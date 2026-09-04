@@ -8,7 +8,7 @@ interface IdentityProvider {
   classify(externalId: string, isExternalGuest?: boolean): Principal;
 }
 
-export type DeactivationSource = "manual" | "directory-sync";
+type DeactivationSource = "manual" | "directory-sync";
 
 export interface DeactivationRecord {
   principalId: string;
