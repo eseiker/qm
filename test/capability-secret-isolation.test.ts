@@ -95,6 +95,18 @@ describe("createServer refuses to boot enforcement that a surface could bypass",
     server.close();
   });
 
+  it("measures split-secret strength in UTF-8 bytes", () => {
+    for (const name of ["capabilitySecret", "portalIdentitySecret"] as const) {
+      const other = name === "capabilitySecret" ? { portalIdentitySecret: "p".repeat(32) } : { capabilitySecret: CAP };
+      assert.throws(() => boot({ ...other, [name]: "x".repeat(31) }), /at least 32 UTF-8 bytes/);
+      assert.throws(() => boot({ ...other, [name]: `${"é".repeat(15)}x` }), /at least 32 UTF-8 bytes/);
+      for (const value of ["x".repeat(32), "é".repeat(16)]) {
+        const server = boot({ ...other, [name]: value });
+        server.close();
+      }
+    }
+  });
+
   it("does not gate when enforcement is off, even with shared secrets", () => {
     const server = createServer(built.app, { signingSecret: SOURCE, scheduler: built.scheduler });
     assert.ok(server);

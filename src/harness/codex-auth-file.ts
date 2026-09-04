@@ -1,10 +1,11 @@
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readSync, type BigIntStats } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
 export type JsonObject = Record<string, unknown>;
 
 const CODEX_OAUTH_MODES = new Set(["chatgpt", "chatgptAuthTokens"]);
+const MAX_CODEX_AUTH_FILE_BYTES = 1024 * 1024;
 export const CODEX_OAUTH_ISSUER = "https://auth.openai.com";
 
 export function asObject(value: unknown): JsonObject | null {
@@ -30,9 +31,48 @@ export function codexOAuthJwtAccountId(value: unknown): string | undefined {
   return codexOAuthJwtAccountIdFromToken(tokens?.id_token);
 }
 
-function readJsonFile(path: string): JsonObject | null {
+function sameCodexAuthFileStat(left: BigIntStats, right: BigIntStats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.nlink === right.nlink &&
+    left.uid === right.uid &&
+    left.gid === right.gid &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
+function readJsonFile(descriptor: number, initial: BigIntStats): JsonObject | null {
+  if (initial.size < 0n || initial.size > BigInt(MAX_CODEX_AUTH_FILE_BYTES)) return null;
+  const size = Number(initial.size);
+  const snapshot = (): Buffer => {
+    const bytes = Buffer.allocUnsafe(size + 1);
+    let length = 0;
+    while (length < bytes.length) {
+      const read = readSync(descriptor, bytes, length, bytes.length - length, length);
+      if (read === 0) break;
+      length += read;
+    }
+    return bytes.subarray(0, length);
+  };
   try {
-    return asObject(JSON.parse(readFileSync(path, "utf8")));
+    const first = snapshot();
+    const between = fstatSync(descriptor, { bigint: true });
+    const second = snapshot();
+    const after = fstatSync(descriptor, { bigint: true });
+    if (
+      !sameCodexAuthFileStat(initial, between) ||
+      !sameCodexAuthFileStat(between, after) ||
+      first.length !== size ||
+      second.length !== size ||
+      !first.equals(second)
+    ) {
+      return null;
+    }
+    return asObject(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(first)));
   } catch {
     return null;
   }
@@ -69,13 +109,37 @@ function isCodexOAuthAuth(value: unknown): value is JsonObject {
 }
 
 export function readCodexOAuthAuthFile(path: string): JsonObject | null {
+  let descriptor: number;
   try {
-    if (statSync(path).mode & 0o077) return null;
+    descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch {
     return null;
   }
-  const auth = readJsonFile(path);
-  return isCodexOAuthAuth(auth) ? auth : null;
+  let auth: JsonObject | null;
+  try {
+    const opened = fstatSync(descriptor, { bigint: true });
+    const currentUid = typeof process.getuid === "function" ? BigInt(process.getuid()) : undefined;
+    if (
+      !opened.isFile() ||
+      opened.nlink !== 1n ||
+      (opened.mode & 0o7777n) !== 0o600n ||
+      currentUid === undefined ||
+      opened.uid !== currentUid
+    ) {
+      auth = null;
+    } else {
+      const parsed = readJsonFile(descriptor, opened);
+      auth = isCodexOAuthAuth(parsed) ? parsed : null;
+    }
+  } catch {
+    auth = null;
+  }
+  try {
+    closeSync(descriptor);
+  } catch {
+    return null;
+  }
+  return auth;
 }
 
 export function sanitizedCodexOAuthAuth(auth: JsonObject): JsonObject {

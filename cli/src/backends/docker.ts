@@ -1,14 +1,15 @@
 import { httpDeploymentLayerTransport, type DeploymentLayerTransport } from "../deployment-layer.ts";
+import { buildxInvocation, sourceBuildEnvironment } from "../buildx.ts";
 
-import { randomBytes } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { CliError, bold, die, dim, errMessage, header, note, ok, step, warn } from "../log.ts";
 import {
   capture,
   captureBoth,
-  deploymentSecretValue,
+  assertNoNulSecret,
   isInvalidSecret,
   readEnvFile,
   resolveBuildRepoRoot,
@@ -17,6 +18,7 @@ import {
   streamLabeled,
   tailString,
   which,
+  type FileIdentity,
 } from "../util.ts";
 import { manifestRef, sandboxBaseRef } from "../manifest.ts";
 import {
@@ -31,9 +33,24 @@ import {
   type LogOpts,
   type ServiceName,
 } from "../services.ts";
-import { dockerBasePort, localSandboxActive, sandboxCoreEnv, securityScreenEnv, type QmConfig } from "../config.ts";
+import {
+  dockerBasePort,
+  effectiveDeployAppsDomain,
+  effectivePortalPublicUrl,
+  localSandboxActive,
+  sandboxCoreEnv,
+  securityScreenEnv,
+  type QmConfig,
+} from "../config.ts";
 import { discoverPlugins, type ResolvedPlugin } from "../plugins.ts";
-import { computedSecrets, runtimeSecretNames, secretsForService } from "../secrets.ts";
+import {
+  computedSecrets,
+  deploymentStoreSecretValue,
+  materializeSecretValues,
+  runtimeSecretNames,
+  secretsForService,
+  validateCompleteSecretValues,
+} from "../secrets.ts";
 import { readDeploymentState, withDeploymentLock, writeDeploymentState, type DeploymentState } from "../state.ts";
 
 /** Deployment-layer transport for docker: signed HTTP to the locally published core port. */
@@ -43,8 +60,138 @@ export const dockerDeploymentLayerTransport: DeploymentLayerTransport = httpDepl
 
 const safe = (s: string): string => s.replace(/[^A-Za-z0-9_.-]/g, "-");
 const ORG_LABEL_KEY = "qm.org";
+const DATABASE_CA_CERT_ENV = "DATABASE_CA_CERT_FILE";
+const DATABASE_CA_CERT_FILE = "/app/.qm-database-ca-cert.pem";
+const AWS_CONTAINER_CREDENTIAL_ENV = [
+  "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+  "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+] as const;
+const DOCKER_PROVIDER_ENV = new Set([
+  "BUILDKIT_COLORS",
+  "BUILDKIT_PROGRESS",
+  "BUILDX_BUILDER",
+  "BUILDX_CONFIG",
+  "BUILDX_EXPERIMENTAL",
+  "DOCKER_API_VERSION",
+  "DOCKER_BUILDKIT",
+  "DOCKER_BUILDX_BIN",
+  "DOCKER_CERT_PATH",
+  "DOCKER_CLI_EXPERIMENTAL",
+  "DOCKER_CONFIG",
+  "DOCKER_CONTENT_TRUST",
+  "DOCKER_CONTENT_TRUST_SERVER",
+  "DOCKER_CONTEXT",
+  "DOCKER_CUSTOM_HEADERS",
+  "DOCKER_DEFAULT_PLATFORM",
+  "DOCKER_HIDE_LEGACY_COMMANDS",
+  "DOCKER_HOST",
+  "DOCKER_SCAN_SUGGEST",
+  "DOCKER_TLS",
+  "DOCKER_TLS_VERIFY",
+  "HOME",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "PATH",
+  "SSH_AUTH_SOCK",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+  "USER",
+  "XDG_CONFIG_HOME",
+  "CURL_CA_BUNDLE",
+  "EXPERIMENTAL_BUILDKIT_SOURCE_POLICY",
+  "KUBECONFIG",
+  "NODE_EXTRA_CA_CERTS",
+  "REQUESTS_CA_BUNDLE",
+  "SSL_CERT_DIR",
+  "SSL_CERT_FILE",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+]);
 const orgLabelArgs = (ctx: DockerCtx): string[] => ["--label", `${ORG_LABEL_KEY}=${ctx.config.orgId}`];
 const baseHostPort = (ctx: DockerCtx): number => dockerBasePort(ctx.config);
+
+function isDockerProviderEnvironment(name: string): boolean {
+  return DOCKER_PROVIDER_ENV.has(name) || /^(?:BUILDKIT|BUILDX|DOCKER)_/.test(name);
+}
+
+function stripAwsContainerCredentialEnvironment(env: Record<string, string | undefined>): void {
+  for (const name of AWS_CONTAINER_CREDENTIAL_ENV) delete env[name];
+}
+
+function dockerProcessEnvironment(
+  config: QmConfig,
+  fileValues: ReadonlyMap<string, string>,
+): {
+  ambientEnv: Readonly<NodeJS.ProcessEnv>;
+  env: NodeJS.ProcessEnv;
+  selectedSecrets: ReadonlyMap<string, string | undefined>;
+  selectedSecretValues: ReadonlySet<string>;
+} {
+  const ambientEnv = { ...process.env };
+  const env = { ...ambientEnv };
+  const secretNames = new Set(["DATABASE_CA_CERT_FILE", "DATABASE_URL", "POSTGRES_PASSWORD"]);
+  const selectedSecrets = new Map<string, string | undefined>();
+  const selectedSecretValues = new Set<string>();
+  const sensitiveValues = new Set<string>();
+  for (const secret of computedSecrets(config)) {
+    if (isDockerProviderEnvironment(secret.name)) {
+      throw new CliError(`${secret.name} cannot be used as a Docker secret-store entry`);
+    }
+    secretNames.add(secret.name);
+    const selected =
+      deploymentStoreSecretValue(secret.name, fileValues.get(secret.name), ambientEnv) ??
+      (secret.name === "PUBLIC_API_URL" ? (config.apiUrl ?? config.publicUrl) : undefined);
+    assertNoNulSecret(secret.name, selected);
+    selectedSecrets.set(secret.name, selected);
+    if (selected !== undefined) {
+      selectedSecretValues.add(selected);
+      sensitiveValues.add(selected);
+    }
+    const ambient = ambientEnv[secret.name];
+    if (ambient !== undefined) sensitiveValues.add(ambient);
+    for (const alias of secret.aliases ?? []) {
+      secretNames.add(alias.name);
+      const aliasValue = ambientEnv[alias.name];
+      if (aliasValue !== undefined && !isDockerProviderEnvironment(alias.name)) sensitiveValues.add(aliasValue);
+    }
+  }
+  const databaseUrl = deploymentStoreSecretValue("DATABASE_URL", fileValues.get("DATABASE_URL"), ambientEnv);
+  assertNoNulSecret("DATABASE_URL", databaseUrl);
+  selectedSecrets.set("DATABASE_URL", databaseUrl);
+  if (databaseUrl !== undefined) {
+    selectedSecretValues.add(databaseUrl);
+    sensitiveValues.add(databaseUrl);
+  }
+  if (ambientEnv.POSTGRES_PASSWORD !== undefined) {
+    selectedSecretValues.add(ambientEnv.POSTGRES_PASSWORD);
+    sensitiveValues.add(ambientEnv.POSTGRES_PASSWORD);
+  }
+  for (const [name, value] of Object.entries(env)) {
+    if (name.startsWith("GIT_")) {
+      delete env[name];
+      continue;
+    }
+    if (isDockerProviderEnvironment(name)) {
+      if (value !== undefined && selectedSecretValues.has(value)) {
+        throw new CliError(`Docker provider control ${name} must not equal a selected deployment secret`);
+      }
+      continue;
+    }
+    if (secretNames.has(name) || (value !== undefined && sensitiveValues.has(value))) delete env[name];
+  }
+  if (selectedSecretValues.has("false")) {
+    throw new CliError("Docker source-build controls must not equal a selected deployment secret");
+  }
+  stripAwsContainerCredentialEnvironment(env);
+  env.BUILDX_GIT_INFO = "false";
+  env.BUILDX_GIT_LABELS = "false";
+  return { ambientEnv, env, selectedSecrets, selectedSecretValues };
+}
 
 interface DockerCtx {
   config: QmConfig;
@@ -55,11 +202,38 @@ interface DockerCtx {
   databaseUrl: string;
   signingSecret?: string;
   envFile?: string;
+  ambientEnv: Readonly<NodeJS.ProcessEnv>;
+  fileValues: ReadonlyMap<string, string>;
   sandboxEnv: Record<string, string>;
-  sandboxSecretKeys: Set<string>;
-  missingSandboxSecrets: string[];
   buildFrom: boolean;
+  processEnv: NodeJS.ProcessEnv;
+  sourceBuildEnv?: NodeJS.ProcessEnv;
+  selectedSecrets: ReadonlyMap<string, string | undefined>;
+  selectedSecretValues: ReadonlySet<string>;
+  dockerSocket?: { path: string; gid?: string };
   repoRoot?: string;
+}
+
+export interface DockerEnvironmentSource {
+  configDir: string;
+  configPath: string;
+  configIdentity: FileIdentity;
+  envFile?: string;
+}
+
+function dockerEnvironmentSnapshot(source: DockerEnvironmentSource): {
+  envFile?: string;
+  fileValues: ReadonlyMap<string, string>;
+} {
+  if (source.envFile !== undefined && !source.envFile.trim()) {
+    throw new CliError("--env-file needs a non-empty path", { clause: "cli.invocation" });
+  }
+  const explicit = source.envFile !== undefined;
+  const path = source.envFile !== undefined ? resolve(source.envFile) : join(source.configDir, ".env");
+  return {
+    envFile: path,
+    fileValues: readEnvFile(path, { required: explicit, protectedIdentity: source.configIdentity }),
+  };
 }
 
 const dockerPrefix = (config: QmConfig): string => `qm-${safe(config.orgId)}`;
@@ -75,80 +249,144 @@ function localAgentSource(): Buffer {
   return readFileSync(existsSync(source) ? source : packaged);
 }
 
-function ensureLocalSandboxImage(config: QmConfig): string {
+function ensureLocalSandboxImage(config: QmConfig, env: NodeJS.ProcessEnv): string {
   const image = localSandboxImage(config);
   if (config.sandbox?.image) return image;
   const base = sandboxBaseRef();
+  const agent = localAgentSource();
+  const source = createHash("sha256").update(base).update("\0").update(agent).digest("hex");
   try {
-    const labeled = capture("docker", [
-      "image",
-      "inspect",
-      "-f",
-      '{{index .Config.Labels "qm.local-sandbox-base"}}',
-      image,
-    ]).trim();
-    if (labeled === base) return image;
+    const labeled = capture(
+      "docker",
+      ["image", "inspect", "-f", '{{index .Config.Labels "qm.local-sandbox-source"}}', image],
+      { env },
+    ).trim();
+    if (labeled === source) return image;
   } catch {
-    // Build the local wrapper when it is absent or stale.
+    void 0;
   }
   const dir = mkdtempSync(join(tmpdir(), "qm-local-sandbox-"));
   try {
-    writeFileSync(join(dir, "agent.mjs"), localAgentSource());
+    writeFileSync(join(dir, "agent.mjs"), agent);
     writeFileSync(
       join(dir, "Dockerfile"),
       `ARG BASE\nFROM \${BASE}\nCOPY agent.mjs /opt/qm/agent.mjs\nENV HOME=/root\nWORKDIR /root\nEXPOSE 8080\nCMD ["node", "/opt/qm/agent.mjs"]\n`,
     );
-    dockerInherit([
-      "build",
-      "--build-arg",
-      `BASE=${base}`,
-      "--label",
-      `qm.local-sandbox-base=${base}`,
-      "-t",
-      image,
-      dir,
-    ]);
+    dockerInherit(
+      [
+        "build",
+        "--build-arg",
+        `BASE=${base}`,
+        "--label",
+        `qm.local-sandbox-base=${base}`,
+        "--label",
+        `qm.local-sandbox-source=${source}`,
+        "-t",
+        image,
+        dir,
+      ],
+      env,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
   return image;
 }
 
-function hostDockerSocket(): { path: string; gid?: string } {
-  const configured = process.env.DOCKER_HOST?.trim();
-  if (configured && !configured.startsWith("unix://")) {
-    throw new CliError('sandbox.backend "local" requires a Unix Docker socket');
-  }
-  const path = configured?.slice("unix://".length) || "/var/run/docker.sock";
-  let gid: string | undefined;
+function dockerEndpoint(env: NodeJS.ProcessEnv): string {
+  const context = env.DOCKER_CONTEXT?.trim();
+  const host = env.DOCKER_HOST?.trim();
+  if (!context && host) return host;
+  const inspectEnv = { ...env };
+  delete inspectEnv.DOCKER_CERT_PATH;
+  delete inspectEnv.DOCKER_CONTEXT;
+  delete inspectEnv.DOCKER_HOST;
+  delete inspectEnv.DOCKER_TLS;
+  delete inspectEnv.DOCKER_TLS_VERIFY;
+  let output: string;
   try {
-    gid = capture("stat", ["-c", "%g", path]).trim() || undefined;
+    output = capture(
+      "docker",
+      ["context", "inspect", "--format", "{{json .Endpoints.docker.Host}}", ...(context ? ["--", context] : [])],
+      { env: inspectEnv },
+    ).trim();
   } catch {
-    throw new CliError(`sandbox.backend "local" cannot read the Docker socket at ${path}`);
+    throw new CliError("Docker target cannot resolve the effective Docker context");
   }
-  return { path, ...(gid ? { gid } : {}) };
+  try {
+    const endpoint: unknown = JSON.parse(output);
+    if (typeof endpoint === "string" && endpoint) return endpoint;
+  } catch {
+    void 0;
+  }
+  throw new CliError("Docker target cannot resolve the effective Docker context");
 }
 
-function requireDocker(): void {
+function hostDockerSocket(
+  env: NodeJS.ProcessEnv,
+  selectedSecretValues: ReadonlySet<string>,
+): { path: string; gid?: string } {
+  const endpoint = dockerEndpoint(env);
+  if (selectedSecretValues.has(endpoint)) {
+    throw new CliError("Docker provider control DOCKER_HOST must not equal a selected deployment secret");
+  }
+  if (!endpoint.startsWith("unix://")) {
+    throw new CliError("Docker target requires a Unix Docker socket");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(endpoint);
+  } catch {
+    throw new CliError("Docker target requires a Unix Docker socket");
+  }
+  if (parsed.protocol !== "unix:" || parsed.hostname || parsed.search || parsed.hash) {
+    throw new CliError("Docker target requires a Unix Docker socket");
+  }
+  let path: string;
+  try {
+    path = decodeURIComponent(parsed.pathname);
+  } catch {
+    throw new CliError("Docker target requires a valid Unix Docker socket path");
+  }
+  if (!isAbsolute(path)) throw new CliError("Docker target requires an absolute Unix Docker socket");
+  try {
+    const identity = statSync(path);
+    delete env.DOCKER_CERT_PATH;
+    delete env.DOCKER_CONTEXT;
+    delete env.DOCKER_TLS;
+    delete env.DOCKER_TLS_VERIFY;
+    env.DOCKER_HOST = endpoint;
+    return { path, gid: String(identity.gid) };
+  } catch {
+    throw new CliError(`Docker target cannot read the Docker socket at ${path}`);
+  }
+}
+
+function requireDocker(env: NodeJS.ProcessEnv): void {
   if (!which("docker")) die("docker not found on PATH (the docker target needs a running Docker daemon).");
   try {
-    capture("docker", ["version", "-f", "{{.Server.Version}}"]);
+    capture("docker", ["version", "-f", "{{.Server.Version}}"], { env });
   } catch {
     die("the Docker daemon is not reachable — start Docker (or OrbStack) and retry.");
   }
 }
 
-function docker(args: string[], allow?: RegExp): string {
+function docker(args: string[], env: NodeJS.ProcessEnv, allow?: RegExp): string {
   try {
-    return capture("docker", args, allow ? { allow } : {});
+    return capture("docker", args, { env, ...(allow ? { allow } : {}) });
   } catch (e) {
     throw dockerError(args, errMessage(e));
   }
 }
 
-function dockerInherit(args: string[], hint?: string): void {
+function dockerInherit(args: string[], env: NodeJS.ProcessEnv, hint?: string): void {
+  const buildArgs = ["build", "--provenance=false", ...args.slice(1)];
+  const invocation =
+    args[0] === "build"
+      ? buildxInvocation(["build", "--load", "--provenance=false", ...args.slice(1)], env, buildArgs)
+      : { command: "docker", args, env };
   try {
-    runInherit("docker", args);
+    runInherit(invocation.command, invocation.args, { env: invocation.env });
   } catch {
     throw new CliError(`docker ${args.slice(0, 2).join(" ")} failed.${hint ? `\n${hint}` : ""}`);
   }
@@ -162,32 +400,35 @@ function dockerError(args: string[], message: string): CliError {
   return new CliError(`docker ${args.slice(0, 3).join(" ")}… failed:\n${message}${hint}`);
 }
 
-function containerRunning(name: string): boolean {
+function containerRunning(name: string, env: NodeJS.ProcessEnv): boolean {
   try {
-    return docker(["inspect", "-f", "{{.State.Running}}", name], /No such object/).trim() === "true";
+    return docker(["inspect", "-f", "{{.State.Running}}", name], env, /No such object/).trim() === "true";
   } catch {
     return false;
   }
 }
 
-function inspectExists(args: string[], notFound: RegExp): boolean {
-  const out = docker(args, notFound);
+function inspectExists(args: string[], env: NodeJS.ProcessEnv, notFound: RegExp): boolean {
+  const out = docker(args, env, notFound);
   return out.trim().length > 0 && !notFound.test(out);
 }
 
-function containerExists(name: string): boolean {
-  return inspectExists(["inspect", "-f", "{{.Id}}", name], /No such object|No such container/i);
+function containerExists(name: string, env: NodeJS.ProcessEnv): boolean {
+  return inspectExists(["inspect", "-f", "{{.Id}}", name], env, /No such object|No such container/i);
 }
 
-function volumeExists(name: string): boolean {
-  return inspectExists(["volume", "inspect", "-f", "{{.Name}}", name], /No such volume|not found/i);
+function volumeExists(name: string, env: NodeJS.ProcessEnv): boolean {
+  return inspectExists(["volume", "inspect", "-f", "{{.Name}}", name], env, /No such volume|not found/i);
 }
 
 function pgContainerPassword(ctx: DockerCtx): string | undefined {
-  if (!containerExists(cname(ctx, "pg"))) return undefined;
+  if (!containerExists(cname(ctx, "pg"), ctx.processEnv)) return undefined;
   try {
-    const env = docker(["inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", cname(ctx, "pg")]);
-    return env
+    const output = docker(
+      ["inspect", "-f", "{{range .Config.Env}}{{println .}}{{end}}", cname(ctx, "pg")],
+      ctx.processEnv,
+    );
+    return output
       .split("\n")
       .map((l) => l.trim())
       .find((l) => l.startsWith("POSTGRES_PASSWORD="))
@@ -207,15 +448,15 @@ function resolveImage(ctx: DockerCtx, service: ServiceName): string {
     const dockerfile = join(root, "deploy", service, "Dockerfile");
     if (!existsSync(dockerfile)) throw new CliError(`no Dockerfile at ${dockerfile}`);
     const tag = `qm-${service}:local`;
-    const buildArgs: string[] = [];
     step(`building ${service} from ${dockerfile}`);
-    dockerInherit(["build", "-f", dockerfile, "-t", tag, ...buildArgs, root]);
+    dockerInherit(["build", "-f", dockerfile, "-t", tag, root], ctx.sourceBuildEnv!);
     return tag;
   }
   const ref = imageRef(ctx, service);
   step(`pulling ${ref}`);
   dockerInherit(
     ["pull", ref],
+    ctx.processEnv,
     `failed to pull ${ref} — the portable images may not be published yet; ` +
       `re-run with --build-from to build locally from deploy/${service}/Dockerfile.`,
   );
@@ -226,24 +467,24 @@ function resolvePluginImage(ctx: DockerCtx, p: ResolvedPlugin): string {
   if (p.kind === "source") {
     const tag = `${ctx.prefix}-${p.name}:local`;
     step(`building plugin ${p.name} from ${p.dockerfile}`);
-    dockerInherit(["build", "-f", p.dockerfile!, "-t", tag, p.sourceDir!]);
+    dockerInherit(["build", "-f", p.dockerfile!, "-t", tag, p.sourceDir!], ctx.sourceBuildEnv!);
     return tag;
   }
   step(`pulling plugin ${p.name} (${p.image})`);
-  dockerInherit(["pull", p.image!], `failed to pull ${p.image} for plugin ${p.name}.`);
+  dockerInherit(["pull", p.image!], ctx.processEnv, `failed to pull ${p.image} for plugin ${p.name}.`);
   return p.image!;
 }
 
 function ensureNetwork(ctx: DockerCtx): void {
-  docker(["network", "create", ctx.network], /already exists/);
+  docker(["network", "create", ctx.network], ctx.processEnv, /already exists/);
 }
 
-function persistRestart(name: string): void {
-  docker(["update", "--restart", "unless-stopped", name]);
+function persistRestart(name: string, env: NodeJS.ProcessEnv): void {
+  docker(["update", "--restart", "unless-stopped", name], env);
 }
 
 function externalDatabaseUrl(ctx: DockerCtx): string | undefined {
-  return process.env.DATABASE_URL ?? readEnvValue(ctx.envFile, "DATABASE_URL");
+  return ctx.selectedSecrets.get("DATABASE_URL");
 }
 
 function ensurePostgres(ctx: DockerCtx, dryRun: boolean): string {
@@ -266,7 +507,7 @@ function ensurePostgres(ctx: DockerCtx, dryRun: boolean): string {
     const existing = pgContainerPassword(ctx);
     if (existing) {
       password = existing;
-    } else if (volumeExists(pgVolume(ctx))) {
+    } else if (volumeExists(pgVolume(ctx), ctx.processEnv)) {
       if (!state?.pgPassword) {
         throw new CliError(
           `Postgres volume ${pgVolume(ctx)} exists but its password is unknown (deployment state missing). ` +
@@ -281,31 +522,37 @@ function ensurePostgres(ctx: DockerCtx, dryRun: boolean): string {
     const stateOut: DeploymentState = { orgId: ctx.config.orgId, network: ctx.network, pgPassword: password };
     writeDeploymentState(stateOut);
 
-    if (!containerRunning(pgName)) {
+    if (!containerRunning(pgName, ctx.processEnv)) {
       step(`Postgres: starting ${pgName}`);
-      docker(["rm", "-f", pgName], /No such container|is not running/);
+      docker(["rm", "-f", pgName], ctx.processEnv, /No such container|is not running/);
       const secretFile = writeSecretEnvFile({ POSTGRES_PASSWORD: password });
       try {
-        docker([
-          "run",
-          "-d",
-          "--name",
+        launchContainer(
           pgName,
-          ...orgLabelArgs(ctx),
-          "--network",
-          ctx.network,
-          "--network-alias",
-          "pg",
-          "--restart",
-          "no",
-          "--env-file",
-          secretFile.path,
-          "-e",
-          "POSTGRES_DB=qm",
-          "-v",
-          `${pgVolume(ctx)}:/var/lib/postgresql/data`,
-          "postgres:16",
-        ]);
+          {
+            args: [
+              "run",
+              "-d",
+              "--name",
+              pgName,
+              ...orgLabelArgs(ctx),
+              "--network",
+              ctx.network,
+              "--network-alias",
+              "pg",
+              "--restart",
+              "no",
+              "--env-file",
+              secretFile.path,
+              "-e",
+              "POSTGRES_DB=qm",
+              "-v",
+              `${pgVolume(ctx)}:/var/lib/postgresql/data`,
+              "postgres:16",
+            ],
+          },
+          ctx.processEnv,
+        );
       } finally {
         secretFile.cleanup();
       }
@@ -317,8 +564,8 @@ function ensurePostgres(ctx: DockerCtx, dryRun: boolean): string {
 async function waitPostgres(ctx: DockerCtx): Promise<void> {
   for (let i = 0; i < 60; i++) {
     try {
-      docker(["exec", cname(ctx, "pg"), "pg_isready", "-U", "postgres"]);
-      persistRestart(cname(ctx, "pg"));
+      docker(["exec", cname(ctx, "pg"), "pg_isready", "-U", "postgres"], ctx.processEnv);
+      persistRestart(cname(ctx, "pg"), ctx.processEnv);
       return;
     } catch {
       await sleep(1000);
@@ -327,23 +574,17 @@ async function waitPostgres(ctx: DockerCtx): Promise<void> {
   throw new CliError("Postgres did not become ready in 60s");
 }
 
-function readEnvValue(envFile: string | undefined, key: string): string | undefined {
-  if (!envFile) return undefined;
-  return readEnvFile(envFile).get(key);
-}
-
 function secretValues(ctx: DockerCtx, service: string): Record<string, string> {
-  const out: Record<string, string> = {};
+  const out = new Map<string, string>();
   for (const secret of secretsForService(ctx.config, service)) {
     if (secret.managedBy === "terraform" && service === "core") continue;
-    const fileValue = readEnvValue(ctx.envFile, secret.name);
-    const value = deploymentSecretValue(secret.name, fileValue);
+    const value = ctx.selectedSecrets.get(secret.name);
     if (value === undefined) continue;
     for (const name of runtimeSecretNames(service, secret)) {
-      if (name !== `FLY_RESIDENT_ENV_${secret.name}`) out[name] = value;
+      out.set(name, value);
     }
   }
-  return out;
+  return Object.fromEntries(out);
 }
 
 export function dockerServiceEnv(config: QmConfig, service: ServiceName): Record<string, string> {
@@ -358,6 +599,8 @@ export function dockerServiceEnv(config: QmConfig, service: ServiceName): Record
     out.QM_CORE_CONTAINER = `${dockerPrefix(config)}-core`;
   }
   if (service === "portal") {
+    const appsDomain = effectiveDeployAppsDomain(config);
+    if (appsDomain) out.DEPLOY_APPS_DOMAIN = appsDomain;
     if (config.services.includes("web-ui")) out.WEB_UI_UPSTREAM = "http://web-ui:8080";
     if (config.services.includes("admin")) out.ADMIN_UPSTREAM = "http://admin:8080";
   }
@@ -365,7 +608,7 @@ export function dockerServiceEnv(config: QmConfig, service: ServiceName): Record
     Object.assign(
       out,
       brokerWiring(service, {
-        publicUrl: config.publicUrl,
+        publicUrl: effectivePortalPublicUrl(config),
         authBaseUrl: `http://${dockerPrefix(config)}-auth.internal:8080`,
         ...(config.env.auth?.AUTH_ALLOWED_EMAIL_DOMAIN
           ? { allowedEmailDomain: config.env.auth.AUTH_ALLOWED_EMAIL_DOMAIN }
@@ -386,86 +629,144 @@ function serviceEnv(ctx: DockerCtx, service: ServiceName): Record<string, string
       orgEnv("core", config.orgId, config.publicUrl, config.services.includes("portal"), brandEnvOf(config)),
     );
     out.PORT = "8080";
-    out.DATA_DIR = "/data";
-    out.SESSION_STORE = "postgres";
-    out.RUN_STORE = "postgres";
     out.DATABASE_URL = ctx.databaseUrl;
     if (config.model) out.PI_MODEL = config.model;
     if (config.modelProvider) out.MODEL_PROVIDER = config.modelProvider;
-    const layerSubs = existingLayerSubdirs(ctx);
-    if (layerSubs.length) out.DEPLOYMENT_LAYER = "/layer";
     Object.assign(out, ctx.sandboxEnv);
-    if (localSandboxActive(config)) {
-      out.DOCKER_HOST = "unix:///var/run/docker.sock";
-      out.QM_CORE_CONTAINER = `${ctx.prefix}-core`;
-    }
   } else {
     Object.assign(out, dockerServiceEnv(config, service));
   }
   const virtualEnv = service === "core" ? virtualServiceEnv(config.services, config.env) : {};
+  const selectedSecrets: Record<string, string> = {
+    ...secretValues(ctx, service),
+    ...(ctx.signingSecret ? { CORE_SIGNING_SECRET: ctx.signingSecret } : {}),
+    ...(service === "core" && ctx.databaseUrl ? { DATABASE_URL: ctx.databaseUrl } : {}),
+  };
   const env = {
     ...out,
     ...virtualEnv,
     ...config.env[service],
     ...(service === "core" ? securityScreenEnv(config) : {}),
-    ...secretValues(ctx, service),
+    ...selectedSecrets,
   };
-  if (ctx.signingSecret) env.CORE_SIGNING_SECRET = ctx.signingSecret;
-  if (service === "core") {
-    env.DATABASE_URL = ctx.databaseUrl;
-    for (const key of ctx.sandboxSecretKeys) {
-      const value = out[key];
-      if (value !== undefined) env[key] = value;
-      else delete env[key];
+  for (const key of secretEnvKeys(ctx, service)) {
+    if (!Object.hasOwn(selectedSecrets, key)) delete env[key];
+  }
+  if (service === "portal") {
+    if (config.services.includes("web-ui")) env.WEB_UI_UPSTREAM = "http://web-ui:8080";
+    else delete env.WEB_UI_UPSTREAM;
+    if (config.services.includes("admin")) env.ADMIN_UPSTREAM = "http://admin:8080";
+    else delete env.ADMIN_UPSTREAM;
+    if (config.services.includes("auth")) {
+      const upstream = out.AUTH_BROKER_UPSTREAM;
+      const prefix = out.AUTH_BROKER_PREFIX;
+      if (!upstream || !prefix) throw new CliError("Docker auth broker wiring is incomplete");
+      env.AUTH_BROKER_UPSTREAM = upstream;
+      env.AUTH_BROKER_PREFIX = prefix;
+    } else {
+      delete env.AUTH_BROKER_UPSTREAM;
+      delete env.AUTH_BROKER_PREFIX;
     }
   }
+  if (service === "web-ui" || service === "admin") delete env.ALLOW_UNSIGNED_TEST_IDENTITY;
+  env.NODE_ENV = "production";
+  if (service === "core") {
+    env.PUBLIC_API_URL = config.apiUrl ?? config.publicUrl;
+    delete env.AGENT_API_URL;
+    delete env.SLACK_API_URL;
+    env.DATA_DIR = "/data";
+    env.SESSION_STORE = "postgres";
+    env.RUN_STORE = "postgres";
+    if (existingLayerSubdirs(ctx).length) env.DEPLOYMENT_LAYER = "/layer";
+    else delete env.DEPLOYMENT_LAYER;
+    if (localSandboxActive(config)) {
+      env.DOCKER_HOST = "unix:///var/run/docker.sock";
+      env.QM_CORE_CONTAINER = `${ctx.prefix}-core`;
+    } else {
+      delete env.DOCKER_HOST;
+      delete env.QM_CORE_CONTAINER;
+    }
+    if (config.services.includes("portal")) env.REQUIRE_SIGNED_PORTAL_IDENTITY = "1";
+  }
+  stripAwsContainerCredentialEnvironment(env);
   return env;
 }
 
 function secretEnvKeys(ctx: DockerCtx, service: string): Set<string> {
-  const keys = new Set(Object.keys(secretValues(ctx, service)));
+  const keys = new Set<string>();
+  for (const secret of secretsForService(ctx.config, service)) {
+    for (const name of runtimeSecretNames(service, secret)) keys.add(name);
+  }
   if (ctx.signingSecret) keys.add("CORE_SIGNING_SECRET");
   if (service === "core") {
     keys.add("DATABASE_URL");
-    for (const key of ctx.sandboxSecretKeys) keys.add(key);
   }
   return keys;
 }
 
-function writeSecretEnvFile(entries: Record<string, string>): { path: string; cleanup: () => void } {
+function assertSecretEnvFileValues(entries: Record<string, string>): void {
   for (const [key, value] of Object.entries(entries)) {
     if (/[\r\n]/.test(value)) {
-      throw new CliError(
-        `secret ${key} contains a newline — docker --env-file is line-based and cannot carry it. ` +
-          `Provide a single-line value (e.g. base64-encode PEM keys and decode in the consumer).`,
-      );
+      throw new CliError(`secret ${key} contains a newline and cannot be serialized to docker --env-file`);
     }
   }
+}
+
+function writeSecretEnvFile(entries: Record<string, string>): { path: string; cleanup: () => void } {
+  assertSecretEnvFileValues(entries);
   const dir = mkdtempSync(join(tmpdir(), "qm-env-"));
   const path = join(dir, "secrets.env");
-  writeFileSync(
-    path,
-    `${Object.entries(entries)
-      .map(([k, v]) => `${k}=${v}`)
-      .join("\n")}\n`,
-    { mode: 0o600 },
-  );
-  return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  try {
+    chmodSync(dir, 0o700);
+    writeFileSync(
+      path,
+      `${Object.entries(entries)
+        .map(([k, v]) => `${k}=${v}`)
+        .join("\n")}\n`,
+      { mode: 0o600 },
+    );
+    return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
 }
 
-function pushEnvArgs(args: string[], env: Record<string, string>, secretKeys: Set<string>): () => void {
-  const secrets: Record<string, string> = {};
+function writeSecretFile(value: string): { path: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "qm-secret-"));
+  const path = join(dir, "value");
+  try {
+    chmodSync(dir, 0o700);
+    writeFileSync(path, value, { mode: 0o444 });
+    chmodSync(path, 0o444);
+    return { path, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function pushEnvArgs(
+  args: string[],
+  env: Record<string, string>,
+  secretKeys: Set<string>,
+  selectedSecretValues: ReadonlySet<string>,
+): { cleanup: () => void } {
+  const secrets = new Map<string, string>();
   for (const [k, v] of Object.entries(env)) {
-    if (secretKeys.has(k)) secrets[k] = v;
+    if (secretKeys.has(k) || selectedSecretValues.has(v)) secrets.set(k, v);
     else args.push("-e", `${k}=${v}`);
   }
-  if (!Object.keys(secrets).length) return () => {};
-  const file = writeSecretEnvFile(secrets);
-  args.push("--env-file", file.path);
-  return file.cleanup;
+  const file = secrets.size ? writeSecretEnvFile(Object.fromEntries(secrets)) : undefined;
+  if (file) args.push("--env-file", file.path);
+  return { cleanup: file?.cleanup ?? (() => {}) };
 }
 
-function runArgs(ctx: DockerCtx, service: ServiceName, image: string): { args: string[]; cleanup: () => void } {
+function runArgs(
+  ctx: DockerCtx,
+  service: ServiceName,
+  image: string,
+): { args: string[]; cleanup: () => void; copy?: { path: string; destination: string } } {
   const def = serviceDef(service);
   const args = [
     "run",
@@ -482,22 +783,78 @@ function runArgs(ctx: DockerCtx, service: ServiceName, image: string): { args: s
     "--restart",
     "no",
   ];
-  const cleanup = pushEnvArgs(args, serviceEnv(ctx, service), secretEnvKeys(ctx, service));
-  if (service === "core") {
-    args.push("-v", `${ctx.prefix}-coredata:/data`);
-    for (const m of layerMounts(ctx)) args.push("-v", m);
-    for (const m of skillMounts(ctx)) args.push("-v", m);
-    if (localSandboxActive(ctx.config)) {
-      const socket = hostDockerSocket();
-      args.push("-v", `${socket.path}:/var/run/docker.sock`);
-      if (socket.gid) args.push("--group-add", socket.gid);
+  const env = serviceEnv(ctx, service);
+  const multilineCa =
+    service === "core" && /[\r\n]/.test(env.DATABASE_CA_CERT ?? "") ? env.DATABASE_CA_CERT : undefined;
+  if (multilineCa !== undefined) {
+    delete env.DATABASE_CA_CERT;
+    env.DATABASE_CA_CERT_FILE = DATABASE_CA_CERT_FILE;
+  }
+  const pushed = pushEnvArgs(args, env, secretEnvKeys(ctx, service), ctx.selectedSecretValues);
+  let copied: { path: string; cleanup: () => void } | undefined;
+  try {
+    copied = multilineCa === undefined ? undefined : writeSecretFile(multilineCa);
+    if (service === "core") {
+      args.push("-v", `${ctx.prefix}-coredata:/data`);
+      for (const m of layerMounts(ctx)) args.push("-v", m);
+      for (const m of skillMounts(ctx)) args.push("-v", m);
+      if (ctx.dockerSocket) {
+        args.push("-v", `${ctx.dockerSocket.path}:/var/run/docker.sock`);
+        if (ctx.dockerSocket.gid) args.push("--group-add", ctx.dockerSocket.gid);
+      }
     }
+    if (def.docker.hostPortOffset !== undefined) {
+      args.push("-p", `${baseHostPort(ctx) + def.docker.hostPortOffset}:${def.docker.internalPort}`);
+    }
+    args.push(image);
+    return {
+      args,
+      cleanup: () => {
+        try {
+          copied?.cleanup();
+        } finally {
+          pushed.cleanup();
+        }
+      },
+      ...(copied ? { copy: { path: copied.path, destination: DATABASE_CA_CERT_FILE } } : {}),
+    };
+  } catch (error) {
+    try {
+      copied?.cleanup();
+    } finally {
+      pushed.cleanup();
+    }
+    throw error;
   }
-  if (def.docker.hostPortOffset !== undefined) {
-    args.push("-p", `${baseHostPort(ctx) + def.docker.hostPortOffset}:${def.docker.internalPort}`);
+}
+
+function launchContainer(
+  name: string,
+  run: { args: string[]; copy?: { path: string; destination: string } },
+  env: NodeJS.ProcessEnv,
+): void {
+  try {
+    if (!run.copy) {
+      docker(run.args, env);
+      return;
+    }
+    const args = [...run.args];
+    args[0] = "create";
+    const detached = args.indexOf("-d");
+    if (detached !== -1) args.splice(detached, 1);
+    docker(args, env);
+    docker(["cp", run.copy.path, `${name}:${run.copy.destination}`], env);
+    docker(["start", name], env);
+  } catch (error) {
+    try {
+      docker(["rm", "-f", name], env, /No such container|No such object|is not running/i);
+    } catch (cleanupError) {
+      throw new CliError(
+        `container ${name} launch failed (${errMessage(error)}); cleanup also failed (${errMessage(cleanupError)})`,
+      );
+    }
+    throw error;
   }
-  args.push(image);
-  return { args, cleanup };
 }
 
 function skillMounts(ctx: DockerCtx): string[] {
@@ -521,12 +878,12 @@ async function waitReady(ctx: DockerCtx, service: ServiceName): Promise<void> {
   const def = serviceDef(service);
   const name = cname(ctx, service);
   for (let i = 0; i < 90; i++) {
-    const logs = captureBoth("docker", ["logs", name]);
+    const logs = captureBoth("docker", ["logs", name], { env: ctx.processEnv });
     if (def.readiness.test(logs)) {
-      persistRestart(name);
+      persistRestart(name, ctx.processEnv);
       return;
     }
-    if (!containerRunning(name)) {
+    if (!containerRunning(name, ctx.processEnv)) {
       noteLogTail(name, logs);
       throw new CliError(`${service} exited before becoming ready (see logs above)`);
     }
@@ -535,31 +892,30 @@ async function waitReady(ctx: DockerCtx, service: ServiceName): Promise<void> {
   throw new CliError(`${service} did not become ready in 90s`);
 }
 
-async function waitPluginUp(name: string): Promise<void> {
+async function waitPluginUp(name: string, env: NodeJS.ProcessEnv): Promise<void> {
   for (let i = 0; i < 5; i++) {
     await sleep(1000);
-    if (!containerRunning(name)) {
-      noteLogTail(name, captureBoth("docker", ["logs", name]));
+    if (!containerRunning(name, env)) {
+      noteLogTail(name, captureBoth("docker", ["logs", name], { env }));
       throw new CliError(`plugin ${name} exited on boot (see logs above) — check the image and its env`);
     }
   }
-  persistRestart(name);
+  persistRestart(name, env);
 }
 
 function buildCtx(
   config: QmConfig,
-  configDir: string,
+  source: DockerEnvironmentSource,
   opts: {
     sandboxDir?: string;
     buildFrom: boolean;
-    buildFromPath?: string;
-    envFile?: string;
     localSandboxImage?: string;
   },
 ): DockerCtx {
+  const { configDir } = source;
   const prefix = dockerPrefix(config);
-  const envFile = opts.envFile ? resolve(opts.envFile) : join(configDir, ".env");
-  if (opts.envFile && !existsSync(envFile)) throw new CliError(`--env-file not found: ${opts.envFile}`);
+  const snapshot = dockerEnvironmentSnapshot(source);
+  const dockerEnvironment = dockerProcessEnvironment(config, snapshot.fileValues);
   const ctx: DockerCtx = {
     config,
     configDir,
@@ -567,23 +923,43 @@ function buildCtx(
     network: prefix,
     prefix,
     databaseUrl: "",
+    ambientEnv: dockerEnvironment.ambientEnv,
+    fileValues: snapshot.fileValues,
     sandboxEnv: {},
-    sandboxSecretKeys: new Set((config.sandbox?.secretEnv ?? []).map((name) => `FLY_RESIDENT_ENV_${name}`)),
-    missingSandboxSecrets: [],
     buildFrom: opts.buildFrom,
+    processEnv: dockerEnvironment.env,
+    selectedSecrets: dockerEnvironment.selectedSecrets,
+    selectedSecretValues: dockerEnvironment.selectedSecretValues,
+    ...(snapshot.envFile !== undefined ? { envFile: snapshot.envFile } : {}),
   };
-  if (existsSync(envFile)) ctx.envFile = envFile;
-  const signingSecret = deploymentSecretValue("CORE_SIGNING_SECRET", readEnvValue(ctx.envFile, "CORE_SIGNING_SECRET"));
+  const signingSecret = ctx.selectedSecrets.get("CORE_SIGNING_SECRET");
   if (signingSecret) ctx.signingSecret = signingSecret;
-  const lookup = (name: string): string | undefined => deploymentSecretValue(name, readEnvValue(ctx.envFile, name));
-  const sb = sandboxCoreEnv(config, lookup);
+  const sb = sandboxCoreEnv(config);
   ctx.sandboxEnv = {
     ...sb.env,
     ...(opts.localSandboxImage ? { LOCAL_SANDBOX_IMAGE: opts.localSandboxImage } : {}),
   };
-  ctx.missingSandboxSecrets = sb.missingSecrets;
-  if (opts.buildFrom) ctx.repoRoot = resolveBuildRepoRoot(opts.buildFromPath, runnableServices(config.services));
   return ctx;
+}
+
+function captureSourceBuildEnvironment(ctx: DockerCtx): void {
+  ctx.sourceBuildEnv = sourceBuildEnvironment(ctx.processEnv, {
+    sensitiveNames: [...ctx.selectedSecrets.keys(), DATABASE_CA_CERT_ENV, "POSTGRES_PASSWORD"],
+    sensitiveValues: ctx.selectedSecretValues,
+  });
+}
+
+function assertDockerReservedEnvironment(ctx: DockerCtx): void {
+  const configured = {
+    ...virtualServiceEnv(ctx.config.services, ctx.config.env),
+    ...ctx.config.env.core,
+  };
+  const secretCollision = secretsForService(ctx.config, "core").some((secret) =>
+    runtimeSecretNames("core", secret).includes(DATABASE_CA_CERT_ENV),
+  );
+  if (Object.hasOwn(configured, DATABASE_CA_CERT_ENV) || secretCollision) {
+    throw new CliError(`${DATABASE_CA_CERT_ENV} is reserved for Docker database CA delivery`);
+  }
 }
 
 function warnUnforwardedEnvKeys(ctx: DockerCtx): void {
@@ -591,7 +967,7 @@ function warnUnforwardedEnvKeys(ctx: DockerCtx): void {
   const injected = new Set(computedSecrets(ctx.config).map((secret) => secret.name));
   injected.add("CORE_SIGNING_SECRET");
   injected.add("DATABASE_URL");
-  const dropped = [...readEnvFile(ctx.envFile).keys()].filter((key) => !injected.has(key));
+  const dropped = [...ctx.fileValues.keys()].filter((key) => !injected.has(key));
   if (!dropped.length) return;
   warn(
     `.env keys not forwarded to any container: ${dropped.join(", ")} — only computed secret names are ` +
@@ -600,7 +976,7 @@ function warnUnforwardedEnvKeys(ctx: DockerCtx): void {
 }
 
 function missingRequiredOperatorSecrets(ctx: DockerCtx): string[] {
-  const lookup = (name: string): string | undefined => deploymentSecretValue(name, readEnvValue(ctx.envFile, name));
+  const lookup = (name: string): string | undefined => ctx.selectedSecrets.get(name);
   return computedSecrets(ctx.config)
     .filter(
       (secret) =>
@@ -609,28 +985,91 @@ function missingRequiredOperatorSecrets(ctx: DockerCtx): string[] {
     .map((secret) => secret.name);
 }
 
+function assertExplicitFileOnlySecrets(ctx: DockerCtx): void {
+  if (ctx.ambientEnv.QM_DEPLOY_ENV_FILE_ONLY !== "1") return;
+  const names = new Set([...computedSecrets(ctx.config).map((secret) => secret.name), "DATABASE_URL"]);
+  const ambientOnly = [...names].filter((name) => {
+    const fileValue = ctx.fileValues.get(name);
+    return (!fileValue || fileValue.trim() === "") && (ctx.ambientEnv[name]?.trim() ?? "") !== "";
+  });
+  if (ambientOnly.length) {
+    throw new CliError(
+      `automatic Docker update will not use ambient-only deployment secrets (${ambientOnly.join(", ")}); add them to the explicit deployment env file`,
+    );
+  }
+}
+
+function assertDockerSelectedSecrets(ctx: DockerCtx, dryRun: boolean): void {
+  const values = new Map<string, string>();
+  const databaseUrl = externalDatabaseUrl(ctx);
+  if (databaseUrl) {
+    if (/[\r\n]/.test(databaseUrl)) {
+      throw new CliError("DATABASE_URL cannot contain CR or LF for Docker deployment");
+    }
+    if (isInvalidSecret("DATABASE_URL", databaseUrl)) {
+      throw new CliError(
+        "Docker deployment secrets are missing, placeholders, malformed, too short, or not distinct: DATABASE_URL",
+      );
+    }
+  }
+  for (const secret of computedSecrets(ctx.config)) {
+    const value = ctx.selectedSecrets.get(secret.name);
+    if (
+      value !== undefined &&
+      /[\r\n]/.test(value) &&
+      !(
+        secret.name === "DATABASE_CA_CERT" &&
+        secret.services.length === 1 &&
+        secret.services[0] === "core" &&
+        !secret.aliases?.length
+      )
+    ) {
+      throw new CliError(`${secret.name} cannot contain CR or LF for Docker deployment`);
+    }
+    if (value !== undefined) values.set(secret.name, value);
+  }
+  try {
+    if (dryRun) {
+      materializeSecretValues(ctx.config, values, { completeness: "partial", managedBy: "operator" });
+    } else {
+      validateCompleteSecretValues(ctx.config, values);
+    }
+  } catch (error) {
+    throw new CliError(
+      `Docker deployment secrets are missing, placeholders, malformed, too short, or not distinct: ${errMessage(error)}`,
+    );
+  }
+}
+
 export async function dockerUp(
   config: QmConfig,
-  configDir: string,
-  opts: { sandboxDir?: string; buildFrom?: boolean; buildFromPath?: string; envFile?: string; dryRun?: boolean } = {},
+  source: DockerEnvironmentSource,
+  opts: { sandboxDir?: string; buildFrom?: boolean; buildFromPath?: string; dryRun?: boolean } = {},
 ): Promise<void> {
-  if (!opts.dryRun) requireDocker();
+  const { configDir } = source;
   const resolvedLocalImage = localSandboxActive(config) ? localSandboxImage(config) : undefined;
-  const ctx = buildCtx(config, configDir, {
+  const ctx = buildCtx(config, source, {
     sandboxDir: opts.sandboxDir,
     buildFrom: opts.buildFrom ?? false,
-    buildFromPath: opts.buildFromPath,
-    envFile: opts.envFile,
     ...(resolvedLocalImage ? { localSandboxImage: resolvedLocalImage } : {}),
   });
+  assertExplicitFileOnlySecrets(ctx);
   const plugins = discoverPlugins(configDir, config).plugins;
+  assertDockerSelectedSecrets(ctx, opts.dryRun ?? false);
+  assertDockerReservedEnvironment(ctx);
+  if (!opts.dryRun) {
+    const dockerSocket = hostDockerSocket(ctx.processEnv, ctx.selectedSecretValues);
+    if (localSandboxActive(config)) ctx.dockerSocket = dockerSocket;
+  }
+  captureSourceBuildEnvironment(ctx);
+  if (ctx.buildFrom) {
+    ctx.repoRoot = resolveBuildRepoRoot(opts.buildFromPath, runnableServices(config.services), ctx.sourceBuildEnv);
+  }
+  if (!opts.dryRun) requireDocker(ctx.processEnv);
 
   header(`qm up — ${config.orgId} (target: docker${opts.buildFrom ? ", build-from-source" : ""})`);
   if (opts.dryRun) note(bold("DRY RUN — no containers will be started.\n"));
   warnUnforwardedEnvKeys(ctx);
-  for (const name of ctx.missingSandboxSecrets) {
-    warn(`sandbox.secretEnv "${name}" has no value in .env or the environment — it won't be set in the sandbox.`);
-  }
   const missingRequired = missingRequiredOperatorSecrets(ctx);
   if (opts.dryRun && missingRequired.length) {
     warn(`MISSING required secrets — add them to .env before up: ${missingRequired.join(", ")}`);
@@ -672,18 +1111,18 @@ export async function dockerUp(
     );
   }
 
-  if (localSandboxActive(config)) ensureLocalSandboxImage(config);
+  if (localSandboxActive(config)) ensureLocalSandboxImage(config, ctx.sourceBuildEnv!);
   ensureNetwork(ctx);
   ctx.databaseUrl = ensurePostgres(ctx, false);
   if (!externalDatabaseUrl(ctx)) await waitPostgres(ctx);
 
   for (const def of ordered(runnableServices(config.services))) {
     const image = resolveImage(ctx, def.name);
-    docker(["rm", "-f", cname(ctx, def.name)], /No such container|is not running/);
+    docker(["rm", "-f", cname(ctx, def.name)], ctx.processEnv, /No such container|is not running/);
     step(`starting ${def.name}`);
     const run = runArgs(ctx, def.name, image);
     try {
-      docker(run.args);
+      launchContainer(cname(ctx, def.name), run, ctx.processEnv);
     } finally {
       run.cleanup();
     }
@@ -693,7 +1132,7 @@ export async function dockerUp(
 
   for (const p of plugins) {
     const image = resolvePluginImage(ctx, p);
-    docker(["rm", "-f", cname(ctx, p.name)], /No such container|is not running/);
+    docker(["rm", "-f", cname(ctx, p.name)], ctx.processEnv, /No such container|is not running/);
     step(`starting plugin ${p.name} (${image})`);
     const args = [
       "run",
@@ -713,20 +1152,28 @@ export async function dockerUp(
       ...orgEnv(p.name, config.orgId, config.publicUrl, config.services.includes("portal"), brandEnvOf(config)),
       PORT: "8080",
     };
-    const env = {
-      ...wiring,
-      ...p.env,
+    const selectedSecrets: Record<string, string> = {
       ...(ctx.signingSecret ? { CORE_SIGNING_SECRET: ctx.signingSecret } : {}),
       ...secretValues(ctx, p.name),
     };
-    const cleanup = pushEnvArgs(args, env, secretEnvKeys(ctx, p.name));
+    const env: Record<string, string> = {
+      ...wiring,
+      ...p.env,
+      ...selectedSecrets,
+    };
+    for (const key of secretEnvKeys(ctx, p.name)) {
+      if (!Object.hasOwn(selectedSecrets, key)) delete env[key];
+    }
+    env.NODE_ENV = "production";
+    stripAwsContainerCredentialEnvironment(env);
+    const pushed = pushEnvArgs(args, env, secretEnvKeys(ctx, p.name), ctx.selectedSecretValues);
     args.push(image);
     try {
-      docker(args);
+      launchContainer(cname(ctx, p.name), { args }, ctx.processEnv);
     } finally {
-      cleanup();
+      pushed.cleanup();
     }
-    await waitPluginUp(cname(ctx, p.name));
+    await waitPluginUp(cname(ctx, p.name), ctx.processEnv);
     ok(`plugin ${p.name} running`);
   }
 
@@ -748,33 +1195,47 @@ function printUrls(ctx: DockerCtx): void {
   note(`   status : qm status   ·   logs: qm logs core   ·   stop: qm down`);
 }
 
-export function dockerStatus(config: QmConfig): void {
-  requireDocker();
+export function dockerStatus(config: QmConfig, source: DockerEnvironmentSource): void {
+  const snapshot = dockerEnvironmentSnapshot(source);
+  const { env, selectedSecretValues } = dockerProcessEnvironment(config, snapshot.fileValues);
+  hostDockerSocket(env, selectedSecretValues);
+  requireDocker(env);
   header(`qm status — ${config.orgId}`);
-  dockerInherit([
-    "ps",
-    "-a",
-    "--filter",
-    `label=${ORG_LABEL_KEY}=${config.orgId}`,
-    "--format",
-    "table {{.Names}}\t{{.Status}}\t{{.Ports}}",
-  ]);
+  dockerInherit(
+    [
+      "ps",
+      "-a",
+      "--filter",
+      `label=${ORG_LABEL_KEY}=${config.orgId}`,
+      "--format",
+      "table {{.Names}}\t{{.Status}}\t{{.Ports}}",
+    ],
+    env,
+  );
   if (config.services.includes("slack")) note("slack: virtual service running in the core container");
 }
 
-function psNames(args: string[]): string[] {
-  return docker(["ps", ...args, "--format", "{{.Names}}"])
+function psNames(args: string[], env: NodeJS.ProcessEnv): string[] {
+  return docker(["ps", ...args, "--format", "{{.Names}}"], env)
     .split("\n")
     .map((s) => s.trim())
     .filter(Boolean);
 }
 
-function listDeploymentContainers(orgId: string): string[] {
-  return psNames(["-a", "--filter", `label=${ORG_LABEL_KEY}=${orgId}`]);
+function listDeploymentContainers(orgId: string, env: NodeJS.ProcessEnv): string[] {
+  return psNames(["-a", "--filter", `label=${ORG_LABEL_KEY}=${orgId}`], env);
 }
 
-export async function dockerLogs(config: QmConfig, service: string | undefined, opts: LogOpts = {}): Promise<void> {
-  requireDocker();
+export async function dockerLogs(
+  config: QmConfig,
+  source: DockerEnvironmentSource,
+  service: string | undefined,
+  opts: LogOpts = {},
+): Promise<void> {
+  const snapshot = dockerEnvironmentSnapshot(source);
+  const { env, selectedSecretValues } = dockerProcessEnvironment(config, snapshot.fileValues);
+  hostDockerSocket(env, selectedSecretValues);
+  requireDocker(env);
   const prefix = dockerPrefix(config);
   const tail = String(opts.tail ?? 200);
 
@@ -782,32 +1243,46 @@ export async function dockerLogs(config: QmConfig, service: string | undefined, 
     const resolved = service === "slack" ? "core" : service;
     if (service === "slack") note("slack is a virtual service; showing core logs");
     const name = `${prefix}-${resolved}`;
-    if (!containerExists(name)) die(`no container ${name} (is the stack up? services: ${config.services.join(", ")})`);
+    if (!containerExists(name, env))
+      die(`no container ${name} (is the stack up? services: ${config.services.join(", ")})`);
     const args = ["logs", "--tail", tail];
     if (opts.follow) args.push("-f");
     args.push(name);
-    dockerInherit(args);
+    dockerInherit(args, env);
     return;
   }
 
-  const names = listDeploymentContainers(config.orgId);
+  const names = listDeploymentContainers(config.orgId, env);
   if (names.length === 0) die(`no containers for ${config.orgId} (is the stack up? run \`qm up\`)`);
-  await streamPrefixedLogs(names, prefix, { follow: opts.follow ?? false, tail });
+  await streamPrefixedLogs(names, prefix, { follow: opts.follow ?? false, tail }, env);
 }
 
-function streamPrefixedLogs(names: string[], prefix: string, opts: { follow: boolean; tail: string }): Promise<void> {
+function streamPrefixedLogs(
+  names: string[],
+  prefix: string,
+  opts: { follow: boolean; tail: string },
+  env: NodeJS.ProcessEnv,
+): Promise<void> {
   return streamLabeled(
     names.map((name) => ({
       label: name.slice(prefix.length + 1),
       command: "docker",
       args: ["logs", "--tail", opts.tail, ...(opts.follow ? ["-f"] : []), name],
+      env,
     })),
     (label, line) => note(`${dim(label)} | ${line}`),
   );
 }
 
-export async function dockerDown(config: QmConfig, opts: { purge?: boolean } = {}): Promise<void> {
-  requireDocker();
+export async function dockerDown(
+  config: QmConfig,
+  source: DockerEnvironmentSource,
+  opts: { purge?: boolean } = {},
+): Promise<void> {
+  const snapshot = dockerEnvironmentSnapshot(source);
+  const { env, selectedSecretValues } = dockerProcessEnvironment(config, snapshot.fileValues);
+  hostDockerSocket(env, selectedSecretValues);
+  requireDocker(env);
   const prefix = dockerPrefix(config);
   header(`qm down — ${config.orgId}`);
   const serviceNames = teardownOrdered(runnableServices(config.services)).map((d) => `${prefix}-${d.name}`);
@@ -816,20 +1291,20 @@ export async function dockerDown(config: QmConfig, opts: { purge?: boolean } = {
   const pluginNames = [
     ...new Set([
       ...config.plugins.map((p) => `${prefix}-${p.name}`),
-      ...listDeploymentContainers(config.orgId).filter((n) => !known.has(n)),
+      ...listDeploymentContainers(config.orgId, env).filter((n) => !known.has(n)),
     ]),
   ];
   const candidates = [...pluginNames, ...serviceNames, pgName];
-  const present = new Set(psNames(["-a"]));
+  const present = new Set(psNames(["-a"], env));
   for (const name of candidates) {
     if (!present.has(name)) continue;
     step(`removing ${name}`);
-    docker(["rm", "-f", name], /No such container/);
+    docker(["rm", "-f", name], env, /No such container/);
   }
   if (opts.purge) {
     warn("purging the network and Postgres volume (durable data will be lost)");
-    docker(["network", "rm", prefix], /not found|No such/);
-    docker(["volume", "rm", `${prefix}-pgdata`, `${prefix}-coredata`], /No such volume|not found|in use/);
+    docker(["network", "rm", prefix], env, /not found|No such/);
+    docker(["volume", "rm", `${prefix}-pgdata`, `${prefix}-coredata`], env, /No such volume|not found|in use/);
   }
   ok("down.");
 }

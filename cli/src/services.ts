@@ -1,5 +1,3 @@
-import { cliVersion } from "./manifest.ts";
-
 export const SERVICE_NAMES = ["core", "web-ui", "admin", "portal", "auth"] as const;
 export type ServiceName = (typeof SERVICE_NAMES)[number];
 
@@ -19,7 +17,7 @@ export function virtualServiceEnv(
   services: readonly DeclaredServiceName[],
   env: Partial<Record<DeclaredServiceName, Record<string, string>>>,
 ): Record<string, string> {
-  return Object.assign({}, ...services.filter(isVirtualService).map((s) => env[s] ?? {}));
+  return Object.fromEntries(services.filter(isVirtualService).flatMap((service) => Object.entries(env[service] ?? {})));
 }
 
 const RESERVED_CONTAINER_NAMES: readonly string[] = [...SERVICE_NAMES, ...VIRTUAL_SERVICE_NAMES, "pg", "sandbox"];
@@ -99,10 +97,7 @@ export function orgEnv(
   brand?: BrandEnv,
 ): Record<string, string> {
   const base = publicUrl.replace(/\/$/, "");
-  const identity: Record<string, string> = {
-    ...(service === "core" ? { ORG_ID: orgId } : { CORE_ORG_ID: orgId }),
-    ...(service === "admin" ? { QM_VERSION: cliVersion() } : {}),
-  };
+  const identity: Record<string, string> = service === "core" ? { ORG_ID: orgId } : { CORE_ORG_ID: orgId };
   const webUiUrl = base;
   if (service === "core") {
     return {
@@ -136,6 +131,8 @@ export const AUTH_BROKER_ENV_KEYS = [
   "OIDC_PRINCIPAL_CLAIM",
   "OIDC_ALLOWED_EMAIL_DOMAIN",
 ] as const;
+
+export const AUTH_SERVICE_BROKER_ENV_KEYS = ["AUTH_ISSUER", "AUTH_CLIENT_ID", "AUTH_REDIRECT_URI"] as const;
 
 export function brokerWiring(
   service: string,
@@ -201,6 +198,7 @@ const CATALOG: Record<ServiceName, ServiceDef> = {
         "PUBLIC_WEB_URL",
         "FLY_ORG",
         "FLY_DEPLOY_BASE_IMAGE",
+        "SPRITES_NAME_PREFIX",
         "PI_DETECT_MODEL",
       ],
       deployFlags: ["--ha=false"],

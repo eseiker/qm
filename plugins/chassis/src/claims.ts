@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { signedHeaders, withSourceAuthNonce } from "./core-client.ts";
+import { signedCoreFetch, withSourceAuthNonce } from "./core-client.ts";
 import { errMessage } from "./errors.ts";
 
 export interface ClaimStore {
@@ -17,9 +17,7 @@ export function coreClaimStore(coreApiUrl: string, signingSecret: string | undef
       const path = withSourceAuthNonce(CLAIM_PATH, signingSecret);
       const body = JSON.stringify({ ids, expiresAtMs });
       try {
-        const r = await fetch(`${coreApiUrl}${path}`, {
-          method: "POST",
-          headers: signedHeaders(signingSecret, "POST", path, body),
+        const r = await signedCoreFetch(coreApiUrl, signingSecret, "POST", path, {
           body,
           signal: AbortSignal.timeout(CLAIM_TIMEOUT_MS),
         });

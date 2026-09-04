@@ -2,6 +2,18 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      recovery_version:
+        description: Exact published QM version to recover; leave empty for a new release
+        required: false
+        type: string
+
+env:
+  NPM_CONFIG_DRY_RUN: "false"
+  NPM_CONFIG_GLOBALCONFIG: /dev/null
+  NPM_CONFIG_PREFER_ONLINE: "true"
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+  NPM_CONFIG_WORKSPACES: "false"
 
 concurrency:
   group: release
@@ -14,43 +26,318 @@ jobs:
     permissions:
       contents: read
     outputs:
+      origin_run_id: ${{ steps.version.outputs.origin_run_id }}
+      resume: ${{ steps.version.outputs.resume }}
+      sha: ${{ steps.version.outputs.sha }}
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           persist-credentials: false
-      - id: version
-        name: Resolve the release tag
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          scope: "@yc-software"
+      - name: Verify the pinned-source bootstrap entry
         run: |
           set -euo pipefail
+          expected=$(jq -er '.version | strings' cli/package.json)
+          actual=$(env -i HOME="$RUNNER_TEMP" PATH="$PATH" node cli/bin/qm.ts version)
+          if [ "$actual" != "$expected" ]; then
+            echo "source bootstrap reported QM $actual, expected $expected" >&2
+            exit 1
+          fi
+      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad
+        with:
+          cosign-release: v3.1.3
+      - id: version
+        name: Validate the release version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SETTINGS_TOKEN: ${{ secrets.RELEASE_SETTINGS_TOKEN || github.token }}
+          REQUESTED_VERSION: ${{ inputs.recovery_version }}
+        run: |
+          set -euo pipefail
+          settings_token=$RELEASE_SETTINGS_TOKEN
+          unset RELEASE_SETTINGS_TOKEN
+          npm_registry() {
+            npm --registry="$NPM_CONFIG_REGISTRY" \
+              --@yc-software:registry="$NPM_CONFIG_REGISTRY" \
+              --workspaces=false "$@"
+          }
+          validate_dist_tags() {
+            printf '%s' "$1" | jq -e \
+              --arg semver '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
+              --arg stable '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              'type == "object"
+               and (.latest | type == "string" and test($stable))
+               and all(to_entries[];
+                 (.value | type == "string") and (.value | test($semver)))
+               and ((has("release-candidate") | not)
+                 or (.["release-candidate"] | type == "string" and test($stable)))' > /dev/null
+          }
+          newest_stable_dist_tag() {
+            printf '%s' "$1" | jq -r \
+              --arg stable '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              '.[] | select(test($stable))' \
+              | sort -V \
+              | tail -1
+          }
+          require_release_rulesets() {
+            rulesets=$(GH_TOKEN="$settings_token" gh api --paginate \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/rulesets?includes_parents=false&targets=tag&per_page=100" \
+              | jq -sc '[.[][]]')
+            mapfile -t ruleset_ids < <(printf '%s' "$rulesets" | jq -er '.[] | .id | numbers')
+            creation_rulesets=0
+            lock_rulesets=0
+            for ruleset_id in "${ruleset_ids[@]}"; do
+              ruleset=$(GH_TOKEN="$settings_token" gh api \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=false")
+              if printf '%s' "$ruleset" | jq -e \
+                '.source_type == "Repository"
+                 and .target == "tag"
+                 and .enforcement == "active"
+                 and .conditions.ref_name.include == ["refs/tags/v*"]
+                 and .conditions.ref_name.exclude == []
+                 and (.rules | type == "array")
+                 and ([.rules[].type] | sort == ["creation"])' > /dev/null; then
+                creation_rulesets=$((creation_rulesets + 1))
+              fi
+              if printf '%s' "$ruleset" | jq -e \
+                '.source_type == "Repository"
+                 and .target == "tag"
+                 and .enforcement == "active"
+                 and .conditions.ref_name.include == ["refs/tags/v*"]
+                 and .conditions.ref_name.exclude == []
+                 and (.rules | type == "array")
+                 and ([.rules[].type] | sort == ["deletion", "update"])' > /dev/null; then
+                lock_rulesets=$((lock_rulesets + 1))
+              fi
+            done
+            if [ "$creation_rulesets" -lt 1 ] || [ "$lock_rulesets" -lt 1 ]; then
+              echo "distinct active repository rulesets must restrict refs/tags/v* creation and lock its update and deletion" >&2
+              return 1
+            fi
+          }
           if [ "$GITHUB_REF" != refs/heads/main ]; then
             echo "releases are cut from main; this run is on $GITHUB_REF" >&2
             exit 1
           fi
-          pkg=$(jq -r .version cli/package.json)
-          case "$pkg" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "cli/package.json version must be semver, got $pkg" >&2; exit 1 ;;
-          esac
-          tagged=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" -q '.[].ref' \
-            | sed 's|^refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's/^v//' | sort -V | tail -1 || true)
-          published=$(npm view @yc-software/qm version 2>/dev/null || true)
-          base=$(printf '%s\n%s\n' "${tagged:-0.0.0}" "${published:-0.0.0}" | sort -V | tail -1)
-          if [ "$(printf '%s\n%s\n' "$base" "$pkg" | sort -V | tail -1)" = "$pkg" ] && [ "$pkg" != "$base" ]; then
-            version=$pkg
-          else
-            IFS=. read -r major minor patch <<< "$base"
-            version="$major.$minor.$((patch + 1))"
-          fi
-          tag="v$version"
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" > /dev/null 2>&1; then
-            echo "$tag already exists; refusing to move it" >&2
+          immutable_error=$(mktemp)
+          set +e
+          immutable_settings=$(GH_TOKEN="$settings_token" gh api \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" 2> "$immutable_error")
+          immutable_status=$?
+          set -e
+          if [ "$immutable_status" -ne 0 ] \
+            || ! printf '%s' "$immutable_settings" \
+              | jq -e '.enabled == true and (.enforced_by_owner | type == "boolean")' > /dev/null; then
+            cat "$immutable_error" >&2
+            echo "immutable release preflight failed: configure RELEASE_SETTINGS_TOKEN with Administration read access, enable release immutability in repository settings, and rerun" >&2
             exit 1
           fi
-          printf 'tag=%s\nversion=%s\n' "$tag" "$version" >> "$GITHUB_OUTPUT"
+          require_release_rulesets
+          source_version=$(jq -r .version cli/package.json)
+          version="${REQUESTED_VERSION:-$source_version}"
+          if [[ ! "$source_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "cli/package.json version must be stable semver, got $source_version" >&2
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release version must be stable semver, got $version" >&2
+            exit 1
+          fi
+          tags=$(npm_registry view @yc-software/qm dist-tags --json)
+          validate_dist_tags "$tags"
+          latest=$(printf '%s' "$tags" | jq -er '.latest | strings')
+          candidate=$(printf '%s' "$tags" | jq -r '.["release-candidate"] // empty')
+          exact_error=$(mktemp)
+          set +e
+          published=$(npm_registry view "@yc-software/qm@$version" version deprecated gitHead dist --json \
+            --min-release-age=0 2> "$exact_error")
+          lookup_status=$?
+          set -e
+          resume=false
+          origin_run_id="$GITHUB_RUN_ID"
+          release_sha="$GITHUB_SHA"
+          if [ "$lookup_status" -eq 0 ]; then
+            published_version=$(printf '%s' "$published" | jq -er '.version | strings')
+            published_git_head=$(printf '%s' "$published" | jq -er '.gitHead | strings')
+            published_integrity=$(printf '%s' "$published" | jq -er '.dist.integrity | strings')
+            provenance_url=$(printf '%s' "$published" | jq -er '.dist.attestations.url | strings')
+            if [ "$published_version" != "$version" ]; then
+              echo "npm resolved @yc-software/qm@$version to unexpected version $published_version" >&2
+              exit 1
+            fi
+            if printf '%s' "$published" | jq -e 'has("deprecated")' > /dev/null; then
+              echo "refusing deprecated QM $version" >&2
+              exit 1
+            fi
+            if [[ ! "$published_git_head" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "@yc-software/qm@$version has invalid gitHead $published_git_head" >&2
+              exit 1
+            fi
+            release_sha="$published_git_head"
+            if [ "$provenance_url" != "https://registry.npmjs.org/-/npm/v1/attestations/@yc-software%2fqm@$version" ]; then
+              echo "@yc-software/qm@$version has an unexpected provenance URL" >&2
+              exit 1
+            fi
+            verify_dir=$(mktemp -d)
+            (cd "$verify_dir" && npm init --yes > /dev/null)
+            npm_registry install \
+              --prefix "$verify_dir" \
+              --ignore-scripts=true \
+              --audit=false \
+              --fund=false \
+              --save-exact \
+              --min-release-age=0 \
+              "@yc-software/qm@$version" > /dev/null
+            pack_dir=$(mktemp -d)
+            pack=$(npm_registry pack \
+              "@yc-software/qm@$version" \
+              --json \
+              --pack-destination "$pack_dir" \
+              --min-release-age=0)
+            tarball="$pack_dir/$(printf '%s' "$pack" | jq -er '.[0].filename | strings')"
+            tarball_integrity="sha512-$(openssl dgst -sha512 -binary "$tarball" | openssl base64 -A)"
+            if [ "$published_integrity" != "$tarball_integrity" ]; then
+              echo "@yc-software/qm@$version tarball does not match its registry integrity" >&2
+              exit 1
+            fi
+            audit=$(mktemp)
+            bundle=$(mktemp)
+            statement=$(mktemp)
+            predicate=https://slsa.dev/provenance/v1
+            timeout 180s npm \
+              --registry="$NPM_CONFIG_REGISTRY" \
+              --@yc-software:registry="$NPM_CONFIG_REGISTRY" \
+              --workspaces=false \
+              audit signatures --json --include-attestations=true \
+              --prefix "$verify_dir" --min-release-age=0 > "$audit"
+            jq -e \
+              --arg predicate "$predicate" \
+              --arg provenance_url "$provenance_url" \
+              --arg version "$version" \
+              '.invalid == []
+               and .missing == []
+               and (.verified | type == "array" and length == 1)
+               and (.verified[0] |
+                 .name == "@yc-software/qm"
+                 and .version == $version
+                 and .location == "node_modules/@yc-software/qm"
+                 and (.registry | rtrimstr("/")) == "https://registry.npmjs.org"
+                 and .attestations.url == $provenance_url
+                 and .attestations.provenance.predicateType == $predicate
+                 and (.attestationBundles | type == "array")
+                 and ([.attestationBundles[] | select(.predicateType == $predicate)] | length == 1))' \
+              "$audit" > /dev/null
+            jq -e \
+              --arg predicate "$predicate" \
+              '[.verified[0].attestationBundles[] | select(.predicateType == $predicate)][0].bundle' \
+              "$audit" > "$bundle"
+            cosign verify-blob-attestation "$tarball" \
+              --bundle "$bundle" \
+              --certificate-identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/publish-cli.yml@refs/heads/main" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              --certificate-github-workflow-name=Release \
+              --certificate-github-workflow-repository="$GITHUB_REPOSITORY" \
+              --certificate-github-workflow-ref=refs/heads/main \
+              --certificate-github-workflow-sha="$release_sha" \
+              --certificate-github-workflow-trigger=workflow_dispatch \
+              --type="$predicate" > /dev/null
+            jq -er '.dsseEnvelope.payload | strings' "$bundle" | base64 --decode > "$statement"
+            tarball_sha512=$(sha512sum "$tarball" | cut -d ' ' -f 1)
+            jq -e \
+              --arg package "pkg:npm/%40yc-software/qm@$version" \
+              --arg repository "https://github.com/$GITHUB_REPOSITORY" \
+              --arg sha "$release_sha" \
+              --arg sha512 "$tarball_sha512" \
+              --arg invocation '^https://github\.com/yc-software/qm/actions/runs/[1-9][0-9]*/attempts/[1-9][0-9]*$' \
+              '._type == "https://in-toto.io/Statement/v1"
+               and .predicateType == "https://slsa.dev/provenance/v1"
+               and .subject == [{name: $package, digest: {sha512: $sha512}}]
+               and .predicate.buildDefinition.buildType == "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1"
+               and .predicate.buildDefinition.externalParameters.workflow == {
+                 ref: "refs/heads/main",
+                 repository: $repository,
+                 path: ".github/workflows/release.yml"
+               }
+               and .predicate.buildDefinition.internalParameters.github == {
+                 event_name: "workflow_dispatch",
+                 repository_id: "1316527318",
+                 repository_owner_id: "153323858"
+               }
+               and any(.predicate.buildDefinition.resolvedDependencies[];
+                 .uri == ("git+" + $repository + "@refs/heads/main")
+                 and .digest == {gitCommit: $sha})
+               and .predicate.runDetails.builder.id == "https://github.com/actions/runner/github-hosted"
+               and (.predicate.runDetails.metadata.invocationId | test($invocation))' \
+              "$statement" > /dev/null
+            invocation_id=$(jq -er '.predicate.runDetails.metadata.invocationId | strings' "$statement")
+            if [[ "$invocation_id" =~ ^https://github\.com/yc-software/qm/actions/runs/([1-9][0-9]*)/attempts/[1-9][0-9]*$ ]]; then
+              origin_run_id="${BASH_REMATCH[1]}"
+            else
+              echo "@yc-software/qm@$version has invalid release invocation $invocation_id" >&2
+              exit 1
+            fi
+            if [ -z "$REQUESTED_VERSION" ]; then
+              if [ "$origin_run_id" != "$GITHUB_RUN_ID" ] || [ "$release_sha" != "$GITHUB_SHA" ]; then
+                echo "QM $version belongs to workflow run $origin_run_id at $release_sha, not this run $GITHUB_RUN_ID at $GITHUB_SHA" >&2
+                echo "re-run the original workflow or dispatch this workflow with recovery_version=$version" >&2
+                exit 1
+              fi
+            elif [ "$release_sha" != "$GITHUB_SHA" ]; then
+              comparison=$(gh api "repos/$GITHUB_REPOSITORY/compare/$release_sha...$GITHUB_SHA")
+              printf '%s' "$comparison" | jq -e \
+                --arg base "$release_sha" \
+                --arg head "$GITHUB_SHA" \
+                '.base_commit.sha == $base
+                 and .merge_base_commit.sha == $base
+                 and .head_commit.sha == $head
+                 and .status == "ahead"
+                 and .ahead_by > 0
+                 and .behind_by == 0' > /dev/null
+            fi
+            resume=true
+          elif ! printf '%s' "$published" | jq -e '.error.code == "E404"' > /dev/null; then
+            cat "$exact_error" >&2
+            printf '%s\n' "$published" >&2
+            exit "$lookup_status"
+          elif [ -n "$REQUESTED_VERSION" ]; then
+            echo "recovery version QM $version is not published on npm" >&2
+            exit 1
+          fi
+          if [ "$lookup_status" -ne 0 ] && [ -n "$candidate" ] && [ "$candidate" != "$latest" ]; then
+            echo "release-candidate QM $candidate is unfinished; dispatch recovery_version=$candidate before publishing QM $version" >&2
+            exit 1
+          fi
+          tag_refs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" -q '.[].ref')
+          tagged=$(printf '%s\n' "$tag_refs" | sed 's|^refs/tags/v||' \
+            | grep -E '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            | sort -V | tail -1 || true)
+          dist_tagged=$(newest_stable_dist_tag "$tags")
+          newest=$(printf '%s\n%s\n' "${tagged:-0.0.0}" "$dist_tagged" | sort -V | tail -1)
+          tag="v$version"
+          if [ "$resume" != true ]; then
+            if [ "$version" = "$newest" ] || [ "$(printf '%s\n%s\n' "$newest" "$version" | sort -V | tail -1)" != "$version" ]; then
+              echo "cli/package.json version $version must be newer than released QM $newest; bump it before release" >&2
+              exit 1
+            fi
+            if printf '%s\n' "$tag_refs" | grep -Fxq "refs/tags/$tag"; then
+              echo "$tag already exists; refusing to move it" >&2
+              exit 1
+            fi
+          fi
+          printf 'origin_run_id=%s\nresume=%s\nsha=%s\ntag=%s\nversion=%s\n' \
+            "$origin_run_id" "$resume" "$release_sha" "$tag" "$version" >> "$GITHUB_OUTPUT"
 
   images:
     name: Images
@@ -60,6 +347,11 @@ jobs:
       packages: write
       id-token: write
     uses: ./.github/workflows/release-package.yml
+    with:
+      origin_run_id: ${{ needs.preflight.outputs.origin_run_id }}
+      resume: ${{ needs.preflight.outputs.resume == 'true' }}
+      sha: ${{ needs.preflight.outputs.sha }}
+      version: ${{ needs.preflight.outputs.version }}
 
   cli:
     name: CLI
@@ -69,9 +361,14 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    secrets: inherit
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      RELEASE_SETTINGS_TOKEN: ${{ secrets.RELEASE_SETTINGS_TOKEN }}
     uses: ./.github/workflows/publish-cli.yml
     with:
+      image_manifest: ${{ needs.images.outputs.manifest }}
+      origin_run_id: ${{ needs.preflight.outputs.origin_run_id }}
+      sha: ${{ needs.preflight.outputs.sha }}
       version: ${{ needs.preflight.outputs.version }}
 
   release:
@@ -83,19 +380,880 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Create the GitHub release
+      - name: Validate the release state
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.preflight.outputs.tag }}
           MANIFEST: ${{ needs.cli.outputs.manifest }}
+          ORIGIN_RUN_ID: ${{ needs.cli.outputs.origin_run_id }}
+          PREFLIGHT_ORIGIN_RUN_ID: ${{ needs.preflight.outputs.origin_run_id }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+          RESUME: ${{ needs.preflight.outputs.resume }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$ORIGIN_RUN_ID" != "$PREFLIGHT_ORIGIN_RUN_ID" ]; then
+            echo "package provenance workflow run $ORIGIN_RUN_ID does not match preflight $PREFLIGHT_ORIGIN_RUN_ID" >&2
+            exit 1
+          fi
+          npm_registry() {
+            npm --registry="$NPM_CONFIG_REGISTRY" \
+              --@yc-software:registry="$NPM_CONFIG_REGISTRY" \
+              --workspaces=false "$@"
+          }
+          validate_dist_tags() {
+            printf '%s' "$1" | jq -e \
+              --arg semver '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
+              --arg stable '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              'type == "object"
+               and (.latest | type == "string" and test($stable))
+               and all(to_entries[];
+                 (.value | type == "string") and (.value | test($semver)))
+               and ((has("release-candidate") | not)
+                 or (.["release-candidate"] | type == "string" and test($stable)))' > /dev/null
+          }
+          newest_stable_dist_tag() {
+            printf '%s' "$1" | jq -r \
+              --arg stable '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              '.[] | select(test($stable))' \
+              | sort -V \
+              | tail -1
+          }
+          printf '%s' "$MANIFEST" | jq . > images.json
+          jq -e -s '
+            def service_name:
+              type == "string" and test("^[a-z0-9]+(-[a-z0-9]+)*$");
+            def digest:
+              type == "string"
+              and test("^sha256:[0-9a-f]{64}$")
+              and (test("^sha256:(.)\\1{63}$") | not);
+            def image_ref($service):
+              type == "string"
+              and (split("@") as $parts
+                | ($parts | length) == 2
+                and $parts[0] == ("ghcr.io/yc-software/qm/" + $service)
+                and ($parts[1] | digest));
+            length == 1
+            and (.[0]
+              | type == "object"
+              and keys == ["sandboxBase", "services"]
+              and (.sandboxBase | image_ref("sandbox-base"))
+              and (.services | type == "object" and length > 0 and (has("sandbox-base") | not))
+              and all(.services | to_entries[];
+                . as $entry
+                | ($entry.key | service_name)
+                  and ($entry.value | image_ref($entry.key))))' \
+            images.json > /dev/null
+          published=$(npm_registry view "@yc-software/qm@$VERSION" version deprecated gitHead --json \
+            --min-release-age=0)
+          published_version=$(printf '%s' "$published" | jq -er '.version | strings')
+          published_git_head=$(printf '%s' "$published" | jq -er '.gitHead | strings')
+          if [ "$published_version" != "$VERSION" ]; then
+            echo "npm resolved @yc-software/qm@$VERSION to unexpected version $published_version" >&2
+            exit 1
+          fi
+          if printf '%s' "$published" | jq -e 'has("deprecated")' > /dev/null; then
+            echo "refusing to release deprecated QM $VERSION" >&2
+            exit 1
+          fi
+          if [ "$published_git_head" != "$RELEASE_SHA" ]; then
+            echo "@yc-software/qm@$VERSION was published from $published_git_head, not $RELEASE_SHA" >&2
+            exit 1
+          fi
+          tags=$(npm_registry view @yc-software/qm dist-tags --json)
+          validate_dist_tags "$tags"
+          candidate=$(printf '%s' "$tags" | jq -r '.["release-candidate"] // empty')
+          newest_published=$(newest_stable_dist_tag "$tags")
+          tag_refs=$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" -q '.[].ref')
+          newest_tag=$(printf '%s\n' "$tag_refs" | sed 's|^refs/tags/v||' \
+            | grep -E '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            | sort -V | tail -1 || true)
+          if [ "$RESUME" != true ]; then
+            if [ "$candidate" != "$VERSION" ]; then
+              echo "release-candidate is QM $candidate, not the expected QM $VERSION" >&2
+              exit 1
+            fi
+            if [ "$(printf '%s\n%s\n' "$newest_published" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+              echo "refusing to publish stale $TAG after npm QM $newest_published" >&2
+              exit 1
+            fi
+            if [ -n "$newest_tag" ] && [ "$(printf '%s\n%s\n' "$newest_tag" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+              echo "refusing to publish stale $TAG after v$newest_tag" >&2
+              exit 1
+            fi
+          fi
+          manifest_hash=$(jq -Sc . images.json | sha256sum | cut -d ' ' -f 1)
+          printf 'QM release provenance\nRepository: %s (%s)\nRun: https://github.com/%s/actions/runs/%s\nCommit: %s\nVersion: %s\nImages: sha256:%s\nBootstrap for QM 0.1.7 and earlier: https://github.com/%s/blob/%s/SECURITY.md#one-time-bootstrap-from-qm-017-and-earlier\nBootstrap only from this immutable annotated tag after verifying its repository, commit, and version marker; release notes and mutable main are not trust sources. Never use deployment npm, npm exec, npx, or package scripts.\n' \
+            "$GITHUB_REPOSITORY" "$REPOSITORY_ID" "$GITHUB_REPOSITORY" "$ORIGIN_RUN_ID" "$RELEASE_SHA" "$VERSION" "$manifest_hash" "$GITHUB_REPOSITORY" "$RELEASE_SHA" \
+            > release-provenance.txt
+
+      - name: Create or verify the release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+          RELEASE_SETTINGS_TOKEN: ${{ secrets.RELEASE_SETTINGS_TOKEN }}
+          RELEASE_TAG_TOKEN: ${{ secrets.RELEASE_TAG_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          settings_token=$RELEASE_SETTINGS_TOKEN
+          tag_token=$RELEASE_TAG_TOKEN
+          unset RELEASE_SETTINGS_TOKEN RELEASE_TAG_TOKEN
+          marker=$(< release-provenance.txt)
+          require_release_rulesets() {
+            rulesets=$(GH_TOKEN="$settings_token" gh api --paginate \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/rulesets?includes_parents=false&targets=tag&per_page=100" \
+              | jq -sc '[.[][]]')
+            mapfile -t ruleset_ids < <(printf '%s' "$rulesets" | jq -er '.[] | .id | numbers')
+            creation_rulesets=0
+            lock_rulesets=0
+            for ruleset_id in "${ruleset_ids[@]}"; do
+              ruleset=$(GH_TOKEN="$settings_token" gh api \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=false")
+              if printf '%s' "$ruleset" | jq -e \
+                '.source_type == "Repository"
+                 and .target == "tag"
+                 and .enforcement == "active"
+                 and .conditions.ref_name.include == ["refs/tags/v*"]
+                 and .conditions.ref_name.exclude == []
+                 and (.rules | type == "array")
+                 and ([.rules[].type] | sort == ["creation"])' > /dev/null; then
+                creation_rulesets=$((creation_rulesets + 1))
+              fi
+              if printf '%s' "$ruleset" | jq -e \
+                '.source_type == "Repository"
+                 and .target == "tag"
+                 and .enforcement == "active"
+                 and .conditions.ref_name.include == ["refs/tags/v*"]
+                 and .conditions.ref_name.exclude == []
+                 and (.rules | type == "array")
+                 and ([.rules[].type] | sort == ["deletion", "update"])' > /dev/null; then
+                lock_rulesets=$((lock_rulesets + 1))
+              fi
+            done
+            if [ "$creation_rulesets" -lt 1 ] || [ "$lock_rulesets" -lt 1 ]; then
+              echo "distinct active repository rulesets must restrict refs/tags/v* creation and lock its update and deletion" >&2
+              return 1
+            fi
+          }
+          require_release_controls() {
+            require_release_rulesets
+            immutable_settings=$(GH_TOKEN="$settings_token" gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/immutable-releases")
+            printf '%s' "$immutable_settings" \
+              | jq -e '.enabled == true and (.enforced_by_owner | type == "boolean")' > /dev/null
+          }
+          lookup_error=$(mktemp)
+          set +e
+          tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2> "$lookup_error")
+          lookup_status=$?
+          set -e
+          if [ "$lookup_status" -ne 0 ] && ! grep -q 'HTTP 404' "$lookup_error"; then
+            cat "$lookup_error" >&2
+            exit "$lookup_status"
+          fi
+          if [ "$lookup_status" -ne 0 ]; then
+            require_release_controls
+            GH_TOKEN="$tag_token" gh api user \
+              | jq -e '.type == "User" and (.id | type == "number")' > /dev/null
+            tag_object=$(GH_TOKEN="$tag_token" gh api "repos/$GITHUB_REPOSITORY/git/tags" \
+              -f tag="$TAG" \
+              -f message="$marker" \
+              -f object="$RELEASE_SHA" \
+              -f type=commit)
+            tag_object_sha=$(printf '%s' "$tag_object" | jq -er '.sha | strings')
+            GH_TOKEN="$tag_token" gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" -f sha="$tag_object_sha" > /dev/null
+            tag_json=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")
+          fi
+          tag_sha=$(printf '%s' "$tag_json" | jq -er '.object.sha | strings')
+          tag_type=$(printf '%s' "$tag_json" | jq -er '.object.type | strings')
+          if [ "$tag_type" != tag ]; then
+            echo "$TAG is not an annotated release tag owned by this run" >&2
+            exit 1
+          fi
+          tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+          printf '%s' "$tag_object" | jq -e \
+            --arg tag "$TAG" \
+            --arg marker "$marker" \
+            --arg sha "$RELEASE_SHA" \
+            '.tag == $tag
+             and .message == $marker
+             and .object.type == "commit"
+             and .object.sha == $sha' > /dev/null
+
+      - name: Create or complete the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SETTINGS_TOKEN: ${{ secrets.RELEASE_SETTINGS_TOKEN }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          settings_token=$RELEASE_SETTINGS_TOKEN
+          unset RELEASE_SETTINGS_TOKEN
+          marker=$(< release-provenance.txt)
+          load_releases() {
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -sc '[.[][]]'
+          }
+          load_release() {
+            load_releases \
+              | jq -c --arg tag "$TAG" \
+                '[.[] | select(.tag_name == $tag)]
+                 | if length > 1 then error("duplicate releases for " + $tag)
+                   elif length == 1 then .[0]
+                   else empty
+                   end'
+          }
+          require_release_rulesets() {
+            rulesets=$(GH_TOKEN="$settings_token" gh api --paginate \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/rulesets?includes_parents=false&targets=tag&per_page=100" \
+              | jq -sc '[.[][]]')
+            mapfile -t ruleset_ids < <(printf '%s' "$rulesets" | jq -er '.[] | .id | numbers')
+            creation_rulesets=0
+            lock_rulesets=0
+            for ruleset_id in "${ruleset_ids[@]}"; do
+              ruleset=$(GH_TOKEN="$settings_token" gh api \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=false")
+              if printf '%s' "$ruleset" | jq -e \
+                '.source_type == "Repository"
+                 and .target == "tag"
+                 and .enforcement == "active"
+                 and .conditions.ref_name.include == ["refs/tags/v*"]
+                 and .conditions.ref_name.exclude == []
+                 and (.rules | type == "array")
+                 and ([.rules[].type] | sort == ["creation"])' > /dev/null; then
+                creation_rulesets=$((creation_rulesets + 1))
+              fi
+              if printf '%s' "$ruleset" | jq -e \
+                '.source_type == "Repository"
+                 and .target == "tag"
+                 and .enforcement == "active"
+                 and .conditions.ref_name.include == ["refs/tags/v*"]
+                 and .conditions.ref_name.exclude == []
+                 and (.rules | type == "array")
+                 and ([.rules[].type] | sort == ["deletion", "update"])' > /dev/null; then
+                lock_rulesets=$((lock_rulesets + 1))
+              fi
+            done
+            if [ "$creation_rulesets" -lt 1 ] || [ "$lock_rulesets" -lt 1 ]; then
+              echo "distinct active repository rulesets must restrict refs/tags/v* creation and lock its update and deletion" >&2
+              return 1
+            fi
+          }
+          validate_release_tag() {
+            tag_ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")
+            tag_sha=$(printf '%s' "$tag_ref" | jq -er \
+              '.object | select(.type == "tag") | .sha | strings')
+            tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+            printf '%s' "$tag_object" | jq -e \
+              --arg tag "$TAG" \
+              --arg marker "$marker" \
+              --arg sha "$RELEASE_SHA" \
+              '.tag == $tag
+               and .message == $marker
+               and .object.type == "commit"
+               and .object.sha == $sha' > /dev/null
+          }
+          require_release_controls() {
+            require_release_rulesets
+            validate_release_tag
+          }
+          require_immutable_releases() {
+            immutable_settings=$(GH_TOKEN="$settings_token" gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/immutable-releases")
+            printf '%s' "$immutable_settings" \
+              | jq -e '.enabled == true and (.enforced_by_owner | type == "boolean")' > /dev/null
+          }
+          validate_release_asset() {
+            local release_json="$1"
+            printf '%s' "$release_json" | jq -e \
+              '(.assets | length == 1)
+               and .assets[0].name == "images.json"
+               and .assets[0].label == "Pinned image digests"
+               and .assets[0].state == "uploaded"
+               and .assets[0].uploader.login == "github-actions[bot]"' > /dev/null
+            local downloaded
+            downloaded=$(mktemp -d)
+            local asset_url
+            asset_url=$(printf '%s' "$release_json" | jq -er '.assets[0].url | strings')
+            gh api -H 'Accept: application/octet-stream' "$asset_url" > "$downloaded/images.json"
+            jq -Sc . "$downloaded/images.json" > "$downloaded/downloaded.canonical.json"
+            jq -Sc . images.json > "$downloaded/expected.canonical.json"
+            if ! cmp --silent "$downloaded/downloaded.canonical.json" "$downloaded/expected.canonical.json"; then
+              echo "$TAG has a different image manifest" >&2
+              return 1
+            fi
+          }
+          newest_public_version() {
+            if ! printf '%s' "$1" | jq -e \
+              'type == "array"
+               and all(.[];
+                 (.tag_name | type == "string")
+                 and (.draft | type == "boolean")
+                 and (.prerelease | type == "boolean"))' > /dev/null; then
+              return 1
+            fi
+            printf '%s' "$1" | jq -r \
+              --arg stable '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              '.[]
+               | select(.draft == false and .prerelease == false)
+               | .tag_name
+               | select(test($stable))
+               | ltrimstr("v")' \
+              | sort -V \
+              | tail -1
+          }
+          require_release_controls
+          require_immutable_releases
+          release_json=$(load_release)
+          if [ -z "$release_json" ]; then
+            create_error=$(mktemp)
+            require_release_controls
+            require_immutable_releases
+            set +e
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --title "$TAG" \
+              --generate-notes \
+              --notes-file release-provenance.txt 2> "$create_error"
+            create_status=$?
+            set -e
+            release_json=$(load_release)
+            if [ -z "$release_json" ]; then
+              cat "$create_error" >&2
+              if [ "$create_status" -ne 0 ]; then exit "$create_status"; fi
+              echo "$TAG release creation returned success without creating a release" >&2
+              exit 1
+            fi
+          fi
+          printf '%s' "$release_json" | jq -e \
+            --arg tag "$TAG" \
+            --arg marker "$marker" \
+            '.tag_name == $tag
+             and .name == $tag
+             and (.body | startswith($marker))
+             and .prerelease == false
+             and .author.login == "github-actions[bot]"
+             and ((.draft == true and .immutable == false)
+               or (.draft == false and .immutable == true))
+             and (.assets | length <= 1)
+             and all(.assets[];
+               .name == "images.json" and .uploader.login == "github-actions[bot]")' > /dev/null
+          release_draft=$(printf '%s' "$release_json" | jq -er \
+            '.draft | if type == "boolean" then tostring else error("invalid draft state") end')
+          asset_count=$(printf '%s' "$release_json" | jq -er '.assets | length')
+          if [ "$asset_count" -eq 1 ]; then
+            asset_state=$(printf '%s' "$release_json" | jq -er '.assets[0].state | strings')
+            if [ "$asset_state" != uploaded ]; then
+              if [ "$release_draft" != true ]; then
+                echo "$TAG is published with an incomplete image manifest asset" >&2
+                exit 1
+              fi
+              asset_id=$(printf '%s' "$release_json" | jq -er '.assets[0].id | numbers')
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+              release_json=$(load_release)
+              asset_count=0
+            fi
+          fi
+          if [ "$asset_count" -eq 0 ]; then
+            if [ "$release_draft" != true ]; then
+              echo "$TAG is published without its image manifest asset" >&2
+              exit 1
+            fi
+            gh release upload "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              "images.json#Pinned image digests"
+            release_json=$(load_release)
+          fi
+          validate_release_asset "$release_json"
+          latest_inventory=$(load_releases)
+          newest_public=$(newest_public_version "$latest_inventory")
+          make_latest=true
+          if [ -n "$newest_public" ] \
+            && [ "$newest_public" != "$VERSION" ] \
+            && [ "$(printf '%s\n%s\n' "$newest_public" "$VERSION" | sort -V | tail -1)" = "$newest_public" ]; then
+            make_latest=false
+          fi
+          release_id=$(printf '%s' "$release_json" | jq -er '.id | numbers')
+          if printf '%s' "$release_json" | jq -e '.draft' > /dev/null; then
+            validate_release_asset "$release_json"
+            require_release_controls
+            require_immutable_releases
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -F draft=false \
+              -f make_latest="$make_latest" > /dev/null
+          elif [ "$make_latest" = true ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -f make_latest=true > /dev/null
+          fi
+          validate_release_tag
+          release_json=$(load_release)
+          printf '%s' "$release_json" | jq -e \
+            --arg tag "$TAG" \
+            --arg marker "$marker" \
+            '.tag_name == $tag
+             and .name == $tag
+             and (.body | startswith($marker))
+             and .draft == false
+             and .prerelease == false
+             and .immutable == true
+             and (.published_at | strings | length > 0)
+             and .author.login == "github-actions[bot]"
+             and (.assets | length == 1)
+             and .assets[0].name == "images.json"
+             and .assets[0].label == "Pinned image digests"
+             and .assets[0].state == "uploaded"
+             and .assets[0].uploader.login == "github-actions[bot]"' > /dev/null
+          validate_release_asset "$release_json"
+          final_inventory=$(load_releases)
+          final_newest=$(newest_public_version "$final_inventory")
+          if [ -z "$final_newest" ]; then
+            echo "GitHub has no published stable QM release after publishing $TAG" >&2
+            exit 1
+          fi
+          expected_latest_tag="v$final_newest"
+          latest_release=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest")
+          printf '%s' "$latest_release" | jq -e \
+            --arg tag "$expected_latest_tag" \
+            --arg target "$TAG" \
+            '.tag_name == $tag
+             and .draft == false
+             and .prerelease == false
+             and (($tag != $target) or .immutable == true)' > /dev/null
+
+  image-aliases:
+    name: Publish versioned image aliases
+    needs:
+      - preflight
+      - cli
+      - release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - name: Publish exact release image aliases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST: ${{ needs.cli.outputs.manifest }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
           printf '%s' "$MANIFEST" | jq . > images.json
-          gh api "repos/$GITHUB_REPOSITORY/git/refs" \
-            -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" > /dev/null
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "$TAG" \
-            --generate-notes \
-            "images.json#Pinned image digests"
+          jq -e -s '
+            def service_name:
+              type == "string" and test("^[a-z0-9]+(-[a-z0-9]+)*$");
+            def digest:
+              type == "string"
+              and test("^sha256:[0-9a-f]{64}$")
+              and (test("^sha256:(.)\\1{63}$") | not);
+            def image_ref($service):
+              type == "string"
+              and (split("@") as $parts
+                | ($parts | length) == 2
+                and $parts[0] == ("ghcr.io/yc-software/qm/" + $service)
+                and ($parts[1] | digest));
+            length == 1
+            and (.[0]
+              | type == "object"
+              and keys == ["sandboxBase", "services"]
+              and (.sandboxBase | image_ref("sandbox-base"))
+              and (.services | type == "object" and length > 0 and (has("sandbox-base") | not))
+              and all(.services | to_entries[];
+                . as $entry
+                | ($entry.key | service_name)
+                  and ($entry.value | image_ref($entry.key))))' \
+            images.json > /dev/null
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          printf '%s' "$release_json" | jq -e \
+            --arg tag "$TAG" \
+             '.tag_name == $tag
+             and .draft == false
+             and .prerelease == false
+             and .immutable == true
+             and (.published_at | strings | length > 0)
+             and .author.login == "github-actions[bot]"
+             and (.assets | length == 1)
+             and .assets[0].name == "images.json"
+             and .assets[0].state == "uploaded"
+             and .assets[0].uploader.login == "github-actions[bot]"' > /dev/null
+          asset_url=$(printf '%s' "$release_json" | jq -er '.assets[0].url | strings')
+          gh api -H 'Accept: application/octet-stream' "$asset_url" > released-images.json
+          comparison=$(mktemp -d)
+          jq -Sc . released-images.json > "$comparison/released.canonical.json"
+          jq -Sc . images.json > "$comparison/expected.canonical.json"
+          if ! cmp --silent "$comparison/released.canonical.json" "$comparison/expected.canonical.json"; then
+            echo "$TAG image manifest does not match the package manifest" >&2
+            exit 1
+          fi
+          scripts/release-image-aliases.sh publish released-images.json "$VERSION"
+
+  promote:
+    name: Promote the npm release
+    needs:
+      - preflight
+      - image-aliases
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          scope: "@yc-software"
+      - name: Promote the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          ORIGIN_RUN_ID: ${{ needs.preflight.outputs.origin_run_id }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RELEASE_SHA: ${{ needs.preflight.outputs.sha }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          npm_token=$NODE_AUTH_TOKEN
+          unset NODE_AUTH_TOKEN
+          npm_registry() {
+            npm --registry="$NPM_CONFIG_REGISTRY" \
+              --@yc-software:registry="$NPM_CONFIG_REGISTRY" \
+              --workspaces=false "$@"
+          }
+          read_packument() {
+            curl --fail --silent --show-error --location \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --header 'Accept: application/json' \
+              --header 'Cache-Control: no-cache' \
+              --header 'Pragma: no-cache' \
+              "https://registry.npmjs.org/@yc-software%2fqm?release-read=$1-$(date +%s%N)-$RANDOM"
+          }
+          validate_packument() {
+            printf '%s' "$1" | jq -e \
+              --arg semver '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
+              --arg stable '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              '.name == "@yc-software/qm"
+               and (.versions | type == "object" and length > 0)
+               and (."dist-tags" | type == "object")
+               and (."dist-tags".latest | type == "string" and test($stable))
+               and all(."dist-tags" | to_entries[];
+                 (.value | type == "string") and (.value | test($semver)))
+               and (((."dist-tags" | has("release-candidate")) | not)
+                 or (."dist-tags"["release-candidate"] | type == "string" and test($stable)))
+               and all(.versions | to_entries[];
+                 (.value | type == "object") and .value.version == .key)
+               and (. as $packument
+                 | all(."dist-tags"[];
+                   . as $version
+                   | $packument.versions | has($version)))' > /dev/null
+          }
+          validate_manifest() {
+            jq -e -s '
+              def service_name:
+                type == "string" and test("^[a-z0-9]+(-[a-z0-9]+)*$");
+              def digest:
+                type == "string"
+                and test("^sha256:[0-9a-f]{64}$")
+                and (test("^sha256:(.)\\1{63}$") | not);
+              def image_ref($service):
+                type == "string"
+                and (split("@") as $parts
+                  | ($parts | length) == 2
+                  and $parts[0] == ("ghcr.io/yc-software/qm/" + $service)
+                  and ($parts[1] | digest));
+              length == 1
+              and (.[0]
+                | type == "object"
+                and keys == ["sandboxBase", "services"]
+                and (.sandboxBase | image_ref("sandbox-base"))
+                and (.services | type == "object" and length > 0 and (has("sandbox-base") | not))
+                and all(.services | to_entries[];
+                  . as $entry
+                  | ($entry.key | service_name)
+                    and ($entry.value | image_ref($entry.key))))' \
+              "$1" > /dev/null
+          }
+          load_public_releases() {
+            gh api --paginate \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -sc '[.[][]]'
+          }
+          newest_public_version() {
+            if ! printf '%s' "$1" | jq -e \
+              'type == "array"
+               and all(.[];
+                 (.tag_name | type == "string")
+                 and (.draft | type == "boolean")
+                 and (.prerelease | type == "boolean")
+                 and (.immutable | type == "boolean"))' > /dev/null; then
+              return 1
+            fi
+            printf '%s' "$1" | jq -r \
+              --arg stable '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              '.[]
+               | select(.draft == false and .prerelease == false)
+               | .tag_name
+               | select(test($stable))
+               | ltrimstr("v")' \
+              | sort -V \
+              | tail -1
+          }
+          verify_github_latest() {
+            latest_inventory=$(load_public_releases)
+            newest_public=$(newest_public_version "$latest_inventory")
+            if [ -z "$newest_public" ]; then
+              echo "GitHub has no published stable QM release" >&2
+              return 1
+            fi
+            EXPECTED_GITHUB_LATEST_TAG="v$newest_public"
+            latest_release=$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/latest")
+            printf '%s' "$latest_release" | jq -e \
+              --arg tag "$EXPECTED_GITHUB_LATEST_TAG" \
+              --arg target "$TAG" \
+              '.tag_name == $tag
+               and .draft == false
+               and .prerelease == false
+               and (($tag != $target) or .immutable == true)' > /dev/null
+          }
+          validate_release_tag() {
+            tag_ref=$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG")
+            tag_sha=$(printf '%s' "$tag_ref" | jq -er \
+              '.object | select(.type == "tag") | .sha | strings')
+            tag_object=$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")
+            printf '%s' "$tag_object" | jq -e \
+              --arg tag "$TAG" \
+              --arg marker "$marker" \
+              --arg sha "$RELEASE_SHA" \
+              '.tag == $tag
+               and .message == $marker
+               and .object.type == "commit"
+               and .object.sha == $sha' > /dev/null
+          }
+          verify_promotion_inputs() {
+            verification=$(mktemp -d)
+            package_json=$(npm_registry pack \
+              "@yc-software/qm@$VERSION" \
+              --json \
+              --pack-destination "$verification" \
+              --min-release-age=0)
+            package_tarball="$verification/$(printf '%s' "$package_json" | jq -er '.[0].filename | strings')"
+            tar -xOzf "$package_tarball" package/manifest.json | jq -c . > "$verification/package-images.json"
+            validate_manifest "$verification/package-images.json"
+            manifest_hash=$(jq -Sc . "$verification/package-images.json" | sha256sum | cut -d ' ' -f 1)
+            printf -v marker 'QM release provenance\nRepository: %s (%s)\nRun: https://github.com/%s/actions/runs/%s\nCommit: %s\nVersion: %s\nImages: sha256:%s\nBootstrap for QM 0.1.7 and earlier: https://github.com/%s/blob/%s/SECURITY.md#one-time-bootstrap-from-qm-017-and-earlier\nBootstrap only from this immutable annotated tag after verifying its repository, commit, and version marker; release notes and mutable main are not trust sources. Never use deployment npm, npm exec, npx, or package scripts.\n' \
+              "$GITHUB_REPOSITORY" "$REPOSITORY_ID" "$GITHUB_REPOSITORY" "$ORIGIN_RUN_ID" "$RELEASE_SHA" "$VERSION" "$manifest_hash" "$GITHUB_REPOSITORY" "$RELEASE_SHA"
+            marker=${marker%$'\n'}
+            validate_release_tag
+            release_json=$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+            printf '%s' "$release_json" | jq -e \
+              --arg tag "$TAG" \
+              '.tag_name == $tag
+               and .draft == false
+               and .prerelease == false
+               and .immutable == true
+               and (.published_at | strings | length > 0)
+               and .author.login == "github-actions[bot]"
+               and (.assets | length == 1)
+               and .assets[0].name == "images.json"
+               and .assets[0].label == "Pinned image digests"
+               and .assets[0].state == "uploaded"
+               and .assets[0].uploader.login == "github-actions[bot]"' > /dev/null
+            asset_id=$(printf '%s' "$release_json" | jq -er '.assets[0].id | numbers')
+            gh api \
+              -H 'Accept: application/octet-stream' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$verification/release-images.json"
+            validate_manifest "$verification/release-images.json"
+            jq -Sc . "$verification/package-images.json" > "$verification/package.canonical.json"
+            jq -Sc . "$verification/release-images.json" > "$verification/release.canonical.json"
+            if ! cmp --silent "$verification/package.canonical.json" "$verification/release.canonical.json"; then
+              echo "$TAG image manifest does not match @yc-software/qm@$VERSION" >&2
+              exit 1
+            fi
+            scripts/release-image-aliases.sh verify "$verification/release-images.json" "$VERSION"
+            validate_release_tag
+            verify_github_latest
+          }
+          newest_other_stable_tag() {
+            printf '%s' "$1" | jq -r \
+              --arg stable '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              '."dist-tags"
+               | to_entries[]
+               | select(.key != "latest" and .key != "release-candidate")
+               | select(.value | test($stable))
+               | .value' \
+              | sort -V \
+              | tail -1
+          }
+          evaluate_latest_state() {
+            local packument="$1"
+            CURRENT_NPM_LATEST=$(printf '%s' "$packument" | jq -er '."dist-tags".latest | strings')
+            if [ "$EXPECTED_GITHUB_LATEST_TAG" != "$TAG" ]; then
+              expected_npm_latest=${EXPECTED_GITHUB_LATEST_TAG#v}
+              if [ "$CURRENT_NPM_LATEST" != "$expected_npm_latest" ]; then
+                echo "npm latest QM $CURRENT_NPM_LATEST does not match GitHub Latest $EXPECTED_GITHUB_LATEST_TAG" >&2
+                return 1
+              fi
+              PROMOTION_DECISION=skip
+              return
+            fi
+            if [ "$CURRENT_NPM_LATEST" = "$VERSION" ]; then
+              PROMOTION_DECISION=done
+              return
+            fi
+            if [ "$(printf '%s\n%s\n' "$CURRENT_NPM_LATEST" "$VERSION" | sort -V | tail -1)" = "$CURRENT_NPM_LATEST" ]; then
+              echo "npm latest QM $CURRENT_NPM_LATEST is newer than GitHub Latest $TAG" >&2
+              return 1
+            fi
+            conflicting=$(newest_other_stable_tag "$packument")
+            if [ -n "$conflicting" ] && [ "$(printf '%s\n%s\n' "$conflicting" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+              echo "stable npm dist-tag points to newer QM $conflicting; only the release workflow may advance latest" >&2
+              return 1
+            fi
+            PROMOTION_DECISION=write
+          }
+          published=$(npm_registry view "@yc-software/qm@$VERSION" version deprecated gitHead --json \
+            --min-release-age=0)
+          published_version=$(printf '%s' "$published" | jq -er '.version | strings')
+          published_git_head=$(printf '%s' "$published" | jq -er '.gitHead | strings')
+          if [ "$published_version" != "$VERSION" ]; then
+            echo "npm resolved @yc-software/qm@$VERSION to unexpected version $published_version" >&2
+            exit 1
+          fi
+          if printf '%s' "$published" | jq -e 'has("deprecated")' > /dev/null; then
+            echo "refusing to promote deprecated QM $VERSION" >&2
+            exit 1
+          fi
+          if [ "$published_git_head" != "$RELEASE_SHA" ]; then
+            echo "@yc-software/qm@$VERSION was published from $published_git_head, not $RELEASE_SHA" >&2
+            exit 1
+          fi
+          verify_promotion_inputs
+          converged=false
+          latest_status=0
+          for attempt in $(seq 1 5); do
+            verify_github_latest
+            before=$(read_packument "$attempt-before")
+            validate_packument "$before"
+            evaluate_latest_state "$before"
+            if [ "$PROMOTION_DECISION" = done ]; then
+              echo "QM $VERSION is npm latest"
+              converged=true
+              break
+            fi
+            if [ "$PROMOTION_DECISION" = skip ]; then
+              echo "verified older QM $VERSION without moving npm latest away from GitHub Latest $EXPECTED_GITHUB_LATEST_TAG"
+              converged=true
+              break
+            fi
+            verify_promotion_inputs
+            before_write=$(read_packument "$attempt-before-write")
+            validate_packument "$before_write"
+            evaluate_latest_state "$before_write"
+            if [ "$PROMOTION_DECISION" = done ]; then
+              echo "QM $VERSION is npm latest"
+              converged=true
+              break
+            fi
+            if [ "$PROMOTION_DECISION" = skip ]; then
+              echo "GitHub Latest advanced to $EXPECTED_GITHUB_LATEST_TAG before npm promotion"
+              converged=true
+              break
+            fi
+            mutation_input=$(read_packument "$attempt-mutation")
+            validate_packument "$mutation_input"
+            verify_github_latest
+            evaluate_latest_state "$mutation_input"
+            if [ "$PROMOTION_DECISION" = done ]; then
+              echo "QM $VERSION is npm latest"
+              converged=true
+              break
+            fi
+            if [ "$PROMOTION_DECISION" = skip ]; then
+              echo "GitHub Latest advanced to $EXPECTED_GITHUB_LATEST_TAG before npm promotion"
+              converged=true
+              break
+            fi
+            set +e
+            NODE_AUTH_TOKEN="$npm_token" npm_registry dist-tag add "@yc-software/qm@$VERSION" latest
+            latest_status=$?
+            set -e
+            after=$(read_packument "$attempt-after")
+            validate_packument "$after"
+            verify_github_latest
+            evaluate_latest_state "$after"
+            if [ "$PROMOTION_DECISION" = done ]; then
+              echo "QM $VERSION is npm latest"
+              converged=true
+              break
+            fi
+            if [ "$PROMOTION_DECISION" = skip ]; then
+              echo "npm latest and GitHub Latest converged concurrently on $EXPECTED_GITHUB_LATEST_TAG"
+              converged=true
+              break
+            fi
+            sleep 3
+          done
+          if [ "$converged" != true ]; then
+            echo "npm latest did not converge to verified QM $VERSION" >&2
+            if [ "$latest_status" -ne 0 ]; then exit "$latest_status"; fi
+            exit 1
+          fi
+          cleanup=$(read_packument candidate-cleanup)
+          validate_packument "$cleanup"
+          candidate=$(printf '%s' "$cleanup" | jq -r '."dist-tags"["release-candidate"] // empty')
+          if [ "$candidate" = "$VERSION" ]; then
+            set +e
+            NODE_AUTH_TOKEN="$npm_token" npm_registry dist-tag rm @yc-software/qm release-candidate
+            candidate_remove_status=$?
+            set -e
+            cleaned=$(read_packument candidate-cleaned)
+            validate_packument "$cleaned"
+            remaining=$(printf '%s' "$cleaned" | jq -r '."dist-tags"["release-candidate"] // empty')
+            if [ "$remaining" = "$VERSION" ]; then
+              echo "release-candidate still points to QM $VERSION after removal" >&2
+              if [ "$candidate_remove_status" -ne 0 ]; then exit "$candidate_remove_status"; fi
+              exit 1
+            fi
+          fi

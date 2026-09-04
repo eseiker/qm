@@ -17,11 +17,12 @@ PORTER_DEPLOY_CLUSTER_ID=<cluster id>
 
 ## Onboarding checklist
 
-Everything below this section is reference and field notes; this is the order that
-actually gets a new operator from zero to a working instance (the deployment workflow's
-agent-facing version lives at `cli/templates/deployment/references/porter.md`). If you are an agent doing
-this deployment: install and prefer the `porter` CLI over raw API calls wherever a
-command exists ([install instructions](https://docs.porter.run/cli/installation) — on
+Everything below this section is reference and field notes; this standalone
+source-checkout workflow is the order that gets a new operator from zero to a working
+instance. Porter is not a target of the packaged `qm init` deployment workflow. If you
+are an agent doing this deployment, install and prefer the `porter` CLI over raw API
+calls wherever a command exists
+([install instructions](https://docs.porter.run/cli/installation) — on
 Homebrew that is the `porter-dev` tap, Homebrew core's `porter` is an unrelated tool, and
 `docker-credential-porter` is a separate checksum-verified binary the tap does not
 install); use
@@ -140,9 +141,46 @@ entry ... no encryption`.
 
 `deploy/helm/` carries the same topology as a Helm chart for operators who would rather
 manage the release themselves; it expects the images published at
-`ghcr.io/yc-software/qm/<service>` and an ingress you configure. Pin `image.tag` to a
-commit that actually carries the Porter backend — the published tags are commit SHAs, and
-one from before Porter support landed rejects `SANDBOX_BACKEND=porter` at startup. Set
+`ghcr.io/yc-software/qm/<service>` and an ingress you configure. Production installs use
+the digest manifest attached to the GitHub release. Download `images.json` and convert it
+to a deterministic Helm values file before upgrading:
+
+```bash
+VERSION=0.1.8
+gh release download "v$VERSION" --repo yc-software/qm --pattern images.json
+jq -eS '
+  if keys == ["sandboxBase", "services"]
+     and (.services | keys == ["admin", "auth", "core", "egress-proxy", "portal", "web-ui"])
+     and (.sandboxBase | test("^ghcr\\.io/yc-software/qm/sandbox-base@sha256:[0-9a-f]{64}$"))
+     and all(.services | to_entries[];
+       . as $entry
+       | $entry.value | test("^ghcr\\.io/yc-software/qm/" + $entry.key + "@sha256:[0-9a-f]{64}$"))
+  then {
+    image: {
+      repository: "ghcr.io/yc-software/qm",
+      digests: (.services | with_entries(.value |= capture("@(?<digest>sha256:[0-9a-f]{64})$").digest))
+    }
+  }
+  else error("invalid QM release image manifest")
+  end
+' images.json > qm-images.values.json
+helm upgrade --install qm deploy/helm \
+  --namespace qm \
+  --create-namespace \
+  --values qm-images.values.json
+```
+
+The chart renders each enabled service as `repository/service@sha256:...` when its
+digest is present, and a malformed digest stops rendering. When a digest is missing,
+the chart falls back to the explicit per-service tag and then the explicit global tag;
+rendering stops only when neither a digest nor a tag is available. Release automation
+also publishes `<version>` image tags after finalization.
+Version tags are mutable convenience pointers, not the production identity. `image.tag`
+and per-service `services.<name>.tag` remain explicit
+compatibility and source-build fallbacks.
+`scripts/deploy-helm.sh` supplies that fallback for the images it just built and pushed;
+the chart never infers an image tag from
+`appVersion`. Set
 `publicUrl` and the chart derives the broker wiring (`AUTH_ISSUER`, `AUTH_REDIRECT_URI`
 and the portal's `OIDC_*` endpoints) the way `cli/src/services.ts` does for the other
 targets; what it cannot invent is the identity allow-list, so production still refuses to

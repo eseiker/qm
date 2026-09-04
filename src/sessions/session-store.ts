@@ -352,12 +352,12 @@ function shortenStrings(value: unknown, depth: number): { value: unknown; trunca
     });
     return truncated ? { value: next, truncated } : { value, truncated };
   }
-  const next: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value)) {
+  const entries = Object.entries(value).map(([key, item]) => {
     const walked = shortenStrings(item, depth + 1);
     truncated ||= walked.truncated;
-    next[key] = walked.value;
-  }
+    return [key, walked.value] as const;
+  });
+  const next = Object.fromEntries(entries);
   return truncated ? { value: next, truncated } : { value, truncated };
 }
 

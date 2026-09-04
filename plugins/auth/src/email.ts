@@ -66,7 +66,9 @@ function smtpMailer(cfg: AuthConfig): Mailer {
 }
 
 export function mailerFor(cfg: AuthConfig): Mailer {
-  return cfg.transport === "smtp" ? smtpMailer(cfg) : resendMailer(cfg);
+  if (cfg.transport === "smtp") return smtpMailer(cfg);
+  if (cfg.transport === "resend") return resendMailer(cfg);
+  throw new Error("AUTH_EMAIL_TRANSPORT must be exactly resend or smtp");
 }
 
 function encodeHeader(value: string): string {

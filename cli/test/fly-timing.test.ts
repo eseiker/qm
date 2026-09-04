@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,12 +19,24 @@ const fs = require("node:fs");
 const args = process.argv.slice(2);
 const cmd = args.join(" ");
 if (process.env.FAKE_FLY_LOG) fs.appendFileSync(process.env.FAKE_FLY_LOG, JSON.stringify(args) + "\\n");
-if (args[0] === "apps" && args[1] === "create") {
+if (args[0] === "deploy" && process.env.FAKE_FLY_DEPLOY_CWD_LOG) {
+  fs.appendFileSync(process.env.FAKE_FLY_DEPLOY_CWD_LOG, process.cwd() + "\\n");
+}
+if (args[0] === "apps" && args[1] === "list") {
+  console.log(JSON.stringify([{ Name: "qm-core" }, { Name: "beta-core" }]));
+} else if (args[0] === "apps" && args[1] === "create") {
   console.log("created");
 } else if (args[0] === "secrets" && args[1] === "set") {
   console.log("staged");
+} else if (args[0] === "secrets" && args[1] === "unset") {
+  console.log("staged");
 } else if (args[0] === "secrets" && args[1] === "list") {
-  console.log("ADMIN_GRANTS\\nANTHROPIC_API_KEY\\nAWS_ACCESS_KEY_ID\\nAWS_ENDPOINT_URL_S3\\nAWS_SECRET_ACCESS_KEY\\nCAPABILITY_SECRET\\nCONNECTOR_SECRET_KEY\\nCORE_SIGNING_SECRET\\nPORTAL_IDENTITY_SECRET\\nSKILL_SIGNING_SECRET\\nFLY_API_TOKEN\\nPUBLIC_API_URL\\n" + (process.env.FAKE_FLY_FRESH_PG ? "" : "DATABASE_URL\\n") + "SLACK_BOT_TOKEN\\nSLACK_APP_TOKEN");
+  const app = args[args.indexOf("-a") + 1];
+  const prefix = app === "qm-core" ? "qm" : "beta";
+  const org = prefix === "qm" ? "acme" : "beta";
+  const owner = "QM_OWNER_" + require("node:crypto").createHash("sha256").update("qm-v2:personal:" + org + ":" + prefix).digest("hex").slice(0, 16).toUpperCase();
+  const names = process.env.FAKE_FLY_OWNER_ONLY ? [owner] : [owner, "ADMIN_GRANTS", "ANTHROPIC_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_ENDPOINT_URL_S3", "AWS_SECRET_ACCESS_KEY", "CAPABILITY_SECRET", "CONNECTOR_SECRET_KEY", "CORE_SIGNING_SECRET", "PORTAL_IDENTITY_SECRET", "SKILL_SIGNING_SECRET", "FLY_API_TOKEN", "PUBLIC_API_URL", "SPRITES_TOKEN", ...(process.env.FAKE_FLY_FRESH_PG ? [] : ["DATABASE_URL"]), "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"];
+  console.log(JSON.stringify(names.map((Name) => ({ Name }))));
 } else if (args[0] === "mpg" && args[1] === "list") {
   console.log(process.env.FAKE_FLY_FRESH_PG ? "" : "pg-1 test-pg");
 } else if (args[0] === "mpg" && args[1] === "create") {
@@ -332,9 +344,10 @@ test("Fly redacts credential-bearing Managed Postgres status failures", () => {
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /fly-user|secret@|flympg\.net/);
 });
 
-test("fly up build-only pushes a tagged image without checking runtime deploy secrets", () => {
+test("fly up build-only runs from the caller cwd and preflights ownership without runtime deploy secrets", () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-fly-build-only-"));
   const logPath = join(dir, "fly.log");
+  const cwdLogPath = join(dir, "fly-cwd.log");
   const stdout = execFileSync(
     process.execPath,
     [
@@ -355,6 +368,8 @@ test("fly up build-only pushes a tagged image without checking runtime deploy se
         ...process.env,
         FLY_BIN: fakeFlyBin(dir),
         FAKE_FLY_LOG: logPath,
+        FAKE_FLY_DEPLOY_CWD_LOG: cwdLogPath,
+        FAKE_FLY_OWNER_ONLY: "1",
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -362,13 +377,16 @@ test("fly up build-only pushes a tagged image without checking runtime deploy se
 
   assert.match(stdout, /--build-only --push --image-label sha123/);
   assert.match(stdout, /image: qm-core -> registry\.fly\.io\/qm-core:sha123/);
+  const deployCwd = readFileSync(cwdLogPath, "utf8").trim();
+  assert.equal(deployCwd, repoRoot);
+  assert.notEqual(deployCwd, join(repoRoot, "deploy", "stacks", "acme"));
   const commands = readFileSync(logPath, "utf8")
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line) as string[]);
   assert.equal(
     commands.some((args) => args[0] === "secrets" && args[1] === "list"),
-    false,
+    true,
   );
   assert.equal(
     commands.some((args) => args[0] === "secrets" && args[1] === "set"),
@@ -416,6 +434,70 @@ test("fly up build-only dry-run plans without pushing an image", () => {
     },
   );
 
+  assert.match(stdout, /sandbox substrate: sprites; no OCI sandbox image publish/);
   assert.match(stdout, /Plan only\. Re-run without --dry-run to build images\./);
-  assert.equal(existsSync(logPath), false);
+  const commands = readFileSync(logPath, "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as string[]);
+  assert.equal(
+    commands.some(
+      (args) =>
+        (args[0] === "apps" && args[1] === "create") ||
+        (args[0] === "secrets" && (args[1] === "set" || args[1] === "unset")) ||
+        args[0] === "deploy" ||
+        (args[0] === "mpg" && args[1] === "create"),
+    ),
+    false,
+  );
+});
+
+test("fly dry-run reports external sandbox backends", () => {
+  for (const backend of ["porter", "smolmachines"]) {
+    const dir = mkdtempSync(join(tmpdir(), `qm-fly-${backend}-dry-run-`));
+    const logPath = join(dir, "fly.log");
+    const configPath = join(dir, "qm.config.jsonc");
+    try {
+      writeFileSync(
+        configPath,
+        JSON.stringify({
+          contract: 1,
+          orgId: "acme",
+          publicUrl: "https://agent.example.com",
+          target: "fly",
+          appPrefix: "qm",
+          region: "sjc",
+          flyOrg: "personal",
+          services: ["core"],
+          env: {
+            core: {
+              HARNESS: "mock",
+              SANDBOX_BACKEND: backend,
+              SNAPSHOT_STORE: "s3",
+              TRANSFER_STORE: "s3",
+              S3_BUCKET: "acme-data",
+              S3_REGION: "auto",
+            },
+          },
+        }),
+      );
+      const stdout = execFileSync(
+        process.execPath,
+        [bin, "up", "--config", configPath, "--only", "core", "--dry-run"],
+        {
+          encoding: "utf8",
+          cwd: repoRoot,
+          env: {
+            ...process.env,
+            FLY_BIN: fakeFlyBin(dir),
+            FAKE_FLY_LOG: logPath,
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      assert.match(stdout, new RegExp(`sandbox substrate: ${backend}; no OCI sandbox image publish`));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 });

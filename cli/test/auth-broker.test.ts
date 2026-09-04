@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,7 @@ import { dockerServiceEnv } from "../src/backends/docker.ts";
 import { computedSecrets, runtimeSecretNames, secretsForService } from "../src/secrets.ts";
 import { stageFlyEmailAllowlist } from "../src/backends/fly.ts";
 import { isReservedContainerName, SERVICE_NAMES, serviceDef } from "../src/services.ts";
+import { readEnvFile } from "../src/util.ts";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const brokerStack = join(repoRoot, "deploy", "stacks", "broker", "qm.config.jsonc");
@@ -188,7 +189,7 @@ test("the config refuses a broker without a portal, a bad transport, and hand-se
   refuses(configText({ services: '["core", "auth"]' }), /"auth" sign-in broker requires "portal"/);
   refuses(
     configText({ env: `{ "auth": { "AUTH_EMAIL_TRANSPORT": "sendmail" } }` }),
-    /AUTH_EMAIL_TRANSPORT must be "resend" or "smtp"/,
+    /AUTH_EMAIL_TRANSPORT must be one of/,
   );
   refuses(configText({ env: `{ "auth": {} }` }), /AUTH_EMAIL_TRANSPORT must be "resend" or "smtp"/);
   refuses(
@@ -246,7 +247,7 @@ const fs=require("node:fs"); fs.appendFileSync(${JSON.stringify(log)}, process.a
   const prior = process.env.FLY_BIN;
   process.env.FLY_BIN = fly;
   try {
-    stageFlyEmailAllowlist(config, dir, new Set(["core", "auth", "portal"]));
+    stageFlyEmailAllowlist(config, new Set(["core", "auth", "portal"]), readEnvFile(join(dir, ".env")));
   } finally {
     if (prior === undefined) delete process.env.FLY_BIN;
     else process.env.FLY_BIN = prior;
@@ -256,4 +257,55 @@ const fs=require("node:fs"); fs.appendFileSync(${JSON.stringify(log)}, process.a
   assert.match(calls, new RegExp(`-a ${prefix}-core AUTH_ALLOWED_EMAILS=- value=new@example.com,other@example.com`));
   assert.match(calls, new RegExp(`-a ${prefix}-auth AUTH_ALLOWED_EMAILS=- value=new@example.com,other@example.com`));
   assert.match(calls, new RegExp(`-a ${prefix}-portal OIDC_ALLOWED_EMAILS=- value=new@example.com,other@example.com`));
+});
+
+test("fly email allowlist staging honors the explicit env-file in file-only mode", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-allowlist-file-only-"));
+  const fly = join(dir, "fly");
+  const log = join(dir, "fly.log");
+  const envFile = join(dir, "deployment.env");
+  writeFileSync(
+    fly,
+    `#!/usr/bin/env node
+const fs=require("node:fs"); fs.appendFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" ")+" value="+fs.readFileSync(0,"utf8")+"\\n");`,
+  );
+  chmodSync(fly, 0o755);
+  writeFileSync(join(dir, ".env"), "AUTH_ALLOWED_EMAILS=original@example.com\n");
+  writeFileSync(envFile, "");
+  const config = configWith(configText({ env: `{ "auth": { "AUTH_EMAIL_TRANSPORT": "smtp" } }` }));
+  const priorFly = process.env.FLY_BIN;
+  const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  const priorAllowlist = process.env.AUTH_ALLOWED_EMAILS;
+  process.env.FLY_BIN = fly;
+  process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+  process.env.AUTH_ALLOWED_EMAILS = "ambient@example.com";
+  try {
+    stageFlyEmailAllowlist(config, new Set(["core", "auth", "portal"]), readEnvFile(envFile, { required: true }));
+    assert.equal(existsSync(log), false);
+    writeFileSync(envFile, "AUTH_ALLOWED_EMAILS=explicit@example.com\n");
+    stageFlyEmailAllowlist(config, new Set(["core", "auth", "portal"]), readEnvFile(envFile, { required: true }));
+    const calls = readFileSync(log, "utf8");
+    assert.match(calls, /value=explicit@example\.com/);
+    assert.doesNotMatch(calls, /original@example\.com|ambient@example\.com/);
+  } finally {
+    if (priorFly === undefined) delete process.env.FLY_BIN;
+    else process.env.FLY_BIN = priorFly;
+    if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+    if (priorAllowlist === undefined) delete process.env.AUTH_ALLOWED_EMAILS;
+    else process.env.AUTH_ALLOWED_EMAILS = priorAllowlist;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fly ignores a stale invalid email allowlist when its computed secret is inactive", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-allowlist-inactive-"));
+  const envFile = join(dir, "deployment.env");
+  writeFileSync(envFile, "AUTH_ALLOWED_EMAILS=replace-me\n");
+  const config = configWith(configText({ services: '["core"]', env: "{}" }));
+  try {
+    assert.doesNotThrow(() => stageFlyEmailAllowlist(config, new Set(["core"]), readEnvFile(envFile)));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

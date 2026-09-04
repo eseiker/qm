@@ -35,7 +35,7 @@ export function parseFrontmatter(raw: string): Frontmatter {
   const closing = /\r?\n---/.exec(source.slice(contentStart));
   if (!closing) throw new Error("frontmatter: --- fence is not closed");
   const end = contentStart + closing.index;
-  const attrs: Record<string, unknown> = {};
+  const attrs = new Map<string, unknown>();
   const lines = source.slice(contentStart, end).split(/\r?\n/);
 
   for (let i = 0; i < lines.length; i++) {
@@ -57,12 +57,12 @@ export function parseFrontmatter(raw: string): Frontmatter {
         i++;
       }
       const joined = literal ? collected.join("\n") : collected.join(" ").replace(/\s+/g, " ");
-      attrs[key] = joined.trim();
+      attrs.set(key, joined.trim());
       continue;
     }
 
     if (rest) {
-      attrs[key] = rest.startsWith("[") && rest.endsWith("]") ? parseFlowArray(rest) : stripQuotes(rest);
+      attrs.set(key, rest.startsWith("[") && rest.endsWith("]") ? parseFlowArray(rest) : stripQuotes(rest));
       continue;
     }
 
@@ -77,10 +77,10 @@ export function parseFrontmatter(raw: string): Frontmatter {
       items.push(stripQuotes(item[1]!));
       i++;
     }
-    attrs[key] = items;
+    attrs.set(key, items);
   }
 
-  return { attrs, body: source.slice(end + closing[0].length).replace(/^\s+/, "") };
+  return { attrs: Object.fromEntries(attrs), body: source.slice(end + closing[0].length).replace(/^\s+/, "") };
 }
 
 export function parseSeedSkillFrontmatter(raw: string): {

@@ -1,15 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
+import { Readable } from "node:stream";
 import { CONFIG_FILENAME, loadConfigAt } from "../src/config.ts";
 import { main } from "../src/cli.ts";
 import { renderTaskDefinition } from "../src/backends/aws.ts";
 import { computedSecrets } from "../src/secrets.ts";
-
-const PINNED_SANDBOX_IMAGE = `registry.fly.io/acme-sandboxes@sha256:${"b".repeat(64)}`;
 
 async function run(argv: string[], cwd?: string): Promise<{ out: string; exitCode: number | null }> {
   const lines: string[] = [];
@@ -114,7 +124,7 @@ test("check --json reserves exit 2 for an unsupported live invocation", async ()
       publicUrl: "http://localhost:8080",
       target: "docker",
       services: ["core"],
-      sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     }),
   );
   try {
@@ -137,7 +147,7 @@ test("check flag typos are invocation errors and never print a success first", a
       publicUrl: "http://localhost:8080",
       target: "docker",
       services: ["core"],
-      sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     }),
   );
   try {
@@ -166,7 +176,7 @@ test("non-JSON check --live fails when the target has no live drift implementati
       publicUrl: "http://localhost:8080",
       target: "docker",
       services: ["core"],
-      sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     }),
   );
   try {
@@ -186,7 +196,11 @@ test("check --live on aws runs live drift checks in plain and JSON modes", async
     `#!/usr/bin/env node
 const args = process.argv.slice(2).join(" ");
 if (args.includes("sts get-caller-identity")) console.log("123456789012");
-else if (args.includes("get-secret-value")) console.log(JSON.stringify({ ARN: "arn", SecretString: "secret-value".repeat(3) }));
+else if (args.includes("get-secret-value")) {
+  const argv = process.argv.slice(2);
+  const id = argv[argv.indexOf("--secret-id") + 1];
+  console.log(JSON.stringify({ ARN: "arn:aws:secretsmanager:us-west-2:123456789012:secret:" + id + "-ABC123", SecretString: Buffer.from(args).toString("hex").padEnd(32, "x") }));
+}
 else if (args.includes("describe-services")) console.log(JSON.stringify({ services: [{ serviceName: "s" }] }));
 else console.log("{}");
 `,
@@ -200,7 +214,7 @@ else console.log("{}");
     services: ["core"],
     env: { core: { AWS_DEPLOY_IMAGE: "acme-microvm-app", AWS_DEPLOY_IMAGE_VERSION: "1" } },
     imageOverrides: { core: `ghcr.io/acme/core@sha256:${"a".repeat(64)}` },
-    sandbox: { backend: "sprites", app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+    sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     aws: {
       accountId: "123456789012",
       region: "us-west-2",
@@ -242,7 +256,7 @@ test("successful check --json --live reports the live-drift clause", async () =>
     services: ["core"],
     env: { core: { AWS_DEPLOY_IMAGE: "acme-microvm-app", AWS_DEPLOY_IMAGE_VERSION: "1" } },
     imageOverrides: { core: `ghcr.io/acme/core@${digest}` },
-    sandbox: { backend: "sprites", app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+    sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     aws: {
       accountId: "123456789012",
       region: "us-west-2",
@@ -257,7 +271,12 @@ test("successful check --json --live reports the live-drift clause", async () =>
   const configPath = join(dir, CONFIG_FILENAME);
   writeFileSync(configPath, JSON.stringify(raw));
   const config = loadConfigAt(configPath).config;
-  const arns = Object.fromEntries(computedSecrets(config).map((secret) => [secret.name, "arn"]));
+  const arns = Object.fromEntries(
+    computedSecrets(config).map((secret) => [
+      secret.name,
+      `arn:aws:secretsmanager:us-west-2:123456789012:secret:p/${secret.name}-ABC123`,
+    ]),
+  );
   const image = `123456789012.dkr.ecr.us-west-2.amazonaws.com/repo@${digest}`;
   const task = renderTaskDefinition(config, "core", image, arns);
   const layerBody = JSON.stringify({ contract: 1, tools: [], skills: [] });
@@ -280,7 +299,10 @@ if (args.includes("sts get-caller-identity")) console.log("123456789012");
 else if (args.includes("lambda-microvms get-microvm-image")) console.log(JSON.stringify({ imageArn: "arn:aws:lambda:us-west-2:123456789012:microvm-image:acme-microvm-app" }));
 else if (args.includes("lambda-microvms list-microvm-image-versions")) console.log(JSON.stringify({ items: [{ imageVersion: "1", state: "SUCCESSFUL", status: "ACTIVE" }] }));
 else if (args.includes("get-secret-value") && args.includes("--query SecretString")) console.log("signing-secret".repeat(3));
-else if (args.includes("get-secret-value")) console.log(JSON.stringify({ ARN: "arn", SecretString: "secret-value".repeat(3) }));
+else if (args.includes("get-secret-value")) {
+  const id = argv[argv.indexOf("--secret-id") + 1];
+  console.log(JSON.stringify({ ARN: "arn:aws:secretsmanager:us-west-2:123456789012:secret:" + id + "-ABC123", SecretString: Buffer.from(args).toString("hex").padEnd(32, "x") }));
+}
 else if (args.includes("describe-services")) console.log(JSON.stringify({ services: [{ serviceName: "s", status: "ACTIVE", desiredCount: 1, runningCount: 1, taskDefinition: "task", networkConfiguration: { awsvpcConfiguration: { subnets: ["subnet"], securityGroups: ["sg"], assignPublicIp: "DISABLED" } }, deployments: [{ status: "PRIMARY", rolloutState: "COMPLETED", taskDefinition: "task" }], loadBalancers: [{ targetGroupArn: "tg" }] }] }));
 else if (args.includes("describe-task-definition")) console.log(${JSON.stringify(JSON.stringify({ taskDefinition: task }))});
 else if (args.includes("run-task")) console.log(JSON.stringify({ tasks: [{ taskArn: "canary" }] }));
@@ -305,6 +327,11 @@ else console.log("{}");
   globalThis.fetch = async () =>
     new Response(
       JSON.stringify({
+        contract: 1,
+        version: 1,
+        generation: 1,
+        source: "durable",
+        operationId: null,
         bundle: JSON.parse(layerBody),
         contentHash: layerHash,
         status: "applied",
@@ -351,7 +378,7 @@ test("--tail must be a non-negative integer", async () => {
       publicUrl: "http://localhost:8080",
       target: "docker",
       services: ["core"],
-      sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     }),
   );
   try {
@@ -373,7 +400,7 @@ test("--env-file that does not exist is an error", async () => {
       publicUrl: "http://localhost:8080",
       target: "docker",
       services: ["core"],
-      sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     }),
   );
   const xdg = mkdtempSync(join(tmpdir(), "qm-xdg-"));
@@ -383,12 +410,274 @@ test("--env-file that does not exist is an error", async () => {
     const { out, exitCode } = await run(["plan", "--env-file", join(dir, "nope.env")], dir);
     assert.equal(exitCode, 1);
     assert.match(out, /--env-file not found/);
+    const blank = await run(["plan", "--env-file="], dir);
+    assert.equal(blank.exitCode, 2);
+    assert.match(blank.out, /--env-file needs a non-empty path/);
+    const created = join(dir, "created.env");
+    const set = await run(["secrets", "set", "TOKEN", "value", "--env-file", created], dir);
+    assert.equal(set.exitCode, null, set.out);
+    assert.equal(readFileSync(created, "utf8"), "TOKEN=value\n");
   } finally {
     if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
     else process.env.XDG_CONFIG_HOME = prevXdg;
     rmSync(dir, { recursive: true, force: true });
     rmSync(xdg, { recursive: true, force: true });
   }
+});
+
+test("path operands reject blanks and NUL bytes before config, mutation, or provider work", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-dispatch-paths-"));
+  const bin = mkdtempSync(join(tmpdir(), "qm-dispatch-bin-"));
+  const marker = join(bin, "provider-called");
+  const configPath = join(dir, CONFIG_FILENAME);
+  const configText = JSON.stringify({
+    contract: 1,
+    orgId: "acme",
+    publicUrl: "http://localhost:8080",
+    target: "docker",
+    services: ["core"],
+    sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
+  });
+  writeFileSync(configPath, configText);
+  const docker = join(bin, "docker");
+  writeFileSync(
+    docker,
+    `#!/usr/bin/env node
+require("node:fs").writeFileSync(${JSON.stringify(marker)}, "called");
+`,
+  );
+  chmodSync(docker, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}${delimiter}${previousPath ?? ""}`;
+  const cases: Array<[string, (bad: string) => string[]]> = [
+    ["--config", (bad) => ["status", `--config=${bad}`]],
+    ["--env-file", (bad) => ["status", `--env-file=${bad}`]],
+    ["--sandbox-dir", (bad) => ["status", `--sandbox-dir=${bad}`]],
+    ["--from", (bad) => ["secrets", "push", `--from=${bad}`]],
+    ["--from-file", (bad) => ["secrets", "set", "TOKEN", `--from-file=${bad}`]],
+    ["init path", (bad) => ["init", bad]],
+    ["setup path", (bad) => ["setup", bad]],
+    ["conformance directory", (bad) => ["conformance", bad, "--static"]],
+    ["--build-from", (bad) => ["plan", `--build-from=${bad}`]],
+  ];
+  try {
+    for (const bad of ["", " \t ", `bad\0path`]) {
+      for (const [label, argv] of cases) {
+        const result = await run(argv(bad), dir);
+        assert.equal(result.exitCode, 2, `${label}: ${result.out}`);
+        assert.match(result.out, bad.includes("\0") ? /NUL byte/ : /non-empty path/, `${label}: ${result.out}`);
+        assert.equal(readFileSync(configPath, "utf8"), configText, label);
+        assert.deepEqual(readdirSync(dir), [CONFIG_FILENAME], label);
+        assert.equal(existsSync(marker), false, label);
+      }
+    }
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test("explicit sandbox directories reject non-directories before provider work and follow directory symlinks", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-dispatch-sandbox-path-"));
+  const bin = mkdtempSync(join(tmpdir(), "qm-dispatch-sandbox-bin-"));
+  const marker = join(bin, "provider-called");
+  writeFileSync(
+    join(dir, CONFIG_FILENAME),
+    JSON.stringify({
+      contract: 1,
+      orgId: "acme",
+      publicUrl: "http://localhost:8080",
+      target: "docker",
+      services: ["core"],
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
+    }),
+  );
+  const docker = join(bin, "docker");
+  writeFileSync(
+    docker,
+    `#!/usr/bin/env node
+require("node:fs").writeFileSync(${JSON.stringify(marker)}, "called");
+`,
+  );
+  chmodSync(docker, 0o755);
+  const sandbox = join(dir, "sandbox-source");
+  const sandboxLink = join(dir, "sandbox-link");
+  const file = join(dir, "regular-file");
+  const fileLink = join(dir, "file-link");
+  const fifo = join(dir, "fifo");
+  mkdirSync(sandbox);
+  symlinkSync(sandbox, sandboxLink);
+  writeFileSync(file, "not a directory");
+  symlinkSync(file, fileLink);
+  const fifoResult = spawnSync("mkfifo", [fifo]);
+  assert.equal(fifoResult.status, 0, fifoResult.stderr.toString());
+  const invalid = [join(dir, "missing"), file, fileLink, fifo, "/dev/null"];
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}${delimiter}${previousPath ?? ""}`;
+  try {
+    for (const path of invalid) {
+      const result = await run(["status", "--sandbox-dir", path], dir);
+      assert.equal(result.exitCode, 2, `${path}: ${result.out}`);
+      assert.match(result.out, /--sandbox-dir must point to an existing directory/);
+      assert.equal(existsSync(marker), false, path);
+    }
+    const accepted = await run(["config", "get", "orgId", "--sandbox-dir", sandboxLink], dir);
+    assert.equal(accepted.exitCode, null, accepted.out);
+    assert.equal(accepted.out, "acme");
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(bin, { recursive: true, force: true });
+  }
+});
+
+test("explicit secret source paths must be existing readable regular files before config resolution", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-dispatch-path-inputs-"));
+  const configPath = join(dir, CONFIG_FILENAME);
+  const invalidConfig = "{ invalid config";
+  writeFileSync(configPath, invalidConfig);
+  const directory = join(dir, "directory");
+  const unreadable = join(dir, "unreadable");
+  const fifo = join(dir, "fifo");
+  mkdirSync(directory);
+  writeFileSync(unreadable, "TOKEN=value\n");
+  chmodSync(unreadable, 0o000);
+  const fifoResult = spawnSync("mkfifo", [fifo]);
+  assert.equal(fifoResult.status, 0, fifoResult.stderr.toString());
+  const sources = [
+    join(dir, "missing"),
+    directory,
+    fifo,
+    "/dev/null",
+    ...(process.getuid?.() === 0 ? [] : [unreadable]),
+  ];
+  try {
+    for (const source of sources) {
+      for (const argv of [
+        ["secrets", "push", "--from", source],
+        ["secrets", "set", "TOKEN", "--from-file", source],
+      ]) {
+        const result = await run(argv, dir);
+        assert.equal(result.exitCode, 2, `${argv.join(" ")}: ${result.out}`);
+        assert.match(result.out, /existing readable regular file/);
+        assert.equal(readFileSync(configPath, "utf8"), invalidConfig);
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("explicit secret source paths follow symlinks to readable regular files", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-dispatch-path-symlinks-"));
+  const snapshotRoot = join(dir, "tmp");
+  mkdirSync(snapshotRoot);
+  writeFileSync(
+    join(dir, CONFIG_FILENAME),
+    JSON.stringify({
+      contract: 1,
+      orgId: "acme",
+      publicUrl: "http://localhost:8080",
+      target: "docker",
+      services: ["core"],
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
+    }),
+  );
+  const valueSource = join(dir, "value-source");
+  const valueLink = join(dir, "value-link");
+  const envSource = join(dir, "env-source");
+  const envLink = join(dir, "env-link");
+  writeFileSync(valueSource, "secret-value\n");
+  writeFileSync(envSource, "ANTHROPIC_API_KEY=test\n");
+  symlinkSync(valueSource, valueLink);
+  symlinkSync(envSource, envLink);
+  const previousTmpdir = process.env.TMPDIR;
+  process.env.TMPDIR = snapshotRoot;
+  try {
+    const set = await run(["secrets", "set", "TOKEN", "--from-file", valueLink], dir);
+    assert.equal(set.exitCode, null, set.out);
+    assert.equal(readFileSync(join(dir, ".env"), "utf8"), "TOKEN=secret-value\n");
+    const push = await run(["secrets", "push", "--from", envLink], dir);
+    assert.equal(push.exitCode, null, push.out);
+    assert.match(push.out, /docker reads \.env directly/);
+    assert.deepEqual(readdirSync(snapshotRoot), []);
+  } finally {
+    if (previousTmpdir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmpdir;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("malformed UTF-8 secret source files fail without mutation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-dispatch-path-utf8-"));
+  writeFileSync(
+    join(dir, CONFIG_FILENAME),
+    JSON.stringify({
+      contract: 1,
+      orgId: "acme",
+      publicUrl: "http://localhost:8080",
+      target: "docker",
+      services: ["core"],
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
+    }),
+  );
+  const source = join(dir, "malformed");
+  writeFileSync(source, Buffer.from([0xc3, 0x28]));
+  try {
+    const commands = [
+      ["secrets", "push", "--from", source],
+      ["secrets", "set", "TOKEN", "--from-file", source],
+    ];
+    for (const config of [readFileSync(join(dir, CONFIG_FILENAME), "utf8"), "{ invalid config"]) {
+      writeFileSync(join(dir, CONFIG_FILENAME), config);
+      for (const argv of commands) {
+        const result = await run(argv, dir);
+        assert.equal(result.exitCode, 2, `${argv.join(" ")}: ${result.out}`);
+        assert.match(result.out, /valid UTF-8 text/);
+        assert.equal(existsSync(join(dir, ".env")), false);
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("malformed UTF-8 stdin fails without mutating the deployment environment", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-dispatch-stdin-utf8-"));
+  writeFileSync(
+    join(dir, CONFIG_FILENAME),
+    JSON.stringify({
+      contract: 1,
+      orgId: "acme",
+      publicUrl: "http://localhost:8080",
+      target: "docker",
+      services: ["core"],
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
+    }),
+  );
+  const descriptor = Object.getOwnPropertyDescriptor(process, "stdin")!;
+  Object.defineProperty(process, "stdin", {
+    value: Readable.from([Buffer.from([0xc3, 0x28])]),
+    configurable: true,
+  });
+  try {
+    const result = await run(["secrets", "set", "TOKEN"], dir);
+    assert.equal(result.exitCode, 2, result.out);
+    assert.match(result.out, /input must contain valid UTF-8 text/);
+    assert.equal(existsSync(join(dir, ".env")), false);
+  } finally {
+    Object.defineProperty(process, "stdin", descriptor);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("prototype-shaped options are rejected as unknown", async () => {
+  const { out, exitCode } = await run(["version", "--__proto__=x"]);
+  assert.equal(exitCode, 2);
+  assert.match(out, /unknown option: --__proto__/);
 });
 
 test("docker --only is rejected explicitly instead of silently restarting the full stack", async () => {
@@ -412,81 +701,17 @@ test("docker --only is rejected explicitly instead of silently restarting the fu
   }
 });
 
-test("sandbox publish directs MicroVM AWS deployments (no sandbox.app) to the image-build path", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-dispatch-"));
-  const configPath = join(dir, CONFIG_FILENAME);
-  const raw = JSON.stringify({
-    contract: 1,
-    orgId: "acme",
-    publicUrl: "https://acme.example.com",
-    target: "aws",
-    services: ["core"],
-    env: { core: { AWS_DEPLOY_IMAGE: "acme-microvm-app" } },
-    aws: {
-      accountId: "123456789012",
-      region: "us-west-2",
-      cluster: "c",
-      deployRoleArn: "arn:aws:iam::123456789012:role/d",
-      secretsPrefix: "p/",
-      imageLabel: "release",
-      networking: { cloudMapNamespace: "n" },
-      services: { core: { ecrRepository: "repo", ecsService: "s", cpu: 256, memory: 512 } },
-    },
-  });
-  writeFileSync(configPath, raw);
-  mkdirSync(join(dir, "sandbox"));
-  writeFileSync(join(dir, "sandbox", "Dockerfile"), "FROM scratch\n");
-  try {
-    const result = await run(["sandbox", "publish", "--dry-run"], dir);
-    assert.equal(result.exitCode, 1, result.out);
-    assert.match(result.out, /Lambda MicroVM sandboxes/);
-    assert.match(result.out, /infra build-image/);
-    assert.equal(readFileSync(configPath, "utf8"), raw);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("sandbox publish on an AWS deployment with sandbox.app dry-runs the operator layer image", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-dispatch-"));
-  const configPath = join(dir, CONFIG_FILENAME);
-  const raw = JSON.stringify({
-    contract: 1,
-    orgId: "acme",
-    publicUrl: "https://acme.example.com",
-    target: "aws",
-    services: ["core"],
-    env: { core: { AWS_DEPLOY_IMAGE: "acme-microvm-app" } },
-    sandbox: { backend: "sprites", app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
-    aws: {
-      accountId: "123456789012",
-      region: "us-west-2",
-      cluster: "c",
-      deployRoleArn: "arn:aws:iam::123456789012:role/d",
-      secretsPrefix: "p/",
-      imageLabel: "release",
-      networking: { cloudMapNamespace: "n" },
-      services: { core: { ecrRepository: "repo", ecsService: "s", cpu: 256, memory: 512 } },
-    },
-  });
-  writeFileSync(configPath, raw);
-  mkdirSync(join(dir, "sandbox"));
-  writeFileSync(join(dir, "sandbox", "Dockerfile"), "FROM scratch\n");
-  try {
-    const result = await run(["sandbox", "publish", "--dry-run"], dir);
-    assert.equal(result.exitCode, null, result.out);
-    assert.match(result.out, /sandbox publish → registry\.fly\.io\/acme-sandboxes:latest/);
-    assert.match(result.out, /DRY RUN — nothing built, pushed, or recorded/);
-    assert.equal(readFileSync(configPath, "utf8"), raw);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+test("sandbox publish rejects the unsupported OCI workflow before resolving a deployment", async () => {
+  const result = await run(["sandbox", "publish"]);
+  assert.equal(result.exitCode, 1, result.out);
+  assert.match(result.out, /supported sandbox backends do not consume OCI layer images/);
+  assert.doesNotMatch(result.out, /no qm\.config/);
 });
 
 test("destructive commands reject unknown flags before resolving a deployment", async () => {
   for (const argv of [
     ["up", "--dryrun"],
-    ["sandbox", "publish", "--dryrun"],
+    ["sandbox", "build", "--dryrun"],
     ["down", "--confg", "/tmp/other"],
     ["rollback", "--too", "v1"],
     ["secrets", "push", "--form", "operator.env"],
@@ -538,7 +763,7 @@ test("destructive commands reject extra positionals and boolean flags never cons
   for (const argv of [
     ["up", "unexpected"],
     ["up", "--dry-run", "unexpected"],
-    ["sandbox", "publish", "unexpected"],
+    ["sandbox", "build", "unexpected"],
     ["down", "--purge", "unexpected"],
     ["rollback", "unexpected"],
     ["secrets", "push", "unexpected"],
@@ -549,7 +774,7 @@ test("destructive commands reject extra positionals and boolean flags never cons
     assert.match(result.out, /unexpected argument/);
     assert.doesNotMatch(result.out, /no qm\.config/);
   }
-  const valuedBoolean = await run(["sandbox", "publish", "--dry-run=false"]);
+  const valuedBoolean = await run(["sandbox", "build", "--dry-run=false"]);
   assert.equal(valuedBoolean.exitCode, 2, valuedBoolean.out);
   assert.match(valuedBoolean.out, /--dry-run does not take a value/);
 });
@@ -576,7 +801,7 @@ test("conformance honors the deploy-wide --config and --sandbox-dir flags", asyn
       publicUrl: "http://localhost:8080",
       target: "docker",
       services: ["core"],
-      sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     }),
   );
   mkdirSync(join(sandboxDir, "skills", "greet"), { recursive: true });
@@ -619,7 +844,7 @@ test("config get prints raw scalars and JSON objects, honors --target, and fails
       publicUrl: "http://localhost:8080",
       target: "docker",
       services: ["core"],
-      sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     }),
   );
   try {
@@ -627,13 +852,13 @@ test("config get prints raw scalars and JSON objects, honors --target, and fails
     assert.equal(scalar.exitCode, null, scalar.out);
     assert.equal(scalar.out, "acme", "scalars print raw, with no quotes");
 
-    const nested = await run(["config", "get", "sandbox.app"], dir);
+    const nested = await run(["config", "get", "sandbox.namePrefix"], dir);
     assert.equal(nested.out, "acme-sandboxes");
 
     const object = await run(["config", "get", "sandbox"], dir);
     assert.deepEqual(
       JSON.parse(object.out),
-      { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      { backend: "sprites", namePrefix: "acme-sandboxes" },
       "objects print as JSON",
     );
 
@@ -643,6 +868,12 @@ test("config get prints raw scalars and JSON objects, honors --target, and fails
     const missing = await run(["config", "get", "aws.deployRoleArn"], dir);
     assert.equal(missing.exitCode, 1);
     assert.match(missing.out, /"aws\.deployRoleArn" is not set/);
+
+    for (const inherited of ["constructor", "__proto__", "toString"]) {
+      const result = await run(["config", "get", inherited], dir);
+      assert.equal(result.exitCode, 1);
+      assert.match(result.out, new RegExp(`"${inherited}" is not set`));
+    }
 
     const usage = await run(["config", "get"], dir);
     assert.equal(usage.exitCode, 2);
@@ -662,7 +893,7 @@ test("--target revalidates the effective provider config", async () => {
       publicUrl: "http://localhost:8080",
       target: "docker",
       services: ["core"],
-      sandbox: { backend: "sprites", app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     }),
   );
   try {
@@ -681,7 +912,7 @@ test("check --json routes failures on structured clause data, not message sniffi
     publicUrl: "http://localhost:8080",
     target: "docker",
     services: ["core"],
-    sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+    sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
   };
   const sandboxDir = mkdtempSync(join(tmpdir(), "qm-dispatch-"));
   writeFileSync(join(sandboxDir, CONFIG_FILENAME), JSON.stringify(base));
@@ -693,7 +924,7 @@ test("check --json routes failures on structured clause data, not message sniffi
     JSON.stringify({
       ...base,
       target: "aws",
-      sandbox: { backend: "sprites", app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
       aws: {
         accountId: "123456789012",
         region: "us-west-2",
@@ -737,7 +968,7 @@ test("check --json groups a multi-clause failure under each error's own clause, 
       publicUrl: "http://localhost:8080",
       target: "docker",
       services: ["core"],
-      sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
       env: { core: { MY_API_KEY: "x" } },
     }),
   );

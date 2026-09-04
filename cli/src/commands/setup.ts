@@ -1,5 +1,4 @@
 import { generateKeyPairSync, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
 import { Writable } from "node:stream";
@@ -7,19 +6,26 @@ import { CONFIG_FILENAME, configPathInDir, loadConfigAt, validOrgId, type Target
 import { bold, die, dim, header, note, ok, warn } from "../log.ts";
 import { HOSTING_PROVIDER_IDS, isTarget } from "../providers.ts";
 import { computedSecrets, MINT_JWK, MINT_LOCALLY, type ComputedSecret } from "../secrets.ts";
-import { isInvalidSecret, readEnvFile } from "../util.ts";
+import {
+  adminGrantEmail,
+  assertEnvFileMutationSafe,
+  assertSecretByteLength,
+  invalidSecretNames,
+  promptHidden,
+  readEnvFile,
+  writeEnvValues,
+} from "../util.ts";
 import { runInit } from "./init.ts";
+
+export { updateEnvContent } from "../util.ts";
 
 export function adminGrantEmails(adminGrants: string | undefined): string {
   return (adminGrants ?? "")
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean)
-    .map((entry) => {
-      const separator = entry.lastIndexOf(":");
-      return (separator === -1 ? entry : entry.slice(0, separator)).trim();
-    })
-    .filter((principal) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(principal))
+    .map(adminGrantEmail)
+    .filter((email): email is string => email !== undefined)
     .join(",");
 }
 
@@ -99,10 +105,6 @@ const PLAYBOOKS: Readonly<Record<string, readonly string[]>> = {
     "is usually a tunnel or LAN address; for fly/aws it matches your apiUrl when",
     "configured (split-hostname stacks), otherwise your publicUrl.",
   ],
-  FLY_SANDBOX_API_TOKEN: [
-    "A Fly deploy token scoped to the agent-computer app <sandbox-app>.",
-    "Create the app first if it does not exist: fly apps create <sandbox-app>",
-  ],
   FLY_DEPLOY_API_TOKEN: [
     "Required only when env.core.DEPLOY_PROVIDER is explicitly set to fly.",
     "A separate Fly organization token for qm's per-deployment apps.",
@@ -122,13 +124,11 @@ const FORMAT_HINTS: Readonly<Record<string, { prefix: string; label: string }>> 
 };
 
 export function playbookFor(name: string, config: QmConfig): string[] {
-  const lines = PLAYBOOKS[name];
+  const lines = Object.hasOwn(PLAYBOOKS, name) ? PLAYBOOKS[name] : undefined;
   if (!lines) return [];
-  const app = config.sandbox?.app ?? "<sandbox-app>";
   const flyOrg = config.flyOrg ?? "<fly-org>";
   return lines.map((line) =>
     line
-      .replaceAll("<sandbox-app>", app)
       .replaceAll("<fly-org>", flyOrg)
       .replaceAll("<public-url>", config.publicUrl.replace(/\/$/, ""))
       .replaceAll("<manifest>", "slack-app-manifest.yml"),
@@ -140,63 +140,46 @@ export function pendingSecrets(
   env: Map<string, string>,
 ): { todo: ComputedSecret[]; done: ComputedSecret[] } {
   const operator = computedSecrets(config).filter((secret) => secret.managedBy === "operator" && secret.required);
-  const todo = operator.filter((secret) => isInvalidSecret(secret.name, env.get(secret.name)));
-  const done = operator.filter((secret) => !isInvalidSecret(secret.name, env.get(secret.name)));
+  const invalid = invalidSecretNames(
+    new Map(computedSecrets(config).map((secret) => [secret.name, env.get(secret.name)])),
+  );
+  const todo = operator.filter((secret) => invalid.has(secret.name));
+  const done = operator.filter((secret) => !invalid.has(secret.name));
   todo.sort((a, b) => Number(b.required) - Number(a.required) || a.name.localeCompare(b.name));
   return { todo, done };
 }
 
-export function updateEnvContent(content: string, entries: ReadonlyMap<string, string>): string {
-  const remaining = new Map(entries);
-  const lines = content.split("\n").map((line) => {
-    const match = /^(#\s*)?([A-Z][A-Z0-9_]*)=/.exec(line.trim());
-    const name = match?.[2];
-    if (!name || !remaining.has(name)) return line;
-    const value = remaining.get(name)!;
-    remaining.delete(name);
-    return `${name}=${value}`;
-  });
-  let out = lines.join("\n");
-  if (remaining.size > 0) {
-    if (out !== "" && !out.endsWith("\n")) out += "\n";
-    for (const [name, value] of remaining) out += `${name}=${value}\n`;
-  }
-  return out;
-}
-
 function makePrompter(): {
-  rl: Interface;
+  close: () => void;
   ask: (q: string) => Promise<string>;
   askHidden: (q: string) => Promise<string>;
 } {
-  let muted = false;
   const output = new Writable({
     write(chunk: Buffer | string, _enc, cb): void {
-      if (!muted) process.stdout.write(chunk);
+      process.stdout.write(chunk);
       cb();
     },
   });
-  const rl = createInterface({ input: process.stdin, output, terminal: process.stdin.isTTY === true });
+  const open = (): Interface =>
+    createInterface({ input: process.stdin, output, terminal: process.stdin.isTTY === true });
+  let rl = open();
   const ask = async (q: string): Promise<string> => (await rl.question(q)).trim();
   const askHidden = async (q: string): Promise<string> => {
-    process.stdout.write(q);
-    muted = true;
+    rl.close();
     try {
-      const answer = await rl.question("");
-      process.stdout.write("\n");
-      return answer.trim();
+      return await promptHidden(q, q);
     } finally {
-      muted = false;
+      rl = open();
     }
   };
-  return { rl, ask, askHidden };
+  return { close: () => rl.close(), ask, askHidden };
 }
 
 export async function runSetup(opts: { dir: string }): Promise<void> {
   if (process.stdin.isTTY !== true) {
     die("setup is an interactive wizard — run it in a terminal (scripted setups edit .env directly; see .env.example)");
   }
-  const { rl, ask, askHidden } = makePrompter();
+  const { close, ask, askHidden } = makePrompter();
   try {
     const dir = opts.dir;
     let configPath = configPathInDir(dir) ?? join(dir, CONFIG_FILENAME);
@@ -221,9 +204,11 @@ export async function runSetup(opts: { dir: string }): Promise<void> {
       note("");
     }
 
-    const config = loadConfigAt(configPath).config;
+    const loaded = loadConfigAt(configPath);
+    const config = loaded.config;
     const envPath = join(dir, ".env");
-    const env = readEnvFile(envPath);
+    assertEnvFileMutationSafe(envPath, configPath);
+    const env = readEnvFile(envPath, { protectedIdentity: loaded.configIdentity });
     const { todo, done } = pendingSecrets(config, env);
 
     header(`Secrets for org ${config.orgId} (target ${config.target})`);
@@ -271,7 +256,8 @@ export async function runSetup(opts: { dir: string }): Promise<void> {
         warn(`  skipped — required before \`up\`; re-run setup to fill it\n`);
         continue;
       }
-      const hint = FORMAT_HINTS[secret.name];
+      assertSecretByteLength(secret.name, value);
+      const hint = Object.hasOwn(FORMAT_HINTS, secret.name) ? FORMAT_HINTS[secret.name] : undefined;
       if (hint && !value.startsWith(hint.prefix)) {
         const keep = await ask(`  that doesn't look right (${hint.label}) — keep it anyway? [y/N] `);
         if (!/^y/i.test(keep)) {
@@ -285,9 +271,7 @@ export async function runSetup(opts: { dir: string }): Promise<void> {
     }
 
     if (collected.size > 0) {
-      const existing = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
-      writeFileSync(envPath, updateEnvContent(existing, collected), { mode: 0o600 });
-      chmodSync(envPath, 0o600);
+      writeEnvValues(envPath, collected, configPath);
       ok(`wrote ${collected.size} value${collected.size === 1 ? "" : "s"} to .env`);
     }
 
@@ -304,6 +288,6 @@ export async function runSetup(opts: { dir: string }): Promise<void> {
     else stepLine(n++, "qm up", "bring the deployment up and print the URLs");
     if (skipped.length > 0 && remainingRequired.length === 0) note(dim(`  (optional skipped: ${skipped.join(", ")})`));
   } finally {
-    rl.close();
+    close();
   }
 }

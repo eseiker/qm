@@ -1,13 +1,33 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  closeSync,
+  constants,
+  existsSync,
+  fchmodSync,
+  fsyncSync,
+  lstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { deflateRawSync } from "node:zlib";
-import { withAwsLease } from "../aws-lease.ts";
-import { updateConfigCoreEnv, type QmConfig } from "../config.ts";
+import {
+  awsCapture as capture,
+  awsCaptureAsync,
+  awsCliErrorMatches,
+  awsLeaseBoundary,
+  withAwsLease,
+} from "../aws-lease.ts";
+import { loadConfigAt, updateConfigCoreEnv, type QmConfig } from "../config.ts";
 import { CliError, ok, step } from "../log.ts";
 import { awsObjectStoreBucket } from "../terraform.ts";
-import { capture, sleep } from "../util.ts";
+import { sleep } from "../util.ts";
 import { guardLambdaMicrovms } from "../backends/aws.ts";
 
 interface ImageSummary {
@@ -24,6 +44,7 @@ interface InfraWaitOptions {
   timeoutMs?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  configPath?: string;
 }
 
 interface MicrovmSummary {
@@ -45,6 +66,15 @@ interface ObjectVersion {
 
 interface ImageOperation extends ImageSummary {
   imageVersion?: string;
+}
+
+interface ConfigPinTarget {
+  path: string;
+  dev: number;
+  ino: number;
+  mode: number;
+  sha256: string;
+  config: QmConfig;
 }
 
 const crcTable = Array.from({ length: 256 }, (_, n) => {
@@ -114,6 +144,29 @@ export function microvmBuildArchive(): Buffer {
   ]);
 }
 
+export function microvmBuildArchiveSha256(archive = microvmBuildArchive()): string {
+  return createHash("sha256").update(archive).digest("hex");
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const imageStates = new Set([
+  "CREATING",
+  "CREATED",
+  "CREATE_FAILED",
+  "UPDATING",
+  "UPDATED",
+  "UPDATE_FAILED",
+  "DELETING",
+  "DELETED",
+  "DELETE_FAILED",
+]);
+const imageVersionStates = new Set(["IN_PROGRESS", "SUCCESSFUL", "FAILED", "DELETING", "DELETED", "DELETE_FAILED"]);
+const imageVersionStatuses = new Set(["ACTIVE", "INACTIVE"]);
+const microvmStates = new Set(["PENDING", "RUNNING", "SUSPENDING", "SUSPENDED", "TERMINATING", "TERMINATED"]);
+const isImageVersion = (value: unknown): value is string => typeof value === "string" && /^[1-9][0-9]*$/.test(value);
+
 function imageList(awsBin: string, region: string, name: string): ImageSummary[] {
   const raw = capture(awsBin, [
     "lambda-microvms",
@@ -126,8 +179,26 @@ function imageList(awsBin: string, region: string, name: string): ImageSummary[]
     "json",
     "--no-cli-pager",
   ]);
-  const parsed = JSON.parse(raw) as { items?: ImageSummary[] };
-  return parsed.items ?? [];
+  const parsed: unknown = JSON.parse(raw);
+  if (
+    !isRecord(parsed) ||
+    !Array.isArray(parsed.items) ||
+    !parsed.items.every(
+      (item) =>
+        isRecord(item) &&
+        typeof item.name === "string" &&
+        item.name.length > 0 &&
+        typeof item.imageArn === "string" &&
+        item.imageArn.length > 0 &&
+        typeof item.state === "string" &&
+        imageStates.has(item.state) &&
+        (item.latestActiveImageVersion === undefined || isImageVersion(item.latestActiveImageVersion)) &&
+        (item.latestFailedImageVersion === undefined || isImageVersion(item.latestFailedImageVersion)),
+    )
+  ) {
+    throw new CliError("AWS returned an invalid MicroVM image-list response");
+  }
+  return parsed.items as unknown as ImageSummary[];
 }
 
 function configuredAws(
@@ -244,7 +315,7 @@ export async function deleteAwsTaskDefinitions(config: QmConfig): Promise<void> 
       const revisions = [...new Set([...active, ...inactive])];
       for (const arn of revisions) assertTaskDefinitionOwnership(config, awsBin, arn);
       for (const arn of active) {
-        capture(awsBin, [
+        await awsCaptureAsync(awsBin, [
           "ecs",
           "deregister-task-definition",
           "--task-definition",
@@ -258,7 +329,7 @@ export async function deleteAwsTaskDefinitions(config: QmConfig): Promise<void> 
       }
       for (let index = 0; index < revisions.length; index += 10) {
         const deleted = JSON.parse(
-          capture(awsBin, [
+          await awsCaptureAsync(awsBin, [
             "ecs",
             "delete-task-definitions",
             "--task-definitions",
@@ -335,7 +406,7 @@ async function waitForSettledImage(
 }
 
 function getImageVersion(awsBin: string, region: string, imageArn: string, imageVersion: string): ImageVersionSummary {
-  return JSON.parse(
+  const parsed: unknown = JSON.parse(
     capture(awsBin, [
       "lambda-microvms",
       "get-microvm-image-version",
@@ -349,7 +420,18 @@ function getImageVersion(awsBin: string, region: string, imageArn: string, image
       "json",
       "--no-cli-pager",
     ]),
-  ) as ImageVersionSummary;
+  );
+  if (
+    !isRecord(parsed) ||
+    !isImageVersion(parsed.imageVersion) ||
+    typeof parsed.state !== "string" ||
+    !imageVersionStates.has(parsed.state) ||
+    (parsed.status !== undefined && (typeof parsed.status !== "string" || !imageVersionStatuses.has(parsed.status))) ||
+    (parsed.stateReason !== undefined && typeof parsed.stateReason !== "string")
+  ) {
+    throw new CliError("AWS returned an invalid MicroVM image-version response");
+  }
+  return parsed as unknown as ImageVersionSummary;
 }
 
 async function waitForImageVersion(
@@ -381,45 +463,113 @@ async function waitForImageVersion(
   }
 }
 
-function recordImagePin(
-  configPath: string,
+function configPinTarget(configPath: string): ConfigPinTarget {
+  const path = resolve(configPath);
+  let entry: ReturnType<typeof lstatSync>;
+  try {
+    entry = lstatSync(path);
+    accessSync(dirname(path), constants.W_OK | constants.X_OK);
+  } catch (error) {
+    throw new CliError("the deployment config cannot be safely replaced to record AWS image coordinates", {
+      cause: error,
+    });
+  }
+  if (!entry.isFile() || entry.isSymbolicLink() || entry.nlink !== 1 || (entry.mode & 0o222) === 0) {
+    throw new CliError("the deployment config cannot be safely replaced to record AWS image coordinates");
+  }
+  const loaded = loadConfigAt(path).config;
+  const sha256 = createHash("sha256").update(readFileSync(path)).digest("hex");
+  return { path, dev: entry.dev, ino: entry.ino, mode: entry.mode & 0o7777, sha256, config: loaded };
+}
+
+function assertConfigPinTarget(target: ConfigPinTarget): void {
+  const entry = lstatSync(target.path);
+  if (
+    !entry.isFile() ||
+    entry.isSymbolicLink() ||
+    entry.nlink !== 1 ||
+    entry.dev !== target.dev ||
+    entry.ino !== target.ino ||
+    (entry.mode & 0o7777) !== target.mode ||
+    createHash("sha256").update(readFileSync(target.path)).digest("hex") !== target.sha256
+  ) {
+    throw new CliError("the deployment config changed while recording AWS image coordinates");
+  }
+}
+
+async function updateImagePin(target: ConfigPinTarget, updates: Record<string, string | undefined>): Promise<void> {
+  assertConfigPinTarget(target);
+  const raw = readFileSync(target.path, "utf8");
+  const updated = updateConfigCoreEnv(raw, updates);
+  if (updated === raw) return;
+  const temporary = join(dirname(target.path), `.${basename(target.path)}.${randomUUID()}.tmp`);
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      target.mode,
+    );
+    writeFileSync(descriptor, updated, "utf8");
+    fchmodSync(descriptor, target.mode);
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    loadConfigAt(temporary);
+    await awsLeaseBoundary();
+    assertConfigPinTarget(target);
+    renameSync(temporary, target.path);
+    const directory = openSync(dirname(target.path), constants.O_RDONLY);
+    try {
+      fsyncSync(directory);
+    } finally {
+      closeSync(directory);
+    }
+    await awsLeaseBoundary();
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+    rmSync(temporary, { force: true });
+  }
+}
+
+async function recordImagePin(
+  target: ConfigPinTarget,
   image: ImageSummary,
   version: string,
   executionRoleArn: string,
-): { imageArn: string; version: string } {
-  const raw = readFileSync(configPath, "utf8");
-  writeFileSync(
-    configPath,
-    updateConfigCoreEnv(raw, {
-      AWS_DEPLOY_IMAGE_VERSION: version,
-      AWS_DEPLOY_EXEC_ROLE_ARN: executionRoleArn,
-    }),
-  );
+  sourceSha256: string,
+): Promise<{ imageArn: string; version: string }> {
+  await updateImagePin(target, {
+    AWS_DEPLOY_IMAGE_VERSION: version,
+    AWS_DEPLOY_EXEC_ROLE_ARN: executionRoleArn,
+    AWS_DEPLOY_IMAGE_SOURCE_SHA256: sourceSha256,
+  });
   ok(`built ${image.imageArn} version ${version}`);
-  ok("recorded AWS_DEPLOY_IMAGE_VERSION and AWS_DEPLOY_EXEC_ROLE_ARN in the QM deployment config");
+  ok("recorded the AWS deploy image version, role, and source digest in the QM deployment config");
   return { imageArn: image.imageArn, version };
 }
 
 export async function buildAwsMicrovmImage(
-  config: QmConfig,
+  _config: QmConfig,
   configPath: string,
   options: InfraWaitOptions = {},
 ): Promise<{ imageArn: string; version: string }> {
-  const configured = configuredAws(config, "infra build-image");
-  return withAwsLease(configured.aws, () => buildAwsMicrovmImageLocked(config, configPath, options, configured)).catch(
-    guardLambdaMicrovms,
-  );
+  const target = configPinTarget(configPath);
+  const configured = configuredAws(target.config, "infra build-image");
+  return withAwsLease(configured.aws, () =>
+    buildAwsMicrovmImageLocked(target.config, target, options, configured),
+  ).catch(guardLambdaMicrovms);
 }
 
 async function buildAwsMicrovmImageLocked(
   config: QmConfig,
-  configPath: string,
+  target: ConfigPinTarget,
   options: InfraWaitOptions,
   configured: ReturnType<typeof configuredAws>,
 ): Promise<{ imageArn: string; version: string }> {
   const { aws, awsBin, imageName } = configured;
   const archive = microvmBuildArchive();
-  const digest = createHash("sha256").update(archive).digest("hex");
+  const digest = microvmBuildArchiveSha256(archive);
   const bucket = awsObjectStoreBucket(config);
   const key = `deployment/microvm-images/${digest}.zip`;
   const uri = `s3://${bucket}/${key}`;
@@ -448,7 +598,7 @@ async function buildAwsMicrovmImageLocked(
   let operation: ImageOperation | undefined;
   try {
     writeFileSync(archivePath, archive);
-    capture(awsBin, [
+    await awsCaptureAsync(awsBin, [
       "s3api",
       "put-object",
       "--bucket",
@@ -473,8 +623,8 @@ async function buildAwsMicrovmImageLocked(
         ? ["--image-identifier", existing.imageArn]
         : ["--name", imageName, "--tags", JSON.stringify({ ManagedBy: "qm-cli", Deployment: config.orgId })];
       try {
-        operation = JSON.parse(
-          capture(awsBin, [
+        const response: unknown = JSON.parse(
+          await awsCaptureAsync(awsBin, [
             "lambda-microvms",
             command,
             ...identityArgs,
@@ -492,11 +642,23 @@ async function buildAwsMicrovmImageLocked(
             "json",
             "--no-cli-pager",
           ]),
-        ) as ImageOperation;
+        );
+        if (
+          !isRecord(response) ||
+          typeof response.imageArn !== "string" ||
+          response.imageArn.length === 0 ||
+          !isImageVersion(response.imageVersion) ||
+          typeof response.state !== "string" ||
+          !imageStates.has(response.state) ||
+          (response.name !== undefined && typeof response.name !== "string")
+        ) {
+          throw new CliError("AWS returned an invalid MicroVM image operation response");
+        }
+        operation = response as unknown as ImageOperation;
         step(`${existing ? "updating" : "creating"} ${imageName}`);
         break;
       } catch (error) {
-        if (!/ConflictException|conflict/i.test(error instanceof Error ? error.message : String(error))) throw error;
+        if (!awsCliErrorMatches(error, "ConflictException")) throw error;
         if (now() >= deadline) throw new CliError(`timed out waiting to start MicroVM image build ${imageName}`);
         step(`another ${imageName} image operation started; waiting for it before retrying this build`);
         await wait(options.intervalMs ?? 10_000);
@@ -508,16 +670,16 @@ async function buildAwsMicrovmImageLocked(
   } finally {
     rmSync(work, { recursive: true, force: true });
   }
-  if (!operation?.imageArn || !operation.imageVersion) {
+  if (!operation?.imageArn || !isImageVersion(operation.imageVersion)) {
     throw new CliError(`AWS did not return the MicroVM image ARN and version for ${imageName}`);
   }
   assertImageIdentity(config, awsBin, { ...operation, name: operation.name || imageName });
   await waitForImageVersion(awsBin, aws.region, operation.imageArn, operation.imageVersion, options);
-  return recordImagePin(configPath, operation, operation.imageVersion, executionRoleArn);
+  return recordImagePin(target, operation, operation.imageVersion, executionRoleArn, digest);
 }
 
 function listMicrovms(awsBin: string, region: string, imageArn: string): MicrovmSummary[] {
-  const parsed = JSON.parse(
+  const parsed: unknown = JSON.parse(
     capture(awsBin, [
       "lambda-microvms",
       "list-microvms",
@@ -529,11 +691,25 @@ function listMicrovms(awsBin: string, region: string, imageArn: string): Microvm
       "json",
       "--no-cli-pager",
     ]),
-  ) as { items?: MicrovmSummary[] };
-  return parsed.items ?? [];
+  );
+  if (
+    !isRecord(parsed) ||
+    !Array.isArray(parsed.items) ||
+    !parsed.items.every(
+      (microvm) =>
+        isRecord(microvm) &&
+        typeof microvm.microvmId === "string" &&
+        microvm.microvmId.length > 0 &&
+        typeof microvm.state === "string" &&
+        microvmStates.has(microvm.state),
+    )
+  ) {
+    throw new CliError("AWS returned an invalid MicroVM list response");
+  }
+  return parsed.items as unknown as MicrovmSummary[];
 }
 
-function deleteMicrovmBuildArtifacts(config: QmConfig, awsBin: string): void {
+async function deleteMicrovmBuildArtifacts(config: QmConfig, awsBin: string): Promise<void> {
   const aws = config.aws!;
   const bucket = awsObjectStoreBucket(config);
   const prefix = "deployment/microvm-images/";
@@ -556,7 +732,7 @@ function deleteMicrovmBuildArtifacts(config: QmConfig, awsBin: string): void {
     .map((object) => ({ Key: object.Key, VersionId: object.VersionId }));
   for (let index = 0; index < objects.length; index += 1000) {
     const deleted = JSON.parse(
-      capture(awsBin, [
+      await awsCaptureAsync(awsBin, [
         "s3api",
         "delete-objects",
         "--bucket",
@@ -579,9 +755,19 @@ function deleteMicrovmBuildArtifacts(config: QmConfig, awsBin: string): void {
   ok(`deleted ${objects.length} MicroVM build artifact version${objects.length === 1 ? "" : "s"}`);
 }
 
+async function clearImagePin(target: ConfigPinTarget | undefined): Promise<void> {
+  if (!target) return;
+  await updateImagePin(target, {
+    AWS_DEPLOY_IMAGE_VERSION: undefined,
+    AWS_DEPLOY_IMAGE_SOURCE_SHA256: undefined,
+  });
+}
+
 export async function deleteAwsMicrovmImage(config: QmConfig, options: InfraWaitOptions = {}): Promise<void> {
-  const configured = configuredAws(config, "infra delete-image");
-  return withAwsLease(configured.aws, () => deleteAwsMicrovmImageLocked(config, options, configured)).catch(
+  const target = options.configPath ? configPinTarget(options.configPath) : undefined;
+  const selected = target?.config ?? config;
+  const configured = configuredAws(selected, "infra delete-image");
+  return withAwsLease(configured.aws, () => deleteAwsMicrovmImageLocked(selected, options, configured, target)).catch(
     guardLambdaMicrovms,
   );
 }
@@ -590,13 +776,15 @@ async function deleteAwsMicrovmImageLocked(
   config: QmConfig,
   options: InfraWaitOptions,
   configured: ReturnType<typeof configuredAws>,
+  target: ConfigPinTarget | undefined,
 ): Promise<void> {
   const { aws, awsBin, imageName } = configured;
   const expectedArn = `arn:aws:lambda:${aws.region}:${aws.accountId}:microvm-image:${imageName}`;
   let image = findImage(awsBin, aws.region, imageName);
   if (!image || image.state === "DELETED") {
     ok(`MicroVM image ${imageName} is already deleted`);
-    deleteMicrovmBuildArtifacts(config, awsBin);
+    await clearImagePin(target);
+    await deleteMicrovmBuildArtifacts(config, awsBin);
     return;
   }
   assertImageIdentity(config, awsBin, image);
@@ -605,7 +793,8 @@ async function deleteAwsMicrovmImageLocked(
     image = await waitForSettledImage(awsBin, aws.region, imageName, options);
     if (!image || image.state === "DELETED") {
       ok(`MicroVM image ${imageName} is deleted`);
-      deleteMicrovmBuildArtifacts(config, awsBin);
+      await clearImagePin(target);
+      await deleteMicrovmBuildArtifacts(config, awsBin);
       return;
     }
     assertImageIdentity(config, awsBin, image);
@@ -618,7 +807,7 @@ async function deleteAwsMicrovmImageLocked(
     const active = listMicrovms(awsBin, aws.region, expectedArn).filter((microvm) => microvm.state !== "TERMINATED");
     for (const microvm of active) {
       if (microvm.state === "TERMINATING") continue;
-      capture(awsBin, [
+      await awsCaptureAsync(awsBin, [
         "lambda-microvms",
         "terminate-microvm",
         "--microvm-identifier",
@@ -636,7 +825,7 @@ async function deleteAwsMicrovmImageLocked(
     await wait(options.intervalMs ?? 10_000);
   }
 
-  capture(awsBin, [
+  await awsCaptureAsync(awsBin, [
     "lambda-microvms",
     "delete-microvm-image",
     "--image-identifier",
@@ -653,7 +842,8 @@ async function deleteAwsMicrovmImageLocked(
     image = findImage(awsBin, aws.region, imageName);
     if (!image || image.state === "DELETED") {
       ok(`deleted MicroVM image ${imageName}`);
-      deleteMicrovmBuildArtifacts(config, awsBin);
+      await clearImagePin(target);
+      await deleteMicrovmBuildArtifacts(config, awsBin);
       return;
     }
     if (image.state === "DELETE_FAILED") throw new CliError(`MicroVM image ${imageName} failed to delete`);

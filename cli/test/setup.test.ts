@@ -1,8 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { linkSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { CONFIG_FILENAME, loadConfigAt } from "../src/config.ts";
 import {
   adminGrantEmails,
@@ -13,6 +14,7 @@ import {
   runSetup,
 } from "../src/commands/setup.ts";
 import { CliError } from "../src/log.ts";
+import { readEnvFile } from "../src/util.ts";
 
 function configFor(
   services: string[],
@@ -26,7 +28,7 @@ function configFor(
       `{
       "contract": 1, "orgId": "acme", "publicUrl": "http://localhost:8082", "target": "docker",
       "model": "claude-opus-4-8", "services": ${JSON.stringify(services)}, "plugins": [], "skills": [],
-      "env": ${env}, "sandbox": { "app": "acme-sandboxes" }${extra}
+      "env": ${env}, "sandbox": { "backend": "sprites", "namePrefix": "acme-sandboxes" }${extra}
     }`,
     );
     return loadConfigAt(join(dir, CONFIG_FILENAME)).config;
@@ -66,11 +68,11 @@ test("pendingSecrets keeps a malformed administrator seed pending", () => {
     `,
       "secretEnv": { "core": { "ADMIN_GRANTS": "ADMIN_GRANTS" } }`,
   );
-  assert.ok(
-    pendingSecrets(config, new Map([["ADMIN_GRANTS", "admin@example.com"]])).todo.some(
-      (secret) => secret.name === "ADMIN_GRANTS",
-    ),
-  );
+  for (const value of ["admin@example.com", "admin@example.com:viewer:org_admin", "admin@example.com::org_admin"]) {
+    assert.ok(
+      pendingSecrets(config, new Map([["ADMIN_GRANTS", value]])).todo.some((secret) => secret.name === "ADMIN_GRANTS"),
+    );
+  }
   assert.ok(
     pendingSecrets(config, new Map([["ADMIN_GRANTS", "admin@example.com:org_admin"]])).done.some(
       (secret) => secret.name === "ADMIN_GRANTS",
@@ -103,8 +105,20 @@ test("updateEnvContent replaces blank and commented lines in place and appends n
 });
 
 test("updateEnvContent replaces an already-set value", () => {
-  const after = updateEnvContent("A=old\nB=keep\n", new Map([["A", "new"]]));
+  const after = updateEnvContent("export A=old\nB=keep\n# A=commented\nA=stale\n", new Map([["A", "new"]]));
   assert.equal(after, "A=new\nB=keep\n");
+});
+
+test("updateEnvContent rejects process-unsafe values without echoing them", () => {
+  assert.throws(
+    () => updateEnvContent("", new Map([["TOKEN", "private\0value"]])),
+    (error: unknown) => {
+      assert.match((error as Error).message, /TOKEN.*NUL/);
+      assert.doesNotMatch((error as Error).message, /private/);
+      return true;
+    },
+  );
+  assert.throws(() => updateEnvContent("", new Map([["BAD KEY", "value"]])), /not a valid environment/);
 });
 
 test("playbooks substitute the manifest names", () => {
@@ -125,6 +139,12 @@ test("the sign-in allowlist derives from the administrator seed", () => {
     "admin@example.com,ops@example.com",
   );
   assert.equal(adminGrantEmails("U012345:org_admin"), "", "a Slack-style principal is not an email address");
+  assert.equal(adminGrantEmails("bad<name@example.com:org_admin"), "");
+  assert.equal(adminGrantEmails("admin@example.com:viewer:org_admin"), "");
+  assert.equal(adminGrantEmails("admin@example.com::org_admin"), "");
+  assert.equal(adminGrantEmails("admin@example.com\0:org_admin"), "");
+  assert.equal(adminGrantEmails("admin@example.com:viewer"), "");
+  assert.equal(adminGrantEmails("admin@example.com"), "");
   assert.equal(adminGrantEmails(undefined), "");
   assert.equal(adminGrantEmails(""), "");
 });
@@ -174,4 +194,116 @@ test("runSetup refuses to run without a TTY", async () => {
       return true;
     },
   );
+});
+
+async function withSetupTty<T>(fn: (input: PassThrough) => Promise<T>): Promise<T> {
+  const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode(): void {} });
+  const descriptor = Object.getOwnPropertyDescriptor(process, "stdin")!;
+  const write = process.stdout.write;
+  Object.defineProperty(process, "stdin", { value: input, configurable: true });
+  process.stdout.write = (() => true) as typeof process.stdout.write;
+  try {
+    return await fn(input);
+  } finally {
+    process.stdout.write = write;
+    Object.defineProperty(process, "stdin", descriptor);
+    input.destroy();
+  }
+}
+
+test("runSetup preserves hidden secret bytes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-setup-hidden-"));
+  try {
+    writeFileSync(
+      join(dir, CONFIG_FILENAME),
+      JSON.stringify({
+        contract: 1,
+        orgId: "acme",
+        publicUrl: "http://localhost:8080",
+        target: "docker",
+        services: ["core"],
+        secretEnv: { core: { CUSTOM_SECRET: "CUSTOM_SECRET" } },
+      }),
+    );
+    await withSetupTty(async (input) => {
+      setImmediate(() => input.end("  padded-secret  \n"));
+      await runSetup({ dir });
+    });
+    assert.equal(readEnvFile(join(dir, ".env")).get("CUSTOM_SECRET"), "  padded-secret  ");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runSetup rejects malformed UTF-8 hidden input without writing it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-setup-hidden-utf8-"));
+  try {
+    writeFileSync(
+      join(dir, CONFIG_FILENAME),
+      JSON.stringify({
+        contract: 1,
+        orgId: "acme",
+        publicUrl: "http://localhost:8080",
+        target: "docker",
+        services: ["core"],
+        secretEnv: { core: { CUSTOM_SECRET: "CUSTOM_SECRET" } },
+      }),
+    );
+    await withSetupTty(async (input) => {
+      setImmediate(() => input.end(Buffer.from([0xc3, 0x28, 0x0a])));
+      await assert.rejects(() => runSetup({ dir }), /valid UTF-8 text/);
+    });
+    assert.equal(readEnvFile(join(dir, ".env")).has("CUSTOM_SECRET"), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("runSetup refuses direct, symlink, and hardlink aliases between config and environment", async () => {
+  const configBody = JSON.stringify({
+    contract: 1,
+    orgId: "acme",
+    publicUrl: "http://localhost:8080",
+    target: "docker",
+    services: ["core"],
+  });
+  for (const kind of ["direct", "symlink", "hardlink"] as const) {
+    const dir = mkdtempSync(join(tmpdir(), `qm-setup-${kind}-`));
+    try {
+      const config = join(dir, CONFIG_FILENAME);
+      const env = join(dir, ".env");
+      if (kind === "direct") {
+        writeFileSync(env, configBody);
+        symlinkSync(env, config);
+      } else {
+        writeFileSync(config, configBody);
+        if (kind === "symlink") symlinkSync(config, env);
+        else linkSync(config, env);
+      }
+      await withSetupTty(() => assert.rejects(() => runSetup({ dir }), /environment file|must be separate/));
+      assert.equal(readFileSync(kind === "direct" ? env : config, "utf8"), configBody);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("runSetup writes generated secrets to a separate environment file", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-setup-safe-"));
+  try {
+    writeFileSync(
+      join(dir, CONFIG_FILENAME),
+      JSON.stringify({
+        contract: 1,
+        orgId: "acme",
+        publicUrl: "http://localhost:8080",
+        target: "docker",
+        services: ["core"],
+      }),
+    );
+    await withSetupTty(() => runSetup({ dir }));
+    assert.match(readFileSync(join(dir, ".env"), "utf8"), /^CORE_SIGNING_SECRET=[a-f0-9]{64}$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

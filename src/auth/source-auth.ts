@@ -3,10 +3,10 @@ import { createMemoryReplayDedupe, type ReplayDedupe } from "./replay-dedupe.ts"
 import { constantTimeEqual } from "../util/crypto.ts";
 
 export const SOURCE_AUTH_REPLAY_WINDOW_MS = 5 * 60_000;
-export const MIN_SIGNING_SECRET_LENGTH = 32;
+export const MIN_SIGNING_SECRET_BYTES = 32;
 
 export function isStrongSigningSecret(secret: string | undefined): secret is string {
-  return (secret?.trim().length ?? 0) >= MIN_SIGNING_SECRET_LENGTH;
+  return Buffer.byteLength(secret?.trim() ?? "", "utf8") >= MIN_SIGNING_SECRET_BYTES;
 }
 
 interface SourceAuthRequest {

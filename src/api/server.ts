@@ -12,7 +12,7 @@ import { createControlService } from "./control-service.ts";
 import {
   createSourceAuth,
   isStrongSigningSecret,
-  MIN_SIGNING_SECRET_LENGTH,
+  MIN_SIGNING_SECRET_BYTES,
   SOURCE_AUTH_REPLAY_WINDOW_MS,
   type SourceAuth,
 } from "../auth/source-auth.ts";
@@ -43,9 +43,6 @@ function capabilityAdminDenied(method: string, pathname: string, url: URL, claim
   }
   if (pathname.startsWith("/v1/admin/grants")) {
     return "admin grant changes (promote/revoke) are portal-only — the agent cannot manage who governs the org";
-  }
-  if (pathname.startsWith("/v1/admin/updates")) {
-    return "QM updates are portal-only — the agent cannot start or alter a deployment";
   }
   if (pathname.startsWith("/v1/admin/impersonate")) {
     return "impersonating a user is portal-only — the agent cannot act as another person";
@@ -502,6 +499,14 @@ function buildServer(app: App, deps: ServerOptions, allowUnsignedSourceAuth: boo
 }
 
 export function createServer(app: App, deps: ServerOptions = {}): Server {
+  for (const [name, value] of [
+    ["CAPABILITY_SECRET", deps.capabilitySecret],
+    ["PORTAL_IDENTITY_SECRET", deps.portalIdentitySecret],
+  ] as const) {
+    if (value !== undefined && !isStrongSigningSecret(value)) {
+      throw new Error(`${name} must be at least ${MIN_SIGNING_SECRET_BYTES} UTF-8 bytes`);
+    }
+  }
   if (!deps.signingSecret && deps.allowUnauthenticatedCore) {
     console.warn(
       "[server] ALLOW_UNAUTHENTICATED_CORE=1 — HTTP ingress is UNAUTHENTICATED (intentionally isolated deployments only).",
@@ -510,7 +515,7 @@ export function createServer(app: App, deps: ServerOptions = {}): Server {
   }
   if (!isStrongSigningSecret(deps.signingSecret)) {
     throw new Error(
-      `CORE_SIGNING_SECRET must be at least ${MIN_SIGNING_SECRET_LENGTH} characters; tests that intentionally need unsigned source auth must use createInsecureTestServer`,
+      `CORE_SIGNING_SECRET must be at least ${MIN_SIGNING_SECRET_BYTES} UTF-8 bytes; tests that intentionally need unsigned source auth must use createInsecureTestServer`,
     );
   }
   if (deps.requireSignedPortalIdentity || deps.production) {

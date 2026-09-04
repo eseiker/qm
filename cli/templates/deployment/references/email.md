@@ -6,7 +6,7 @@ relay works and there is no DNS wait. Pick Resend only when the operator
 prefers it and has DNS control over a domain they are happy to send from.
 
 Set `env.auth.AUTH_EMAIL_TRANSPORT` to `resend` or `smtp` before collecting
-secrets, then run `npm exec qm -- setup`, which prompts for exactly the
+secrets, then run `npm exec --yes=false -- qm setup`, which prompts for exactly the
 credentials that choice needs and generates every key itself.
 
 ## What you can do, and what only the operator can

@@ -1,25 +1,32 @@
-import { awsWorkloadArchitecture, loadConfigAt, sandboxImagePinErrors, type QmConfig } from "../config.ts";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { awsWorkloadArchitecture, loadConfigAt, type QmConfig } from "../config.ts";
 import { CliError, errMessage, note } from "../log.ts";
 import type { Target } from "../providers.ts";
 import { syncDeploymentLayer, type DeploymentLayerTransport } from "../deployment-layer.ts";
 import { TARGET_ENV_DEFAULTS, type TargetEnvDefaults } from "../target-env-defaults.ts";
+import { computedSecrets } from "../secrets.ts";
 import { renderTerraformVars } from "../terraform.ts";
-import { buildAwsMicrovmImage, deleteAwsMicrovmImage, deleteAwsTaskDefinitions } from "../commands/infra.ts";
-import { runSandboxPublish, type SandboxPublishOpts } from "../commands/sandbox.ts";
+import {
+  buildAwsMicrovmImage,
+  deleteAwsMicrovmImage,
+  deleteAwsTaskDefinitions,
+  microvmBuildArchiveSha256,
+} from "../commands/infra.ts";
 import { awsScaffold, dockerScaffold, flyScaffold, type ProviderScaffold } from "../provider-scaffold.ts";
 import type { ResolvedPlugin } from "../plugins.ts";
 import { runnableServices } from "../services.ts";
 import {
-  assertAwsSandboxPinRecordable,
   awsCheckLive,
   awsDoctor,
   awsDown,
   awsLogs,
-  awsPinSandbox,
   awsRollback,
   awsSecretsPush,
   awsStatus,
   awsUp,
+  awsPreflightUp,
+  type AwsUpPreflight,
   awsDeploymentLayerTransport,
 } from "./aws.ts";
 import { dockerDeploymentLayerTransport, dockerDown, dockerLogs, dockerStatus, dockerUp } from "./docker.ts";
@@ -29,22 +36,49 @@ import {
   flyDoctor,
   flyDown,
   flyLogs,
-  flyPinSandbox,
   flyRollback,
   flySecretsPush,
   flyStatus,
   flyUp,
+  flyPreflightUp,
   flyDeploymentLayerTransport,
 } from "./fly.ts";
 import type { Backend, BackendUpOptions } from "./types.ts";
+import type { FileIdentity } from "../util.ts";
 
 export interface DeployContext {
   config: QmConfig;
   configPath: string;
+  configIdentity: FileIdentity;
   configDir: string;
   sandboxDir: string;
   envFile?: string;
   target: Target;
+  awsMicrovmBuildPlanned?: boolean;
+  awsPreflight?: AwsUpPreflight;
+  flyPreflighted?: boolean;
+}
+
+export function assertDeploymentEnvironmentDisjoint(ctx: DeployContext, allowMissing = false): void {
+  if (ctx.envFile !== undefined && !ctx.envFile.trim()) {
+    throw new CliError("--env-file needs a non-empty path", { clause: "cli.invocation" });
+  }
+  const environmentPath = resolve(ctx.envFile ?? join(ctx.configDir, ".env"));
+  const configPath = resolve(ctx.configPath);
+  if (ctx.envFile !== undefined && !existsSync(environmentPath)) {
+    if (allowMissing) return;
+    throw new CliError(`--env-file not found: ${ctx.envFile}`);
+  }
+  if (!existsSync(environmentPath)) return;
+  const environment = statSync(environmentPath, { bigint: true });
+  if (!environment.isFile()) throw new CliError("the deployment environment path must be a regular file");
+  if (
+    environmentPath === configPath ||
+    (existsSync(configPath) && realpathSync(environmentPath) === realpathSync(configPath)) ||
+    (environment.dev === ctx.configIdentity.dev && environment.ino === ctx.configIdentity.ino)
+  ) {
+    throw new CliError("the deployment environment file must be physically disjoint from the deployment config");
+  }
 }
 
 type InfraOperation = "render" | "build-image" | "delete-image" | "delete-task-definitions";
@@ -59,18 +93,60 @@ export interface HostingProvider {
   infra?: Partial<Record<InfraOperation, (ctx: DeployContext) => void | Promise<void>>>;
   upFlags: readonly string[];
   upOptions(ctx: DeployContext, flags: Readonly<Record<string, string | boolean>>, dryRun: boolean): BackendUpOptions;
+  preflightUp(ctx: DeployContext, opts: BackendUpOptions): Promise<DeployContext>;
   createBackend(ctx: DeployContext): Backend;
   coordinates(config: QmConfig): { accountOrOrganization?: string; region?: string };
-  requiresSandboxApp: boolean;
-  publishSandbox(ctx: DeployContext, opts: SandboxPublishOpts): Promise<void>;
   scaffold: ProviderScaffold;
   validateConfig(config: QmConfig, plugins: readonly ResolvedPlugin[]): Array<{ clause: string; message: string }>;
+}
+
+export async function prepareUpSubstrate(ctx: DeployContext, opts: BackendUpOptions): Promise<DeployContext> {
+  if (opts.buildOnly || (opts.only && !opts.only.includes("core"))) return ctx;
+  if (ctx.target === "aws") {
+    const targetSource = microvmBuildArchiveSha256();
+    const coreEnv = ctx.config.env.core;
+    if (
+      ctx.awsPreflight?.microvmRebuildRequired ||
+      !coreEnv?.AWS_DEPLOY_IMAGE_VERSION?.trim() ||
+      coreEnv.AWS_DEPLOY_IMAGE_SOURCE_SHA256 !== targetSource
+    ) {
+      if (opts.dryRun) {
+        return {
+          ...ctx,
+          config: {
+            ...ctx.config,
+            env: {
+              ...ctx.config.env,
+              core: {
+                ...coreEnv,
+                AWS_DEPLOY_IMAGE_VERSION: "pending-build",
+                AWS_DEPLOY_IMAGE_SOURCE_SHA256: targetSource,
+              },
+            },
+          },
+          awsMicrovmBuildPlanned: true,
+        };
+      }
+      if (!opts.yes) return ctx;
+      await buildAwsMicrovmImage(ctx.config, ctx.configPath);
+      const loaded = loadConfigAt(ctx.configPath, { target: ctx.target });
+      return {
+        ...ctx,
+        config: loaded.config,
+        configIdentity: loaded.configIdentity,
+        ...(ctx.awsPreflight ? { awsPreflight: { ...ctx.awsPreflight, microvmRebuildRequired: false } } : {}),
+      };
+    }
+  }
+  return ctx;
 }
 
 const stringFlag = (flags: Readonly<Record<string, string | boolean>>, name: string): string | undefined => {
   const value = flags[name];
   if (value === undefined) return undefined;
-  if (typeof value !== "string") throw new CliError(`--${name} needs a value`, { clause: "cli.invocation" });
+  if (typeof value !== "string" || !value.trim()) {
+    throw new CliError(`--${name} needs a non-empty value`, { clause: "cli.invocation" });
+  }
   return value;
 };
 
@@ -78,6 +154,9 @@ const buildFromOptions = (
   flags: Readonly<Record<string, string | boolean>>,
 ): Pick<BackendUpOptions, "buildFrom" | "buildFromPath"> => {
   const value = flags["build-from"];
+  if (typeof value === "string" && !value.trim()) {
+    throw new CliError("--build-from needs a non-empty path when a value is provided", { clause: "cli.invocation" });
+  }
   return {
     buildFrom: value !== undefined,
     ...(typeof value === "string" ? { buildFromPath: value } : {}),
@@ -97,24 +176,6 @@ const onlyOptions = (flags: Readonly<Record<string, string | boolean>>): string[
   return names;
 };
 
-async function publishFlySandbox(ctx: DeployContext, opts: SandboxPublishOpts, pin: boolean): Promise<void> {
-  const published = runSandboxPublish(opts);
-  if (!published || opts.dryRun) return;
-  const config = loadConfigAt(ctx.configPath, { target: ctx.target }).config;
-  await syncDeploymentLayer({
-    config,
-    transport: hostingProvider(ctx.target).deploymentLayerTransport,
-    configDir: ctx.configDir,
-    sandboxDir: ctx.sandboxDir,
-    ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
-    allowUnavailable: true,
-  });
-  if (pin)
-    await hostingProvider(ctx.target)
-      .createBackend({ ...ctx, config })
-      .pinSandbox(published.image);
-}
-
 const docker: HostingProvider = {
   id: "docker",
   deploymentLayerTransport: dockerDeploymentLayerTransport,
@@ -130,47 +191,55 @@ const docker: HostingProvider = {
     }
     return { dryRun, ...buildFromOptions(flags) };
   },
-  createBackend: (ctx) => ({
-    up: async (opts) => {
-      await dockerUp(ctx.config, ctx.configDir, {
-        sandboxDir: ctx.sandboxDir,
-        buildFrom: opts.buildFrom ?? false,
-        ...(opts.buildFromPath ? { buildFromPath: opts.buildFromPath } : {}),
-        ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
-        dryRun: opts.dryRun,
-      });
-      if (!opts.dryRun) {
-        await syncDeploymentLayer({
-          config: ctx.config,
-          transport: hostingProvider(ctx.target).deploymentLayerTransport,
-          configDir: ctx.configDir,
+  preflightUp: async (ctx, _opts) => {
+    assertDeploymentEnvironmentDisjoint(ctx);
+    return ctx;
+  },
+  createBackend: (ctx) => {
+    const source = {
+      configDir: ctx.configDir,
+      configPath: ctx.configPath,
+      configIdentity: ctx.configIdentity,
+      ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
+    };
+    return {
+      up: async (opts) => {
+        await dockerUp(ctx.config, source, {
           sandboxDir: ctx.sandboxDir,
-          ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
+          buildFrom: opts.buildFrom ?? false,
+          ...(opts.buildFromPath !== undefined ? { buildFromPath: opts.buildFromPath } : {}),
+          dryRun: opts.dryRun,
         });
-      }
-    },
-    status: () => dockerStatus(ctx.config),
-    logs: (service, opts) => dockerLogs(ctx.config, service, opts),
-    down: (opts) => dockerDown(ctx.config, opts),
-    rollback: () => {
-      throw new CliError("rollback is not implemented for target docker");
-    },
-    doctor: () =>
-      doctorCommon(ctx.config, localDoctorSecrets(ctx.configDir, ctx.envFile), {
-        requiredSecretValues: true,
-        configDir: ctx.configDir,
-      }),
-    secretsPush: () => {
-      note("docker reads .env directly; no secret upload is needed");
-    },
-    pinSandbox: () => {
-      note("sandbox pin recorded; re-run `qm up` to restart a local core with it");
-    },
-  }),
+        if (!opts.dryRun) {
+          await syncDeploymentLayer({
+            config: ctx.config,
+            configIdentity: ctx.configIdentity,
+            transport: hostingProvider(ctx.target).deploymentLayerTransport,
+            configDir: ctx.configDir,
+            sandboxDir: ctx.sandboxDir,
+            ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
+          });
+        }
+      },
+      status: () => dockerStatus(ctx.config, source),
+      logs: (service, opts) => dockerLogs(ctx.config, source, service, opts),
+      down: (opts) => dockerDown(ctx.config, source, opts),
+      rollback: () => {
+        throw new CliError("rollback is not implemented for target docker");
+      },
+      doctor: () =>
+        doctorCommon(ctx.config, localDoctorSecrets(ctx.configDir, ctx.envFile, ctx.configIdentity), {
+          requiredSecretValues: true,
+          configDir: ctx.configDir,
+        }),
+      secretsPush: () => {
+        computedSecrets(ctx.config);
+        note("docker reads .env directly; no secret upload is needed");
+      },
+    };
+  },
   coordinates: () => ({}),
-  requiresSandboxApp: true,
-  publishSandbox: (ctx, opts) => publishFlySandbox(ctx, opts, false),
-  validateConfig: (config) => sandboxImagePinErrors(config),
+  validateConfig: () => [],
 };
 
 const fly: HostingProvider = {
@@ -194,26 +263,47 @@ const fly: HostingProvider = {
       ...(imageRepoPrefix ? { imageRepoPrefix } : {}),
     };
   },
+  preflightUp: async (ctx, opts) => {
+    assertDeploymentEnvironmentDisjoint(ctx);
+    flyPreflightUp(ctx.config, ctx.configDir, {
+      dryRun: opts.dryRun,
+      configPath: ctx.configPath,
+      configIdentity: ctx.configIdentity,
+      ...(opts.buildFrom !== undefined ? { buildFrom: opts.buildFrom } : {}),
+      ...(opts.buildFromPath !== undefined ? { buildFromPath: opts.buildFromPath } : {}),
+      ...(opts.only ? { only: opts.only } : {}),
+      ...(opts.imageFrom ? { imageFrom: opts.imageFrom } : {}),
+      ...(opts.imageLabel ? { imageLabel: opts.imageLabel } : {}),
+      ...(opts.imageRepoPrefix ? { imageRepoPrefix: opts.imageRepoPrefix } : {}),
+      ...(opts.buildOnly ? { buildOnly: true } : {}),
+      ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
+    });
+    return { ...ctx, flyPreflighted: true };
+  },
   createBackend: (ctx) => ({
     up: async (opts) => {
       await flyUp(ctx.config, ctx.configDir, {
         dryRun: opts.dryRun,
         configPath: ctx.configPath,
+        configIdentity: ctx.configIdentity,
         ...(opts.buildFrom !== undefined ? { buildFrom: opts.buildFrom } : {}),
-        ...(opts.buildFromPath ? { buildFromPath: opts.buildFromPath } : {}),
+        ...(opts.buildFromPath !== undefined ? { buildFromPath: opts.buildFromPath } : {}),
         ...(opts.only ? { only: opts.only } : {}),
         ...(opts.imageFrom ? { imageFrom: opts.imageFrom } : {}),
         ...(opts.imageLabel ? { imageLabel: opts.imageLabel } : {}),
         ...(opts.imageRepoPrefix ? { imageRepoPrefix: opts.imageRepoPrefix } : {}),
         ...(opts.buildOnly ? { buildOnly: true } : {}),
+        ...(ctx.flyPreflighted ? { preflighted: true } : {}),
+        ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
       });
       if (!opts.dryRun && !opts.buildOnly && (!opts.only || opts.only.includes("core"))) {
         await syncDeploymentLayer({
           config: ctx.config,
+          configIdentity: ctx.configIdentity,
           transport: hostingProvider(ctx.target).deploymentLayerTransport,
           configDir: ctx.configDir,
           sandboxDir: ctx.sandboxDir,
-          ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
+          ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
           allowUnavailable: true,
         });
       }
@@ -222,19 +312,16 @@ const fly: HostingProvider = {
     logs: (service, opts) => flyLogs(ctx.config, ctx.configDir, service, opts),
     down: () => flyDown(ctx.config, ctx.configDir),
     rollback: (to) => flyRollback(ctx.config, ctx.configPath, to),
-    doctor: () => flyDoctor(ctx.config, ctx.configDir, ctx.envFile),
-    secretsPush: (envFile) => flySecretsPush(ctx.config, ctx.configDir, envFile),
+    doctor: () => flyDoctor(ctx.config, ctx.configDir, ctx.envFile, ctx.configIdentity),
+    secretsPush: (values) => flySecretsPush(ctx.config, ctx.configDir, values),
     checkLive: (opts) => flyCheckLive(ctx.config, ctx.configDir, opts),
-    pinSandbox: (image) => flyPinSandbox(ctx.config, image, ctx.configDir),
   }),
   coordinates: (config) => ({
     ...(config.flyOrg ? { accountOrOrganization: config.flyOrg } : {}),
     ...(config.region ? { region: config.region } : {}),
   }),
-  requiresSandboxApp: true,
-  publishSandbox: (ctx, opts) => publishFlySandbox(ctx, opts, true),
   validateConfig: (config) => {
-    const errors: Array<{ clause: string; message: string }> = [...sandboxImagePinErrors(config)];
+    const errors: Array<{ clause: string; message: string }> = [];
     if (!config.region?.trim())
       errors.push({ clause: "config.v1", message: 'contract config.fly.region: target "fly" requires "region"' });
     if (!config.flyOrg?.trim())
@@ -266,14 +353,14 @@ const aws: HostingProvider = {
     "build-image": async (ctx) => {
       await buildAwsMicrovmImage(ctx.config, ctx.configPath);
     },
-    "delete-image": (ctx) => deleteAwsMicrovmImage(ctx.config),
+    "delete-image": (ctx) => deleteAwsMicrovmImage(ctx.config, { configPath: ctx.configPath }),
     "delete-task-definitions": (ctx) => deleteAwsTaskDefinitions(ctx.config),
   },
   scaffold: awsScaffold,
   upFlags: ["build-from", "only", "yes", "image-label"],
   upOptions: (ctx, flags, dryRun) => {
     const only = onlyOptions(flags);
-    const unknown = only?.filter((name) => !ctx.config.aws?.services[name]) ?? [];
+    const unknown = only?.filter((name) => !ctx.config.aws || !Object.hasOwn(ctx.config.aws.services, name)) ?? [];
     if (unknown.length) throw new CliError(`--only has unknown AWS workload(s): ${unknown.join(", ")}`);
     const imageLabel = stringFlag(flags, "image-label");
     return {
@@ -284,62 +371,65 @@ const aws: HostingProvider = {
       ...(only ? { only } : {}),
     };
   },
+  preflightUp: async (ctx, opts) => {
+    assertDeploymentEnvironmentDisjoint(ctx);
+    return {
+      ...ctx,
+      awsPreflight: await awsPreflightUp(ctx.config, ctx.configDir, {
+        dryRun: opts.dryRun,
+        configIdentity: ctx.configIdentity,
+        ...(opts.yes !== undefined ? { yes: opts.yes } : {}),
+        ...(opts.buildFrom !== undefined ? { buildFrom: opts.buildFrom } : {}),
+        ...(opts.buildFromPath !== undefined ? { buildFromPath: opts.buildFromPath } : {}),
+        ...(opts.imageLabel ? { imageLabel: opts.imageLabel } : {}),
+        ...(opts.only ? { only: opts.only } : {}),
+        ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
+      }),
+    };
+  },
   createBackend: (ctx) => ({
     up: (opts) =>
       awsUp(ctx.config, ctx.configDir, {
         dryRun: opts.dryRun,
+        configIdentity: ctx.configIdentity,
         ...(opts.yes !== undefined ? { yes: opts.yes } : {}),
         ...(opts.buildFrom !== undefined ? { buildFrom: opts.buildFrom } : {}),
-        ...(opts.buildFromPath ? { buildFromPath: opts.buildFromPath } : {}),
+        ...(opts.buildFromPath !== undefined ? { buildFromPath: opts.buildFromPath } : {}),
         ...(opts.imageLabel ? { imageLabel: opts.imageLabel } : {}),
         ...(opts.only ? { only: opts.only } : {}),
+        ...(ctx.awsMicrovmBuildPlanned ? { microvmBuildPlanned: true } : {}),
+        ...(ctx.awsPreflight ? { preflight: ctx.awsPreflight } : {}),
         sandboxDir: ctx.sandboxDir,
-        ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
+        ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
       }),
     status: () => awsStatus(ctx.config, ctx.configDir),
     logs: (service, opts) => awsLogs(ctx.config, service, opts, ctx.configDir),
     down: () => awsDown(ctx.config, ctx.configDir),
     rollback: (to) =>
-      awsRollback(ctx.config, to, { configDir: ctx.configDir, ...(ctx.envFile ? { envFile: ctx.envFile } : {}) }),
+      awsRollback(ctx.config, to, {
+        configDir: ctx.configDir,
+        configIdentity: ctx.configIdentity,
+        ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
+      }),
     doctor: () => awsDoctor(ctx.config, ctx.configDir),
-    secretsPush: (envFile) => awsSecretsPush(ctx.config, ctx.configDir, envFile),
+    secretsPush: (values) => awsSecretsPush(ctx.config, ctx.configDir, values),
     checkLive: (opts) =>
       awsCheckLive(ctx.config, {
         ...opts,
         configDir: ctx.configDir,
+        configIdentity: ctx.configIdentity,
         sandboxDir: ctx.sandboxDir,
-        ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
-      }),
-    pinSandbox: (image) =>
-      awsPinSandbox(ctx.config, image, {
-        configDir: ctx.configDir,
-        sandboxDir: ctx.sandboxDir,
-        ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
+        ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
       }),
   }),
   coordinates: (config) =>
     config.aws ? { accountOrOrganization: config.aws.accountId, region: config.aws.region } : {},
-  requiresSandboxApp: false,
-  publishSandbox: async (ctx, opts) => {
-    if (ctx.config.sandbox?.backend !== "sprites") {
-      throw new CliError(
-        `this AWS deployment runs Lambda MicroVM sandboxes (sandbox.backend is not "sprites"); use \`qm sandbox build\` to validate the layer and \`qm infra build-image\` to publish the runtime — or set "sandbox.backend": "sprites" with "sandbox.app" to host sandboxes in an operator-published layer image`,
-      );
-    }
-    if (!opts.dryRun) assertAwsSandboxPinRecordable(ctx.config);
-    const published = runSandboxPublish(opts);
-    if (!published || opts.dryRun) return;
-    const config = loadConfigAt(ctx.configPath, { target: ctx.target }).config;
-    await hostingProvider(ctx.target)
-      .createBackend({ ...ctx, config })
-      .pinSandbox(published.image);
-  },
   validateConfig: (config, plugins) => {
     if (!config.aws) return [];
     const errors: Array<{ clause: string; message: string }> = [];
     const workloads = new Set<string>([...runnableServices(config.services), ...plugins.map((plugin) => plugin.name)]);
     for (const name of workloads) {
-      if (!config.aws.services[name]) {
+      if (!Object.hasOwn(config.aws.services, name)) {
         errors.push({
           clause: "config.v1",
           message: `contract aws.services.${name}: every AWS service and plugin needs ECS/ECR coordinates`,

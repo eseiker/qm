@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import vm from "node:vm";
 
 const html = readFileSync(new URL("../public/index.html", import.meta.url), "utf8");
 
@@ -78,6 +79,33 @@ test("mobile admin navigation keeps the active section visible and controls touc
 test("admin history previews quote the first message instead of saying started", () => {
   assert.equal((html.match(/\?\s*"> "\s*\+\s*s\.firstMessage\s*:\s*"created "/g) || []).length, 1);
   assert.doesNotMatch(html, /\? "started " \+ s\.firstMessage : "created "/);
+});
+
+test("admin Slack mentions resolve only own prototype-like ids", () => {
+  const start = html.indexOf("      function slackUnescape");
+  const end = html.indexOf("      function slackAppendMrkdwn", start);
+  assert.ok(start >= 0 && end > start);
+  const script = html.slice(start, end);
+  const render = (id: string, mentions: Record<string, string>) => {
+    const context = vm.createContext({
+      document: { createElement: () => ({ className: "", textContent: "" }) },
+      id,
+      mentions,
+    });
+    vm.runInContext(script, context);
+    return vm.runInContext('slackEntityNode("@" + id, mentions).textContent', context) as string;
+  };
+  const mentions = JSON.parse(
+    '{"__proto__":"proto-name","constructor":"constructor-name","prototype":"prototype-name"}',
+  ) as Record<string, string>;
+  assert.deepEqual(
+    ["__proto__", "constructor", "prototype"].map((id) => render(id, mentions)),
+    ["@proto-name", "@constructor-name", "@prototype-name"],
+  );
+  assert.deepEqual(
+    ["__proto__", "constructor", "prototype"].map((id) => render(id, {})),
+    ["@__proto__", "@constructor", "@prototype"],
+  );
 });
 
 test("transcript visibility controls stay in the sticky header and filter lazy-rendered entries", () => {

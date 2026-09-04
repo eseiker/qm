@@ -1,112 +1,102 @@
+import { readFileSync } from "node:fs";
 import { errMessage } from "../../chassis/src/errors.ts";
 
-const REGISTRY_URL = "https://registry.npmjs.org/@yc-software%2fqm";
-const SEMVER = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
-const RELEASE_AGE_MS = 7 * 24 * 60 * 60 * 1_000;
-export const SUCCESS_TTL_MS = 6 * 60 * 60 * 1_000;
-export const FAILURE_TTL_MS = 5 * 60 * 1_000;
+const REGISTRY_URL = "https://registry.npmjs.org/@yc-software%2fqm/latest";
+const STABLE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+export const SUCCESS_TTL_MS = 5 * 60_000;
+export const FAILURE_TTL_MS = 30_000;
 
-type VersionParts = [number, number, number, string | undefined];
+type VersionParts = [bigint, bigint, bigint];
+
+class RegistryUnavailableError extends Error {}
 
 function versionParts(version: string): VersionParts | null {
-  const match = SEMVER.exec(version);
+  const match = STABLE_VERSION.exec(version);
   if (!match) return null;
-  return [Number(match[1]), Number(match[2]), Number(match[3]), match[4]];
+  return [BigInt(match[1]!), BigInt(match[2]!), BigInt(match[3]!)];
+}
+
+export function resolveCurrentQmVersion(
+  envVersion = process.env.QM_VERSION,
+  packageUrl = new URL("../qm-package.json", import.meta.url),
+  nodeEnv = process.env.NODE_ENV,
+): string | undefined {
+  if (nodeEnv !== "production" && envVersion) return versionParts(envVersion) ? envVersion : undefined;
+  try {
+    const value = JSON.parse(readFileSync(packageUrl, "utf8")) as { name?: unknown; version?: unknown };
+    return value.name === "@yc-software/qm" && typeof value.version === "string" && versionParts(value.version)
+      ? value.version
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function compareVersions(a: string, b: string): number {
   const left = versionParts(a);
   const right = versionParts(b);
-  if (!left || !right) throw new Error(`invalid QM version: ${!left ? a : b}`);
+  if (!left || !right) throw new Error(`invalid stable QM version: ${!left ? a : b}`);
   for (const i of [0, 1, 2] as const) {
-    const difference = left[i]! - right[i]!;
-    if (difference !== 0) return Math.sign(difference);
+    if (left[i] < right[i]) return -1;
+    if (left[i] > right[i]) return 1;
   }
-  if (left[3] === right[3]) return 0;
-  if (left[3] === undefined) return 1;
-  if (right[3] === undefined) return -1;
-  return left[3].localeCompare(right[3], undefined, { numeric: true });
+  return 0;
 }
 
 export interface UpdateStatus {
   currentVersion: string;
   latestVersion: string;
-  newestVersion: string;
   updateAvailable: boolean;
   updateCommand: string;
   releaseUrl: string;
-  releasedAt: string;
-  newestAvailableAt?: string;
 }
 
-interface RegistryMetadata {
-  "dist-tags"?: { latest?: unknown };
-  time?: Record<string, unknown>;
-  versions?: Record<string, { deprecated?: unknown } | undefined>;
+function promotedVersion(metadata: unknown): string {
+  if (!metadata || typeof metadata !== "object") {
+    throw new Error("npm registry returned invalid latest QM metadata");
+  }
+  const { version, deprecated } = metadata as { version?: unknown; deprecated?: unknown };
+  if (typeof version !== "string" || !versionParts(version)) {
+    throw new Error("npm registry returned an invalid stable latest QM version");
+  }
+  if (deprecated !== undefined) throw new Error(`npm registry returned deprecated QM ${version}`);
+  return version;
 }
 
-function eligibleRelease(metadata: RegistryMetadata, now: number): { version: string; releasedAt: string } {
-  const newest = metadata["dist-tags"]?.latest;
-  if (typeof newest !== "string" || !versionParts(newest)) {
-    throw new Error("npm registry returned an invalid latest QM version");
+export async function fetchUpdateStatus(currentVersion: string, fetcher: typeof fetch = fetch): Promise<UpdateStatus> {
+  if (!versionParts(currentVersion)) throw new Error(`invalid current stable QM version: ${currentVersion}`);
+  let response: Response;
+  try {
+    response = await fetcher(REGISTRY_URL, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(3_000),
+    });
+  } catch (error) {
+    throw new RegistryUnavailableError(`npm registry request failed: ${errMessage(error)}`, { cause: error });
   }
-  const cutoff = now - RELEASE_AGE_MS;
-  const eligible = Object.entries(metadata.versions ?? {})
-    .filter(([version, entry]) => {
-      const published = metadata.time?.[version];
-      const parsed = typeof published === "string" ? Date.parse(published) : NaN;
-      const parts = versionParts(version);
-      return (
-        parts?.[3] === undefined &&
-        !entry?.deprecated &&
-        Number.isFinite(parsed) &&
-        parsed <= cutoff &&
-        compareVersions(version, newest) <= 0
-      );
-    })
-    .map(([version]) => version)
-    .sort(compareVersions)
-    .at(-1);
-  const releasedAt = eligible ? metadata.time?.[eligible] : undefined;
-  if (!eligible || typeof releasedAt !== "string") {
-    throw new Error("npm registry has no QM release outside the dependency cooldown");
+  if (!response.ok) {
+    const message = `npm registry returned ${response.status}`;
+    if (response.status === 408 || response.status === 429 || (response.status >= 500 && response.status < 600)) {
+      throw new RegistryUnavailableError(message);
+    }
+    throw new Error(message);
   }
-  return { version: eligible, releasedAt };
-}
-
-export async function fetchUpdateStatus(
-  currentVersion: string,
-  fetcher: typeof fetch = fetch,
-  now = Date.now(),
-): Promise<UpdateStatus> {
-  if (!versionParts(currentVersion)) throw new Error(`invalid current QM version: ${currentVersion}`);
-  const response = await fetcher(REGISTRY_URL, {
-    headers: { accept: "application/json" },
-    signal: AbortSignal.timeout(3_000),
-  });
-  if (!response.ok) throw new Error(`npm registry returned ${response.status}`);
-  const body = (await response.json()) as RegistryMetadata;
-  const newestVersion = body["dist-tags"]?.latest;
-  const newestParts = typeof newestVersion === "string" ? versionParts(newestVersion) : null;
-  if (typeof newestVersion !== "string" || !newestParts) {
-    throw new Error("npm registry returned an invalid latest QM version");
+  let metadata: unknown;
+  try {
+    metadata = await response.json();
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error("npm registry returned invalid latest QM metadata", { cause: error });
+    }
+    throw new RegistryUnavailableError(`npm registry response failed: ${errMessage(error)}`, { cause: error });
   }
-  const eligible = eligibleRelease(body, now);
-  const newestReleasedAt = body.time?.[newestVersion];
-  const newestReleasedAtMs = typeof newestReleasedAt === "string" ? Date.parse(newestReleasedAt) : NaN;
-  const newestAvailableAt =
-    newestVersion !== eligible.version && newestParts[3] === undefined && Number.isFinite(newestReleasedAtMs)
-      ? new Date(newestReleasedAtMs + RELEASE_AGE_MS).toISOString()
-      : undefined;
+  const latestVersion = promotedVersion(metadata);
   return {
     currentVersion,
-    latestVersion: eligible.version,
-    newestVersion,
-    updateAvailable: compareVersions(currentVersion, eligible.version) < 0,
-    updateCommand: `npm exec qm -- update --yes --version ${eligible.version}`,
-    releaseUrl: `https://github.com/yc-software/qm/releases/tag/v${encodeURIComponent(eligible.version)}`,
-    releasedAt: eligible.releasedAt,
-    ...(newestAvailableAt ? { newestAvailableAt } : {}),
+    latestVersion,
+    updateAvailable: compareVersions(currentVersion, latestVersion) < 0,
+    updateCommand: `node node_modules/@yc-software/qm/dist/bin/qm.js update --yes --version ${latestVersion}`,
+    releaseUrl: `https://github.com/yc-software/qm/releases/tag/v${latestVersion}`,
   };
 }
 
@@ -116,26 +106,36 @@ export function createUpdateChecker(
 ): () => Promise<UpdateStatus | null> {
   const fetcher = options.fetcher ?? fetch;
   const now = options.now ?? Date.now;
-  let cached: { expiresAt: number; status: UpdateStatus | null } | null = null;
-  let pending: Promise<UpdateStatus | null> | null = null;
+  let cached: { expiresAt: number; status: UpdateStatus } | null = null;
+  let failed: { error: unknown; retryAt: number; staleAvailable: boolean } | null = null;
+  let pending: Promise<UpdateStatus> | null = null;
 
   return async (): Promise<UpdateStatus | null> => {
     if (!currentVersion || !versionParts(currentVersion)) return null;
     if (cached && cached.expiresAt > now()) return cached.status;
-    if (pending) return pending;
-    pending = fetchUpdateStatus(currentVersion, fetcher, now())
-      .then((status) => {
-        cached = { expiresAt: now() + SUCCESS_TTL_MS, status };
-        return status;
-      })
-      .catch((error: unknown) => {
-        console.warn(`[admin] update check failed: ${errMessage(error)}`);
-        cached = { expiresAt: now() + FAILURE_TTL_MS, status: null };
-        return null;
-      })
-      .finally(() => {
-        pending = null;
-      });
+    if (failed && failed.retryAt > now()) {
+      if (cached && failed.staleAvailable) return cached.status;
+      throw failed.error;
+    }
+    if (!pending) {
+      pending = fetchUpdateStatus(currentVersion, fetcher)
+        .then((status) => {
+          cached = { expiresAt: now() + SUCCESS_TTL_MS, status };
+          failed = null;
+          return status;
+        })
+        .catch((error: unknown) => {
+          console.warn(`[admin] update check failed: ${errMessage(error)}`);
+          const staleAvailable = error instanceof RegistryUnavailableError && cached?.status.updateAvailable === false;
+          failed = { error, retryAt: now() + FAILURE_TTL_MS, staleAvailable };
+          if (!staleAvailable) cached = null;
+          if (cached) return cached.status;
+          throw error;
+        })
+        .finally(() => {
+          pending = null;
+        });
+    }
     return pending;
   };
 }

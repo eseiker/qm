@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto";
 import { type Target, type QmConfig } from "../config.ts";
-import { deploymentLayerBundle, deploymentLayerRequest, type DeploymentLayerBundle } from "../deployment-layer.ts";
+import {
+  currentDeploymentLayerState,
+  deploymentLayerBundle,
+  type DeploymentLayerBundle,
+  type DeploymentLayerState,
+} from "../deployment-layer.ts";
 import { CliError, errMessage, header, ok, step } from "../log.ts";
 import { parseToolDescriptor, type ToolDescriptor } from "../sandbox-layer.ts";
-import { canonicalJson } from "../util.ts";
+import type { FileIdentity } from "../util.ts";
 import { runChecks } from "./check.ts";
 import { hostingProvider } from "../backends/registry.ts";
 
@@ -13,6 +18,7 @@ export function expectedDescriptors(bundle: DeploymentLayerBundle): ToolDescript
 
 export interface ConformanceDeployment {
   config: QmConfig;
+  configIdentity: FileIdentity;
   configDir: string;
   sandboxDir: string;
   target: Target;
@@ -23,7 +29,7 @@ export async function runConformance(
   deployment: ConformanceDeployment,
   opts: { runtime?: boolean } = {},
 ): Promise<void> {
-  const { config, configDir, sandboxDir, target, envFile } = deployment;
+  const { config, configIdentity, configDir, sandboxDir, target, envFile } = deployment;
   header(`qm conformance — ${config.orgId}`);
   const checked = runChecks(config, configDir, sandboxDir, { report: false });
   step("config.v1: pass");
@@ -33,30 +39,17 @@ export async function runConformance(
     ok("static conformance passed");
     return;
   }
-  let response: { status: number; body: string };
+  let live: DeploymentLayerState;
   try {
-    response = await deploymentLayerRequest({
+    live = await currentDeploymentLayerState({
       config,
+      configIdentity,
       configDir,
       transport: hostingProvider(target).deploymentLayerTransport,
-      method: "GET",
-      ...(envFile ? { envFile } : {}),
+      ...(envFile !== undefined ? { envFile } : {}),
     });
   } catch (error) {
     throw new CliError(`runtime.layer-resolved: ${errMessage(error)}`);
-  }
-  if (response.status < 200 || response.status >= 300)
-    throw new CliError(`runtime.layer-resolved: GET failed (${response.status}): ${response.body}`);
-  let live: {
-    contentHash?: string | null;
-    status?: string;
-    runtimeContentHash?: string | null;
-    resolved?: { tools?: unknown[] } | null;
-  };
-  try {
-    live = JSON.parse(response.body) as typeof live;
-  } catch {
-    throw new CliError("runtime.layer-resolved: deployment layer read returned unparseable JSON");
   }
   const bundle = deploymentLayerBundle(sandboxDir);
   const expectedHash = createHash("sha256").update(JSON.stringify(bundle)).digest("hex");
@@ -65,16 +58,10 @@ export async function runConformance(
       "runtime.layer-resolved: live content hash differs from the directory's complete tools and skills layer",
     );
   }
-  if (
-    live.status === "degraded" ||
-    (live.runtimeContentHash !== undefined && live.runtimeContentHash !== expectedHash)
-  ) {
+  if (live.status === "degraded" || live.runtimeContentHash !== expectedHash) {
     throw new CliError(
       "runtime.layer-resolved: the core stores the directory's layer but is still serving a previous resolved layer",
     );
-  }
-  if (canonicalJson(live.resolved?.tools ?? []) !== canonicalJson(expectedDescriptors(bundle))) {
-    throw new CliError("runtime.layer-resolved: live descriptors differ from sandbox/tools");
   }
   step("runtime.layer-resolved: pass");
   ok("deployment directory conforms to contract v1");

@@ -15,13 +15,10 @@ Before cloud mutation, read `qm.config.jsonc` when it exists. Its `target` is
 the selected provider; confirm it with the operator and do not offer to change
 it in place. If the repository has not been initialized, collect:
 
-- hosting target: a cloud provider — Fly.io, AWS, or Porter. Recommend Fly.io
-  when the operator has no preference. Porter deploys onto a Kubernetes
-  cluster in the operator's own cloud account and has no `qm` CLI target:
-  choosing it switches this workflow to `references/porter.md`, which drives
-  the Porter CLI and dashboard directly. The docker target runs everything on
-  the local machine, is for a quick local test drive only, and is outside this
-  workflow; never present it as the recommended path for a real deployment;
+- hosting target: Fly.io or AWS. Recommend Fly.io when the operator has no
+  preference. The docker target runs everything on the local machine, is for a
+  quick local test drive only, and is outside this workflow; never present it
+  as the recommended path for a real deployment;
 - the first administrator's verified work email;
 - how people sign in: the built-in `auth` broker, which emails a one-time link,
   or an external OIDC provider. Ask whether the company runs on Slack before
@@ -58,7 +55,11 @@ contracts are scaffolded as one unit.
 
 ## 2. Prepare the deployment repository
 
-Require Node 24+, npm, Git, Docker with Buildx, and `openssl`.
+Require Node 24+, npm, and Git. Provider-specific prerequisites are in the
+selected reference. Fly builds remotely and does not require local Docker or
+Buildx. Init and setup generate secrets through Node and do not require
+OpenSSL. The update command specifically requires native npm `>=11.12.0 and
+<12`.
 
 For a repository without `qm.config.jsonc`, first confirm the hosting target
 and the derived slug, then initialize its root with the current CLI:
@@ -81,42 +82,222 @@ For an already-initialized clone, install reproducibly. Use `npm ci` when
 `package-lock.json` exists; otherwise use `npm install` to create it:
 
 ```bash
-test -f package-lock.json && npm ci || npm install
-npm exec qm -- version
+if test -f package-lock.json; then
+  npm ci
+else
+  npm install
+fi
+npm exec --yes=false -- qm version
 ```
 
-After Admin reports a new release, update the exact package pin and deploy its
-runtime images in one command:
+After Admin reports a new stable release, copy its exact version into the
+update command. The command accepts only the version currently promoted on npm's
+`latest` tag. It installs that package in isolation from the official registry with
+lifecycle scripts disabled, verifies its npm signatures, SLSA provenance, source
+commit, and embedded image manifest, then lets the trusted native npm install the
+exact dependency offline from the verified private cache. The updater enforces native
+npm `>=11.12.0 and <12`. npm owns the package, lock, and installed-tree changes; there
+is no updater journal, transplant, or rollback. The automatic path requires an
+existing exact registry pin and refuses a local package link; normalize a source
+checkout through its ordinary trusted package-manager workflow first. On macOS, the
+deployment tree and external local-input and environment paths must be free of
+extended ACLs. Their mutation-controlling ancestors may have deny-only ACLs, but no
+permission-granting ACL entries. On Linux, trusted `getfacl`, `getfattr`, and `lsattr`
+commands must be available on the launcher `PATH`; protected paths must be free of
+extended access and default ACLs, extended attributes, and immutable file flags:
 
 ```bash
-npm exec qm -- update --yes
+node node_modules/@yc-software/qm/dist/bin/qm.js update --yes --version <version>
 ```
 
-Fly and AWS deployments also include `.github/workflows/qm-update.yml`. To make
-Admin's update button deploy without a command, configure the admin service with:
+The installed `@yc-software/qm` package and its `dist/bin/qm.js` entry point are part
+of the trusted launcher boundary and must be unchanged before the updater starts.
+Run that entry point directly only from a trusted, clean operator shell whose `PATH`
+resolves `node` to a trusted Node executable. Never launch an update through
+`npm exec`, `npx`, a package script, or another npm-mediated launcher. npm processes
+this project's `.npmrc` and package settings before QM starts, outside the updater's
+isolated npm environment. Ambient preloads and loaders also execute before QM;
+`NODE_OPTIONS`, `NODE_PATH`, and platform dynamic-loader variables such as
+`LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, and `DYLD_LIBRARY_PATH` must
+be absent or independently trusted. They are part of the trusted launcher boundary.
+Keep using `npm exec --yes=false -- qm <command>` for routine non-update commands.
 
-```json
-"env": {
-  "admin": {
-    "QM_UPDATE_GITHUB_REPOSITORY": "owner/deployment-repository",
-    "QM_UPDATE_GITHUB_REF": "main"
-  }
-},
-"secretEnv": {
-  "admin": {
-    "QM_UPDATE_GITHUB_TOKEN": "QM_UPDATE_GITHUB_TOKEN"
-  }
+`qm update --yes` is supported on macOS and Linux, not Windows.
+
+### One-time bootstrap from QM 0.1.7 and earlier
+
+Published QM 0.1.7 and earlier do not contain `qm update`. For the one-time
+bootstrap to the first hardened updater, do not install or execute the new package
+through the deployment's npm project. The trusted Node code below obtains the exact
+current stable version directly from the official npm registry over HTTPS and rejects
+anything except stable semver. That mutable registry value selects a tag but does not
+authenticate source. The matching protected immutable annotated tag, not registry or
+release prose, is the source trust anchor. The commands require that tag to point
+directly to a commit whose message has the exact official repository identity, version,
+peeled commit, bootstrap link, and fixed warning. Independently inspect the recorded
+official Actions run when verifying release provenance. From a trusted, clean operator
+shell, create a fresh clone in a mode-0700 temporary directory outside the deployment,
+then invoke the verified source entry with trusted Node 24 or newer from the deployment
+directory:
+
+```bash
+set -euo pipefail
+bootstrap=$(mktemp -d)
+chmod 700 "$bootstrap"
+version=$(
+  node --input-type=module <<'NODE'
+import { get } from "node:https";
+
+const response = await new Promise((resolve, reject) => {
+  const request = get(
+    "https://registry.npmjs.org/@yc-software%2fqm/latest",
+    { headers: { accept: "application/json" } },
+    resolve,
+  );
+  request.on("error", reject);
+});
+if (response.statusCode !== 200) throw new Error(`npm registry returned HTTP ${response.statusCode}`);
+response.setEncoding("utf8");
+let body = "";
+for await (const chunk of response) {
+  body += chunk;
+  if (body.length > 1_000_000) throw new Error("npm registry response is too large");
 }
+const metadata = JSON.parse(body);
+const stable = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+if (typeof metadata.version !== "string" || !stable.test(metadata.version)) {
+  throw new Error("npm latest is not stable semver");
+}
+if (Object.hasOwn(metadata, "deprecated")) throw new Error("npm latest is deprecated");
+process.stdout.write(metadata.version);
+NODE
+)
+tag="v$version"
+repository=yc-software/qm
+repository_id=1316527318
+git clone --filter=blob:none --no-checkout --no-tags "https://github.com/$repository.git" "$bootstrap/qm"
+git -C "$bootstrap/qm" fetch --depth=1 --no-tags origin "refs/tags/$tag:refs/tags/$tag"
+tag_ref="refs/tags/$tag"
+test "$(git -C "$bootstrap/qm" cat-file -t "$tag_ref")" = tag
+tag_object=$(git -C "$bootstrap/qm" cat-file -p "$tag_ref")
+release_commit=$(git -C "$bootstrap/qm" rev-parse "$tag_ref^{commit}")
+test "$(printf '%s\n' "$tag_object" | sed -n '1p')" = "object $release_commit"
+test "$(printf '%s\n' "$tag_object" | sed -n '2p')" = "type commit"
+test "$(printf '%s\n' "$tag_object" | sed -n '3p')" = "tag $tag"
+tag_message=$(git -C "$bootstrap/qm" for-each-ref --format='%(contents)' "$tag_ref")
+test "$(printf '%s\n' "$tag_message" | sed -n '1p')" = "QM release provenance"
+test "$(printf '%s\n' "$tag_message" | sed -n '2p')" = "Repository: $repository ($repository_id)"
+printf '%s\n' "$tag_message" | sed -n '3p' | grep -Eq '^Run: https://github\.com/yc-software/qm/actions/runs/[1-9][0-9]*$'
+test "$(printf '%s\n' "$tag_message" | sed -n '4p')" = "Commit: $release_commit"
+test "$(printf '%s\n' "$tag_message" | sed -n '5p')" = "Version: $version"
+printf '%s\n' "$tag_message" | sed -n '6p' | grep -Eq '^Images: sha256:[0-9a-f]{64}$'
+test "$(printf '%s\n' "$tag_message" | sed -n '7p')" = "Bootstrap for QM 0.1.7 and earlier: https://github.com/$repository/blob/$release_commit/SECURITY.md#one-time-bootstrap-from-qm-017-and-earlier"
+test "$(printf '%s\n' "$tag_message" | sed -n '8p')" = "Bootstrap only from this immutable annotated tag after verifying its repository, commit, and version marker; release notes and mutable main are not trust sources. Never use deployment npm, npm exec, npx, or package scripts."
+test -z "$(printf '%s\n' "$tag_message" | sed -n '9p')"
+git -C "$bootstrap/qm" checkout --detach "$release_commit"
+test "$(git -C "$bootstrap/qm" rev-parse HEAD)" = "$release_commit"
+cd /absolute/path/to/deployment
+node "$bootstrap/qm/cli/bin/qm.ts" update --yes --version "$version"
 ```
 
-Use a fine-grained token limited to this deployment repository with Actions
-read/write access. Add `FLY_API_TOKEN` as a repository Actions secret for Fly.
-If the update needs local deployment values, add the gitignored `.env` contents
-as the repository secret `QM_DEPLOY_ENV`. AWS uses the configured GitHub OIDC
-deploy role. Allow Actions to write repository contents: the workflow records
-the exact pin in `package.json` and its lockfile before deploying, so a rerun is
-idempotent. A failed deploy therefore leaves the branch ahead of the running
-version; rerun the workflow or run `npm exec qm -- update --yes` to finish it.
+Use only the verified immutable annotated tag, never editable release prose, mutable
+`main`, `curl | node`, `npm install`, `npm exec`, `npx`, or a package script for this
+bootstrap. The pinned source launcher performs the hardened package signature, SLSA
+provenance, source-commit, and manifest verification before npm can change the
+deployment. After the first hardened version is installed, use the direct installed
+entry above for later updates.
+
+Only npm verification and mutation are isolated. Provider reconciliation runs the
+verified CLI from a temporary working directory with absolute deployment inputs, but
+intentionally trusts the operator's external home, ambient provider variables, agent
+and keyring sockets, provider configuration and credentials, credential helpers, CLI
+plugins and aliases, proxy and CA settings, and external provider executables.
+Provider executables, transitive helpers, and plugins receive the operator's filtered
+ambient environment and external `PATH`; their interpreter and runtime loaders,
+caches, output paths, and delegated executables are not exhaustively isolated.
+Provider reconciliation is state-changing and may modify provider resources, just as
+ordinary `up` can. Every path those trusted inputs delegate to is trusted too; they must not reference
+deployment-controlled code. The external objects and every alias to them must not be
+writable through the deployment. Direct `PATH` entries that resolve inside the
+deployment are excluded; explicit provider-configuration paths that do so are
+rejected.
+
+The updater never converts ambient operator-shell values into deployment workload
+secrets. Local values must already be in the explicit deployment environment file;
+existing remote provider secret stores remain authoritative.
+
+Treat the update as same-owner exclusive maintenance for this deployment directory.
+Finish every other QM CLI command and package-manager write before starting it, and
+start neither until it exits. Admin only reports the promoted release; it never runs
+this command. After any forced kill, confirm that no descendant npm, Node/QM, Docker,
+Fly, AWS, or other provider process remains before repairing the package or running a
+recovery command. If npm is interrupted, inspect the checkout, restore `package.json`
+and `package-lock.json` through version control as needed, and run trusted
+`npm ci --ignore-scripts` before retrying.
+
+The verified target CLI runs its ordinary `up` path. Docker rebuilds its generated
+local sandbox wrapper when its packaged base or agent wrapper changed. Every AWS
+target rebuilds its deployment-publisher Lambda MicroVM image when its deterministic
+source hash, recorded version, or remote active version is stale or missing; an AWS
+Lambda MicroVM agent backend reuses that pin. Sprites on Fly, Docker, or AWS use the
+Sprites API directly and do no OCI sandbox-image work. A remote failure leaves the
+verified package pin in place. On Docker or Fly, reconcile it with
+`npm exec --yes=false -- qm up`; on AWS, use
+`npm exec --yes=false -- qm up --yes`. Then review and commit the durable tracked
+changes. Retry the exact update command only while its version remains npm `latest`.
+
+For a new Sprites deployment, `sandbox.namePrefix` is the only explicit durable
+namespace selector. Without it, the runtime keeps the historical `qm` prefix. Legacy
+`sandbox.app` may remain alongside a migrated `sandbox.namePrefix`, but it stays inert
+and neither selects nor overrides the prefix. `sandbox.image` and `sandbox.baseImage`
+are also compatibility data for this path and never select an OCI image. Migrate a legacy explicit
+`env.core.SPRITES_NAME_PREFIX` value byte-for-byte to `sandbox.namePrefix`; replacing
+it with a scaffold default would silently abandon the old namespace. Any prefix change
+is a planned data migration. Existing Sprites remain under the old namespace and must
+not be deleted as cleanup.
+
+Do not remove legacy `sandbox.env` or `sandbox.secretEnv` just to make validation pass.
+Direct Sprites has no resident environment injection. Move every value and credential
+to the supported tool, skill, connector, or keychain delivery path used by its
+consumer and verify it can use the replacement. Remove the legacy fields and roll the
+deployment, then verify the live consumer. On Fly, confirm the affected app rollout no
+longer references the old injection, then delete each `FLY_RESIDENT_ENV_<name>` app
+secret. On AWS, confirm the new task definition no longer references the old
+injection, then delete each original `${aws.secretsPrefix}<name>` entry from Secrets
+Manager. On Docker, complete the replacement container rollout, then remove each
+original `<name>` from the deployment's `.env` or other environment source. The CLI
+does not perform that provider cleanup or accept field presence as acknowledgement
+that this migration succeeded. This work is separate from revoking and deleting the
+retired source credential `FLY_SANDBOX_API_TOKEN` and unsetting its deployed core
+`FLY_API_TOKEN` alias.
+
+Automatic updates stop before changing files when any workload `imageOverrides` are
+set. They also stop for Fly `imageFrom` or an explicit Docker-local `sandbox.image`.
+Roll workload overrides, `imageFrom`, and the local Docker image forward through their
+normal image process. Automatic updates also stop for `sandbox/Dockerfile` whenever
+the effective backend is Sprites on Fly, Docker, or AWS. Sprites no longer consume OCI
+sandbox images, so review and archive or remove that retired file before updating;
+never silently delete its custom content. Docker's local sandbox build is separate.
+Every AWS target still requires its packaged deployment-publisher MicroVM image, and
+the AWS agent-computer backend reuses the same pin. `sandbox publish` is retired and
+hard-rejected.
+
+If this repository has retired default or renamed Admin-dispatched GitHub update
+workflows or any `QM_UPDATE_GITHUB_*` Admin config, first cancel every queued or
+running job for every configured or detected legacy workflow and wait for each job to
+reach a terminal status. Only then remove every workflow copy and all settings and
+delete the GitHub repository secret `QM_DEPLOY_ENV`, revoke the old GitHub token and
+remove every resident `QM_UPDATE_GITHUB_TOKEN` copy, then revoke and delete the
+retired source credential `FLY_SANDBOX_API_TOKEN` from every repository, host, and CI
+secret store before updating. Removing or disabling a workflow or redeploying Admin
+does not cancel queued jobs. Fly reconciliation stages removal of its deployed core
+`FLY_API_TOKEN` alias, but that is not a substitute for revoking and deleting the
+source credential.
+
+After the live acceptance checks pass, review `git diff` and commit
+`package.json`, `package-lock.json`, `qm.config.jsonc`, and every other tracked
+deployment-state change produced by the update. Do not leave the new running
+release recorded only in one checkout.
 
 Confirm `.env` is private and ignored before adding credentials:
 
@@ -244,9 +425,9 @@ preflight and setup order:
 Follow the selected provider reference, then run:
 
 ```bash
-npm exec qm -- check --live
-npm exec qm -- conformance
-npm exec qm -- outputs --json
+npm exec --yes=false -- qm check --live
+npm exec --yes=false -- qm conformance
+npm exec --yes=false -- qm outputs --json
 ```
 
 `check --live` verifies provider infrastructure, private storage, public
@@ -276,8 +457,8 @@ receive a real model response. Use a specific request rather than a greeting,
 then confirm its generated sidebar title replaces the `Web chat` fallback. A
 missing title is one failed runtime assertion; inspect the core error log and
 rerun `check --live` before continuing. Ask the agent to create a fresh UUID in
-`/root/workspace/qm-computer-proof.txt`, then use the provider reference's
-independent proof to verify that UUID outside the model transcript.
+`qm-computer-proof.txt` in its current workspace, then use the provider reference's
+backend-specific path to verify that UUID outside the model transcript.
 
 ## 5. Configure connectors
 
@@ -297,8 +478,8 @@ sign-in already created its SSO app in step 3. Skip this when the bot was
 deferred. Otherwise read `.codex/skills/deploy-qm/references/slack.md`, then run:
 
 ```bash
-npm exec qm -- slack render
-npm exec qm -- outputs
+npm exec --yes=false -- qm slack render
+npm exec --yes=false -- qm outputs
 ```
 
 Create the app from the exact bot manifest URL. Enter its bot and app tokens in
@@ -318,7 +499,7 @@ Return:
 - pass/fail for health, the private live session canary, sign-in, manual web
   chat and generated title, agent-computer proof, connector visibility, user
   OAuth, Slack reply, conformance, and an idempotent deployment rerun;
-- `npm exec qm -- status`, logs, rollback, and teardown commands;
+- `npm exec --yes=false -- qm status`, logs, rollback, and teardown commands;
 - recurring cost or manual work still owned by the operator, including model
   usage billed directly by the provider.
 

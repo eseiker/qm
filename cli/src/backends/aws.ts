@@ -1,27 +1,57 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { lookup, resolveCname } from "node:dns/promises";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  mkdtempSync,
+  openSync,
+  readSync,
+  rmSync,
+  writeFileSync,
+  type BigIntStats,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
-  acquireAwsLease as acquireLease,
+  assertAwsLeaseHeld,
+  awsCapture,
+  awsCaptureAsync,
+  awsCliErrorMatches,
+  awsLeaseBoundary,
+  awsLeaseOperation,
+  awsRunInherit,
+  awsRunInheritAsync,
   awsText,
+  awsTextAsync,
   deployLocksTable,
-  releaseAwsLease as releaseLease,
   withAwsLease,
 } from "../aws-lease.ts";
 import { CliError, dim, errMessage, header, note, ok, step, warn } from "../log.ts";
 import {
   awsWorkloadArchitecture,
+  effectiveDeployAppsDomain,
+  effectivePortalPublicUrl,
+  isReservedSecretEnvironmentName,
   isDigestPinned,
+  sandboxBackend,
   sandboxCoreEnv,
   securityScreenEnv,
   type AwsConfig,
   type QmConfig,
 } from "../config.ts";
 import { manifestRef } from "../manifest.ts";
-import { computedSecrets, runtimeSecretNames, secretsForService, type ComputedSecret } from "../secrets.ts";
+import {
+  computedSecrets,
+  deploymentStoreSecretValue,
+  materializeSecretValues,
+  runtimeSecretNames,
+  secretsForService,
+  validateCompleteSecretValues,
+  type ComputedSecret,
+} from "../secrets.ts";
 import {
   brokerWiring,
   brandEnvOf,
@@ -36,52 +66,65 @@ import {
 } from "../services.ts";
 import { discoverPlugins, type ResolvedPlugin } from "../plugins.ts";
 import {
+  assertNoNulSecret,
+  assertSecretByteLength,
   canonicalJson,
   capture,
-  deploymentSecretValue,
   envNum,
+  gitSubprocessEnvironment,
+  invalidSecretNames,
   isInvalidSecret,
   isMissingOrPlaceholder,
+  processErrorMatches,
   promptHidden,
   readEnvFile,
   resolveBuildRepoRoot,
-  runInherit,
   sleep,
   streamLabeled,
+  type FileIdentity,
 } from "../util.ts";
 import { doctorCommon } from "./doctor.ts";
+import { readRenderedFile } from "../safe-write.ts";
 import { awsObjectStoreBucket, declaredVariables, terraformVarsDrift } from "../terraform.ts";
 import {
+  clearDeploymentLayer,
   currentDeploymentLayerState,
   deploymentLayerBody,
   syncDeploymentLayerBody,
+  type DeploymentLayerPrecondition,
   type DeploymentLayerSyncResult,
+  type DeploymentLayerState,
   httpDeploymentLayerTransport,
   type DeploymentLayerTransport,
 } from "../deployment-layer.ts";
+import { buildxInvocation, sourceBuildEnvironment } from "../buildx.ts";
 
-/**
- * Deployment-layer transport for AWS: signed HTTP to the public core URL,
- * with a Secrets Manager fallback for CORE_SIGNING_SECRET and a 60s timeout.
- */
-export const awsDeploymentLayerTransport: DeploymentLayerTransport = httpDeploymentLayerTransport({
-  secretFallback: (config) =>
-    config.aws
-      ? capture(process.env.AWS_BIN ?? "aws", [
-          "secretsmanager",
-          "get-secret-value",
-          "--secret-id",
-          `${config.aws.secretsPrefix}CORE_SIGNING_SECRET`,
-          "--query",
-          "SecretString",
-          "--output",
-          "text",
-          "--region",
-          config.aws.region,
-        ]).trim()
-      : undefined,
+const awsHttpDeploymentLayerTransport = httpDeploymentLayerTransport({
+  secretFallback: (config) => {
+    if (!config.aws) return undefined;
+    const value = awsJson<{ SecretString?: string }>(config.aws, [
+      "secretsmanager",
+      "get-secret-value",
+      "--secret-id",
+      `${config.aws.secretsPrefix}CORE_SIGNING_SECRET`,
+    ]).SecretString;
+    assertNoNulSecret("CORE_SIGNING_SECRET", value);
+    return value;
+  },
   timeoutMs: 60_000,
 });
+
+export const awsDeploymentLayerTransport: DeploymentLayerTransport = async (options) => {
+  await awsLeaseBoundary();
+  try {
+    const result = await awsHttpDeploymentLayerTransport(options);
+    await awsLeaseBoundary();
+    return result;
+  } catch (error) {
+    await awsLeaseBoundary();
+    throw error;
+  }
+};
 export interface AwsUpOpts {
   dryRun?: boolean;
   yes?: boolean;
@@ -91,6 +134,16 @@ export interface AwsUpOpts {
   only?: string[];
   sandboxDir?: string;
   envFile?: string;
+  configIdentity: FileIdentity;
+  microvmBuildPlanned?: boolean;
+  preflight?: AwsUpPreflight;
+}
+
+export interface AwsUpPreflight {
+  microvmRebuildRequired: boolean;
+  publicApiUrlNeedsUpdate: boolean;
+  secretArns: Record<string, string>;
+  secretValues: ReadonlyMap<string, string>;
 }
 
 export interface EcsTaskDefinition {
@@ -110,6 +163,21 @@ function requireAws(config: QmConfig): AwsConfig {
   return config.aws;
 }
 
+type AwsServiceSpec = AwsConfig["services"][string];
+
+function ownAwsServiceSpec(aws: AwsConfig, workload: string): AwsServiceSpec | undefined {
+  if (!Object.hasOwn(aws.services, workload)) return undefined;
+  const value = (aws.services as Record<string, unknown>)[workload];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  return value as AwsServiceSpec;
+}
+
+function awsServiceSpec(aws: AwsConfig, workload: string): AwsServiceSpec {
+  const spec = ownAwsServiceSpec(aws, workload);
+  if (!spec) throw new CliError(`aws.services.${workload} is missing`);
+  return spec;
+}
+
 function rdsInstanceIdentifier(aws: AwsConfig): string {
   return aws.rdsInstance ?? `${aws.cluster}-core`;
 }
@@ -126,7 +194,7 @@ function awsTopology(
   const stale = Object.keys(aws.services)
     .filter((workload) => !enabled.has(workload))
     .sort();
-  const missing = workloads.filter((workload) => !aws.services[workload]);
+  const missing = workloads.filter((workload) => !ownAwsServiceSpec(aws, workload));
   if (stale.length || missing.length) {
     const problems = [
       ...(stale.length ? [`disabled workloads: ${stale.join(", ")}`] : []),
@@ -134,6 +202,7 @@ function awsTopology(
     ];
     throw new CliError(`aws.services topology mismatch (${problems.join("; ")})`);
   }
+  for (const workload of workloads) assertWorkloadSecretDestinations(config, workload);
   return { aws, workloads, plugins: discovered.plugins };
 }
 
@@ -143,11 +212,18 @@ function containerSecretNames(service: string, secret: ComputedSecret): string[]
 }
 
 function awsArgs(aws: AwsConfig, args: string[]): string[] {
+  assertAwsLeaseHeld();
   return [...args, "--region", aws.region];
 }
 
 function awsJson<T>(aws: AwsConfig, args: string[]): T {
-  const raw = capture(process.env.AWS_BIN ?? "aws", awsArgs(aws, [...args, "--output", "json"]));
+  const raw = awsCapture(process.env.AWS_BIN ?? "aws", awsArgs(aws, [...args, "--output", "json"]));
+  if (!raw.trim()) return {} as T;
+  return JSON.parse(raw) as T;
+}
+
+async function awsJsonAsync<T>(aws: AwsConfig, args: string[]): Promise<T> {
+  const raw = await awsCaptureAsync(process.env.AWS_BIN ?? "aws", awsArgs(aws, [...args, "--output", "json"]));
   if (!raw.trim()) return {} as T;
   return JSON.parse(raw) as T;
 }
@@ -159,8 +235,8 @@ function assertAwsCallerAccount(aws: AwsConfig): void {
   }
 }
 
-function registerTaskDefinition(config: QmConfig, file: string): string {
-  return awsText(config.aws!, [
+function registerTaskDefinition(config: QmConfig, file: string): Promise<string> {
+  return awsTextAsync(config.aws!, [
     "ecs",
     "register-task-definition",
     "--cli-input-json",
@@ -175,17 +251,38 @@ function registerTaskDefinition(config: QmConfig, file: string): string {
   ]);
 }
 
-function deployImageCoordinates(config: QmConfig): { name: string; version: string } {
+function deployImageCoordinates(config: QmConfig): { name: string; version?: string } {
   const name = config.env.core?.AWS_DEPLOY_IMAGE?.trim();
   const version = config.env.core?.AWS_DEPLOY_IMAGE_VERSION?.trim();
-  if (!name || !version || isMissingOrPlaceholder(name) || isMissingOrPlaceholder(version)) {
-    throw new CliError("AWS requires exact env.core.AWS_DEPLOY_IMAGE and AWS_DEPLOY_IMAGE_VERSION coordinates");
+  if (!name || isMissingOrPlaceholder(name)) {
+    throw new CliError("AWS requires an exact env.core.AWS_DEPLOY_IMAGE coordinate");
   }
-  return { name, version };
+  const usableVersion =
+    version && version !== "pending-build" && !isMissingOrPlaceholder(version) ? version : undefined;
+  if (usableVersion && !/^[1-9][0-9]*$/.test(usableVersion)) {
+    throw new CliError("AWS_DEPLOY_IMAGE_VERSION must be a positive integer image version");
+  }
+  return { name, ...(usableVersion ? { version: usableVersion } : {}) };
 }
 
+function microvmImageVersion(value: unknown): string | undefined {
+  if (typeof value === "string" && /^[1-9][0-9]*$/.test(value)) return value;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return String(value);
+  return undefined;
+}
+
+const microvmImageVersionStates = new Set([
+  "IN_PROGRESS",
+  "SUCCESSFUL",
+  "FAILED",
+  "DELETING",
+  "DELETED",
+  "DELETE_FAILED",
+]);
+const microvmImageVersionStatuses = new Set(["ACTIVE", "INACTIVE"]);
+
 export function guardLambdaMicrovms(e: unknown): never {
-  if (/invalid choice:?\s*'?lambda-microvms/i.test(errMessage(e))) {
+  if (processErrorMatches(e, /invalid choice:?\s*'?lambda-microvms/i)) {
     throw new CliError(
       "this AWS CLI lacks the `lambda-microvms` commands needed to build/verify the AWS deploy MicroVM image; install an AWS CLI with Lambda MicroVMs support",
     );
@@ -193,7 +290,7 @@ export function guardLambdaMicrovms(e: unknown): never {
   throw e instanceof Error ? e : new Error(errMessage(e));
 }
 
-function assertAwsDeployImage(config: QmConfig): void {
+function awsDeployImageStatus(config: QmConfig): { current: boolean; reason?: string } {
   const aws = requireAws(config);
   const { name, version } = deployImageCoordinates(config);
   const expectedArn = `arn:aws:lambda:${aws.region}:${aws.accountId}:microvm-image:${name}`;
@@ -206,30 +303,82 @@ function assertAwsDeployImage(config: QmConfig): void {
       expectedArn,
     ]);
   } catch (e) {
-    if (/invalid choice:?\s*'?lambda-microvms/i.test(errMessage(e))) return;
+    if (awsCliErrorMatches(e, "ResourceNotFoundException")) {
+      return { current: false, reason: `AWS deploy image ${name} does not exist` };
+    }
     guardLambdaMicrovms(e);
   }
-  const detail = (image.image && typeof image.image === "object" ? image.image : image) as Record<string, unknown>;
-  const arn = detail.imageArn ?? detail.imageARN ?? detail.arn;
-  if (arn !== expectedArn)
-    throw new CliError(`AWS deploy image ${name} resolves to ${String(arn ?? "no ARN")}, expected ${expectedArn}`);
-  const versions =
-    awsJson<{ items?: Array<{ imageVersion?: string | number; state?: string; status?: string }> }>(aws, [
-      "lambda-microvms",
-      "list-microvm-image-versions",
-      "--image-identifier",
-      expectedArn,
-    ]).items ?? [];
-  const pinned = versions.find((item) => String(item.imageVersion) === version);
-  if (!pinned || pinned.state !== "SUCCESSFUL" || pinned.status !== "ACTIVE") {
-    throw new CliError(`AWS deploy image ${name} version ${version} is not SUCCESSFUL and ACTIVE`);
+  const envelope: unknown = image;
+  const detailValue =
+    typeof envelope === "object" && envelope !== null && !Array.isArray(envelope)
+      ? ((envelope as Record<string, unknown>).image ?? envelope)
+      : envelope;
+  if (typeof detailValue !== "object" || detailValue === null || Array.isArray(detailValue)) {
+    throw new CliError(`AWS deploy image ${name} returned an invalid response without an ARN`);
   }
+  const detail = detailValue as Record<string, unknown>;
+  const arn = detail.imageArn ?? detail.imageARN ?? detail.arn;
+  if (arn !== expectedArn) {
+    if (arn === undefined) throw new CliError(`AWS deploy image ${name} returned an invalid response without an ARN`);
+    throw new CliError(`AWS deploy image ${name} resolves to ${String(arn)}, expected ${expectedArn}`);
+  }
+  if (!version) {
+    return { current: false, reason: `AWS deploy image ${name} has no recorded AWS_DEPLOY_IMAGE_VERSION` };
+  }
+  const response = awsJson<{ items?: Array<{ imageVersion?: string | number; state?: string; status?: string }> }>(
+    aws,
+    ["lambda-microvms", "list-microvm-image-versions", "--image-identifier", expectedArn],
+  );
+  if (
+    !Array.isArray(response.items) ||
+    !response.items.every(
+      (item) =>
+        item !== null &&
+        typeof item === "object" &&
+        microvmImageVersion(item.imageVersion) !== undefined &&
+        typeof item.state === "string" &&
+        microvmImageVersionStates.has(item.state) &&
+        typeof item.status === "string" &&
+        microvmImageVersionStatuses.has(item.status),
+    )
+  ) {
+    throw new CliError(`AWS deploy image ${name} returned an invalid versions response`);
+  }
+  const versions = response.items;
+  const pinned = versions.find((item) => microvmImageVersion(item.imageVersion) === version);
+  if (!pinned || pinned.state !== "SUCCESSFUL" || pinned.status !== "ACTIVE") {
+    return { current: false, reason: `AWS deploy image ${name} version ${version} is not SUCCESSFUL and ACTIVE` };
+  }
+  return { current: true };
+}
+
+export function awsDeployImageNeedsRebuild(config: QmConfig): boolean {
+  return !awsDeployImageStatus(config).current;
+}
+
+function assertAwsDeployImage(config: QmConfig): void {
+  const status = awsDeployImageStatus(config);
+  if (!status.current) throw new CliError(status.reason ?? "AWS deploy image is not ready");
 }
 
 function secretValueFrom(config: QmConfig, name: string, arns?: Record<string, string>): string {
   if (arns?.[name]) return arns[name];
   const aws = requireAws(config);
   return `arn:aws:secretsmanager:${aws.region}:${aws.accountId}:secret:${aws.secretsPrefix}${name}`;
+}
+
+const forbiddenCoreEndpointNames = new Set(["AGENT_API_URL", "SLACK_API_URL"]);
+
+function withoutAwsEndpointEnvironment(
+  config: QmConfig,
+  workload: string,
+  values: Readonly<Record<string, string>> | undefined,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(values ?? {}).filter(
+      ([name]) => !(name.startsWith("AWS_ENDPOINT_URL") && isReservedSecretEnvironmentName(config, workload, name)),
+    ),
+  );
 }
 
 export function serviceEnvironment(config: QmConfig, service: ServiceName): Record<string, string> {
@@ -248,7 +397,7 @@ export function serviceEnvironment(config: QmConfig, service: ServiceName): Reco
     ...orgEnv(service, config.orgId, config.publicUrl, config.services.includes("portal"), brandEnvOf(config)),
     ...(service === "core" ? {} : { CORE_API_URL: coreUrl }),
     ...coreEnv,
-    ...config.env[service],
+    ...withoutAwsEndpointEnvironment(config, service, config.env[service]),
     ...(service === "core" ? securityScreenEnv(config) : {}),
   };
   if (service === "core") {
@@ -262,14 +411,11 @@ export function serviceEnvironment(config: QmConfig, service: ServiceName): Reco
       S3_BUCKET: config.env.core?.S3_BUCKET?.trim() || awsObjectStoreBucket(config),
       S3_REGION: aws.region,
     };
-    if (usesFlySandboxes(config)) {
+    if (!usesAwsMicrovmSandboxes(config)) {
       Object.assign(env, sandboxCoreEnv(config).env, {
-        SANDBOX_BACKEND: config.env.core?.SANDBOX_BACKEND?.trim() || config.sandbox?.backend || "sprites",
         ...stores,
       });
     } else {
-      delete env.FLY_BASE_IMAGE;
-      delete env.FLY_SANDBOX_APP_NAME;
       Object.assign(env, {
         SANDBOX_BACKEND: "aws",
         AWS_SANDBOX_REGION: aws.region,
@@ -286,12 +432,14 @@ export function serviceEnvironment(config: QmConfig, service: ServiceName): Reco
     env.WEB_UI_UPSTREAM = `http://web-ui.${aws.networking.cloudMapNamespace}:8080`;
     env.ADMIN_UPSTREAM = `http://admin.${aws.networking.cloudMapNamespace}:8080`;
     env.PORTAL_XFF_TRUSTED_HOPS = "1";
+    const appsDomain = effectiveDeployAppsDomain(config);
+    if (appsDomain) env.DEPLOY_APPS_DOMAIN = appsDomain;
   }
   if (config.services.includes("auth")) {
     Object.assign(
       env,
       brokerWiring(service, {
-        publicUrl: config.publicUrl,
+        publicUrl: effectivePortalPublicUrl(config),
         authBaseUrl: `http://auth.${aws.networking.cloudMapNamespace}:8080`,
         ...(config.env.auth?.AUTH_ALLOWED_EMAIL_DOMAIN
           ? { allowedEmailDomain: config.env.auth.AUTH_ALLOWED_EMAIL_DOMAIN }
@@ -299,9 +447,15 @@ export function serviceEnvironment(config: QmConfig, service: ServiceName): Reco
       }),
     );
   }
-  if (config.services.includes("portal") && (service === "web-ui" || service === "admin")) {
+  delete env.REQUIRE_SIGNED_PORTAL_IDENTITY;
+  if (config.services.includes("portal") && service === "core") {
     env.REQUIRE_SIGNED_PORTAL_IDENTITY = "1";
   }
+  if (service === "core") {
+    for (const name of forbiddenCoreEndpointNames) delete env[name];
+    env.DATA_DIR = "/data";
+  }
+  env.NODE_ENV = "production";
   env[def.docker.portEnv] = String(def.docker.internalPort);
   return Object.fromEntries(Object.entries(env).sort(([a], [b]) => a.localeCompare(b)));
 }
@@ -313,21 +467,46 @@ function workloadEnvironment(config: QmConfig, workload: string): Record<string,
     Object.entries({
       CORE_API_URL: `http://core.${requireAws(config).networking.cloudMapNamespace}:8080`,
       ...orgEnv(workload, config.orgId, config.publicUrl, config.services.includes("portal"), brandEnvOf(config)),
-      ...plugin?.env,
+      ...withoutAwsEndpointEnvironment(config, workload, plugin?.env),
+      NODE_ENV: "production",
       PORT: "8080",
     }).sort(([a], [b]) => a.localeCompare(b)),
   );
 }
 
-function workloadSecrets(config: QmConfig, workload: string, available?: Record<string, string>) {
-  const secrets = secretsForService(config, workload).filter(
-    (secret) => secret.required || Boolean(available?.[secret.name]),
-  );
+function allWorkloadSecrets(config: QmConfig, workload: string): ComputedSecret[] {
+  const secrets = secretsForService(config, workload);
   if (!isServiceName(workload) && !secrets.some((secret) => secret.name === "CORE_SIGNING_SECRET")) {
     const signing = computedSecrets(config).find((secret) => secret.name === "CORE_SIGNING_SECRET");
     if (signing) return [...secrets, signing];
   }
   return secrets;
+}
+
+function workloadSecrets(config: QmConfig, workload: string, available?: Record<string, string>) {
+  return allWorkloadSecrets(config, workload).filter((secret) => secret.required || Boolean(available?.[secret.name]));
+}
+
+function assertWorkloadSecretDestinations(config: QmConfig, workload: string): void {
+  const providerEnvironment = workloadEnvironment(config, workload);
+  const enabled = new Set<string>(["core", ...config.services]);
+  const configured = Object.entries(config.secretEnv ?? {}).flatMap(([service, entries]) => {
+    if (!enabled.has(service) || (isVirtualService(service) ? "core" : service) !== workload) return [];
+    return Object.keys(entries ?? {});
+  });
+  const plugin = config.plugins.find((entry) => entry.name === workload);
+  configured.push(...(plugin?.secrets ?? []).map((secret) => secret.name));
+  const conflicts = configured.filter(
+    (name) =>
+      isReservedSecretEnvironmentName(config, workload, name) ||
+      Object.hasOwn(providerEnvironment, name) ||
+      (workload === "core" && forbiddenCoreEndpointNames.has(name)),
+  );
+  if (conflicts.length) {
+    throw new CliError(
+      `AWS secret destinations overlap provider-owned environment for ${workload}: ${[...new Set(conflicts)].sort().join(", ")}`,
+    );
+  }
 }
 
 function workloadArchitecture(config: QmConfig, workload: string): "arm64" | "amd64" {
@@ -342,10 +521,9 @@ export function renderTaskDefinition(
   secretArns?: Record<string, string>,
 ): EcsTaskDefinition {
   if (!isDigestPinned(image)) throw new CliError(`aws task image for ${service} must be pinned by digest`);
+  assertWorkloadSecretDestinations(config, service);
   const aws = requireAws(config);
-  const spec = aws.services[service];
-  if (!spec) throw new CliError(`aws.services.${service} is missing`);
-  if (service === "core" && usesFlySandboxes(config)) resolveAwsSandboxPin(config, () => undefined);
+  const spec = awsServiceSpec(aws, service);
   const internalPort = isServiceName(service) ? serviceDef(service).docker.internalPort : 8080;
   const executionRoleArn = spec.executionRoleArn ?? `arn:aws:iam::${aws.accountId}:role/${aws.cluster}-task-execution`;
   const taskRoleArn =
@@ -414,7 +592,7 @@ function ecrHost(aws: AwsConfig): string {
 
 function expectedWorkloadImageRepository(config: QmConfig, workload: string): string {
   const aws = requireAws(config);
-  const repository = aws.services[workload]?.ecrRepository;
+  const repository = ownAwsServiceSpec(aws, workload)?.ecrRepository;
   if (!repository) throw new CliError(`aws.services.${workload} is missing`);
   return `${ecrHost(aws)}/${repository}`;
 }
@@ -424,13 +602,17 @@ export function isPinnedWorkloadImage(config: QmConfig, workload: string, image:
   return new RegExp(`^${repository}@sha256:[0-9a-f]{64}$`).test(image);
 }
 
-function dockerLogin(aws: AwsConfig): void {
-  const password = awsText(aws, ["ecr", "get-login-password"]);
-  const result = spawnSync("docker", ["login", "--username", "AWS", "--password-stdin", ecrHost(aws)], {
-    input: `${password}\n`,
-    encoding: "utf8",
-    stdio: ["pipe", "inherit", "inherit"],
-  });
+async function dockerLogin(aws: AwsConfig, buildEnv: NodeJS.ProcessEnv): Promise<void> {
+  const password = await awsTextAsync(aws, ["ecr", "get-login-password"]);
+  assertNoNulSecret("ECR login password", password);
+  const result = await awsLeaseOperation(() =>
+    spawnSync("docker", ["login", "--username", "AWS", "--password-stdin", ecrHost(aws)], {
+      input: `${password}\n`,
+      encoding: "utf8",
+      stdio: ["pipe", "inherit", "inherit"],
+      env: buildEnv,
+    }),
+  );
   if (result.status !== 0) throw new CliError("docker login to ECR failed");
 }
 
@@ -457,73 +639,118 @@ function workloadImageProvenance(
   opts: Pick<AwsUpOpts, "buildFrom" | "buildFromPath">,
 ): DeploymentImageProvenance {
   if (plugin?.kind === "source") {
-    return { kind: "source-build", source: "plugin", ...sourceBuildInfo(plugin.sourceDir!) };
+    return { kind: "source-build", source: "plugin" };
   }
   if (opts.buildFrom && isServiceName(workload)) {
-    return {
-      kind: "source-build",
-      source: "checkout",
-      ...sourceBuildInfo(resolveBuildRepoRoot(opts.buildFromPath, [workload])),
-    };
+    return { kind: "source-build", source: "checkout" };
   }
   const source = workloadSourceImage(config, workload, plugin);
   if (!source) throw new CliError(`AWS workload ${workload} has no source image`);
   return { kind: "configured", source };
 }
 
-const sourceBuildInfoByRoot = new Map<string, { gitCommit?: string; dirty?: boolean }>();
-
-function sourceBuildInfo(root: string): { gitCommit?: string; dirty?: boolean } {
-  const cached = sourceBuildInfoByRoot.get(root);
-  if (cached) return cached;
-  const info: { gitCommit?: string; dirty?: boolean } = {};
-  try {
-    info.gitCommit = capture("git", ["-C", root, "rev-parse", "HEAD"]).trim();
-    info.dirty = capture("git", ["-C", root, "status", "--porcelain"]).trim().length > 0;
-  } catch {
-    void 0;
-  }
-  sourceBuildInfoByRoot.set(root, info);
-  return info;
+interface SourceBuildSnapshot {
+  root: string;
 }
 
-function sourceImageDigest(source: string): string {
+interface AwsSourceBuildAdmission {
+  baseEnv: NodeJS.ProcessEnv;
+  fileValues: ReadonlyMap<string, string>;
+  sensitiveNames: ReadonlySet<string>;
+  sensitiveValues: ReadonlySet<string>;
+}
+
+function sourceBuildAdmission(
+  config: QmConfig,
+  configDir: string,
+  envFile: string | undefined,
+  configIdentity: FileIdentity,
+): AwsSourceBuildAdmission {
+  const baseEnv = { ...process.env };
+  const fileValues = readEnvFile(resolve(envFile ?? join(configDir, ".env")), {
+    required: envFile !== undefined,
+    protectedIdentity: configIdentity,
+  });
+  const sensitiveNames = new Set([...computedSecrets(config).map((secret) => secret.name), "DATABASE_URL"]);
+  const sensitiveValues = new Set<string>();
+  for (const name of sensitiveNames) {
+    for (const value of [
+      fileValues.get(name),
+      baseEnv[name],
+      selectedSecretValue(name, fileValues.get(name), baseEnv),
+    ]) {
+      if (value !== undefined) sensitiveValues.add(value);
+    }
+  }
+  return { baseEnv, fileValues, sensitiveNames, sensitiveValues };
+}
+
+function awsSourceBuildEnvironment(
+  admission: AwsSourceBuildAdmission,
+  remoteValues: ReadonlyMap<string, string>,
+): NodeJS.ProcessEnv {
+  return sourceBuildEnvironment(admission.baseEnv, {
+    sensitiveNames: admission.sensitiveNames,
+    sensitiveValues: [...admission.sensitiveValues, ...remoteValues.values()],
+  });
+}
+
+function sourceBuildSnapshot(
+  workload: string,
+  plugin: ResolvedPlugin | undefined,
+  opts: Pick<AwsUpOpts, "buildFrom" | "buildFromPath">,
+): SourceBuildSnapshot | undefined {
+  if (plugin?.kind === "source") return { root: plugin.sourceDir! };
+  if (opts.buildFrom && isServiceName(workload)) {
+    return { root: resolveBuildRepoRoot(opts.buildFromPath, [workload]) };
+  }
+  return undefined;
+}
+
+async function sourceImageDigest(source: string, buildEnv: NodeJS.ProcessEnv): Promise<string> {
   const pinned = source.match(/@(?<digest>sha256:[0-9a-f]{64})$/)?.groups?.digest;
   if (pinned) return pinned;
-  const output = capture("docker", ["buildx", "imagetools", "inspect", source]);
+  const invocation = buildxInvocation(["imagetools", "inspect", source], buildEnv);
+  const output = await awsCaptureAsync(invocation.command, invocation.args, { env: invocation.env });
   const digest = output.match(/^Digest:\s*(sha256:[0-9a-f]{64})\s*$/m)?.[1];
   if (!digest) throw new CliError(`registry did not return an immutable digest for AWS source image ${source}`);
   return digest;
 }
 
-function plannedWorkloadImage(config: QmConfig, workload: string, plugin: ResolvedPlugin | undefined): string {
+async function plannedWorkloadImage(
+  config: QmConfig,
+  workload: string,
+  plugin: ResolvedPlugin | undefined,
+  buildEnv: NodeJS.ProcessEnv,
+): Promise<string> {
   const source = workloadSourceImage(config, workload, plugin);
   if (!source) throw new CliError(`AWS workload ${workload} has no source image`);
-  return `${expectedWorkloadImageRepository(config, workload)}@${sourceImageDigest(source)}`;
+  return `${expectedWorkloadImageRepository(config, workload)}@${await sourceImageDigest(source, buildEnv)}`;
 }
 
 function workloadBuildArgs(config: QmConfig, workload: string): Record<string, string> {
-  return { ...requireAws(config).services[workload]?.buildArgs };
+  return { ...ownAwsServiceSpec(requireAws(config), workload)?.buildArgs };
 }
 
 export function imageTransferArgs(source: string, tagged: string): string[] {
-  return ["buildx", "imagetools", "create", "--prefer-index=false", "--tag", tagged, source];
+  return ["imagetools", "create", "--prefer-index=false", "--tag", tagged, source];
 }
 
-function publishWorkloadImage(
+async function publishWorkloadImage(
   config: QmConfig,
   workload: string,
   plugin: ResolvedPlugin | undefined,
   label: string,
   opts: AwsUpOpts,
-): string {
+  snapshot: SourceBuildSnapshot | undefined,
+  buildEnv: NodeJS.ProcessEnv,
+): Promise<string> {
   const aws = requireAws(config);
-  const spec = aws.services[workload]!;
+  const spec = awsServiceSpec(aws, workload);
   const tagged = `${ecrHost(aws)}/${spec.ecrRepository}:${label}`;
   const platform = `linux/${workloadArchitecture(config, workload)}`;
   if (plugin?.kind === "source") {
     const args = [
-      "buildx",
       "build",
       "--platform",
       platform,
@@ -536,38 +763,28 @@ function publishWorkloadImage(
     ];
     for (const [name, value] of Object.entries(workloadBuildArgs(config, workload)))
       args.push("--build-arg", `${name}=${value}`);
-    args.push(plugin.sourceDir!);
-    runInherit("docker", args);
+    args.push(snapshot!.root);
+    const invocation = buildxInvocation(args, buildEnv);
+    await awsRunInheritAsync(invocation.command, invocation.args, { env: invocation.env });
   } else if (opts.buildFrom && isServiceName(workload)) {
-    const root = resolveBuildRepoRoot(opts.buildFromPath, [workload]);
+    const root = snapshot!.root;
     const dockerfile = join(root, spec.dockerfile ?? join("deploy", workload, "Dockerfile"));
     if (spec.dockerfile && !existsSync(dockerfile)) {
       throw new CliError(`aws.services.${workload}.dockerfile is missing from the build checkout: ${spec.dockerfile}`);
     }
-    const args = [
-      "buildx",
-      "build",
-      "--platform",
-      platform,
-      "--provenance=false",
-      "--push",
-      "-f",
-      dockerfile,
-      "-t",
-      tagged,
-    ];
-    const info = sourceBuildInfo(root);
-    if (info.gitCommit) args.push("--build-arg", `GIT_SHA=${info.gitCommit}${info.dirty ? "-dirty" : ""}`);
+    const args = ["build", "--platform", platform, "--provenance=false", "--push", "-f", dockerfile, "-t", tagged];
     for (const [name, value] of Object.entries(workloadBuildArgs(config, workload)))
       args.push("--build-arg", `${name}=${value}`);
     args.push(root);
-    runInherit("docker", args);
+    const invocation = buildxInvocation(args, buildEnv);
+    await awsRunInheritAsync(invocation.command, invocation.args, { env: invocation.env });
   } else {
     const source = workloadSourceImage(config, workload, plugin);
     if (!source) throw new CliError(`AWS workload ${workload} has no source image`);
-    runInherit("docker", imageTransferArgs(source, tagged));
+    const invocation = buildxInvocation(imageTransferArgs(source, tagged), buildEnv);
+    await awsRunInheritAsync(invocation.command, invocation.args, { env: invocation.env });
   }
-  const response = awsJson<{ imageDetails?: Array<{ imageDigest?: string }> }>(aws, [
+  const response = await awsJsonAsync<{ imageDetails?: Array<{ imageDigest?: string }> }>(aws, [
     "ecr",
     "describe-images",
     "--repository-name",
@@ -580,9 +797,32 @@ function publishWorkloadImage(
   return `${ecrHost(aws)}/${spec.ecrRepository}@${digest}`;
 }
 
-function secretArns(config: QmConfig): Record<string, string> {
+function verifiedAwsSecretArn(aws: AwsConfig, name: string, id: string, arn: unknown): string {
+  const prefix = `arn:aws:secretsmanager:${aws.region}:${aws.accountId}:secret:${id}-`;
+  if (typeof arn !== "string" || !arn.startsWith(prefix) || !/^[A-Za-z0-9]{6}$/.test(arn.slice(prefix.length))) {
+    throw new CliError(`AWS secret ${name} returned an ARN outside the configured account and secret path`);
+  }
+  return arn;
+}
+
+interface AwsSecretSnapshot {
+  arns: Record<string, string>;
+  publicApiUrlNeedsUpdate: boolean;
+  values: ReadonlyMap<string, string>;
+}
+
+function awsSecretSnapshot(
+  config: QmConfig,
+  expectedCoreSigningSecret?: string,
+  stagePublicApiUrl = false,
+): AwsSecretSnapshot {
   const aws = requireAws(config);
-  const pairs = computedSecrets(config).flatMap((secret) => {
+  const secrets = computedSecrets(config);
+  const pairs: Array<readonly [string, string]> = [];
+  const values = new Map<string, string>();
+  const expectedPublicApiUrl = configuredAwsPublicApiUrl(config);
+  let publicApiUrlNeedsUpdate = false;
+  for (const secret of secrets) {
     const id = `${aws.secretsPrefix}${secret.name}`;
     try {
       const value = awsJson<{ ARN?: string; SecretString?: string }>(aws, [
@@ -591,21 +831,142 @@ function secretArns(config: QmConfig): Record<string, string> {
         "--secret-id",
         id,
       ]);
-      if (!value.ARN || isInvalidSecret(secret.name, value.SecretString)) {
-        if (!secret.required) return [];
+      assertNoNulSecret(secret.name, value.SecretString);
+      if (value.SecretString === undefined) {
+        if (stagePublicApiUrl && secret.name === "PUBLIC_API_URL" && expectedPublicApiUrl !== undefined) {
+          values.set(secret.name, expectedPublicApiUrl);
+          publicApiUrlNeedsUpdate = true;
+          pairs.push([secret.name, verifiedAwsSecretArn(aws, secret.name, id, value.ARN)]);
+          continue;
+        }
+        if (!secret.required) continue;
         throw new CliError(`required AWS secret ${secret.name} has no usable, non-placeholder AWSCURRENT value`);
       }
-      return [[secret.name, value.ARN] as const];
+      if (stagePublicApiUrl && secret.name === "PUBLIC_API_URL" && expectedPublicApiUrl !== undefined) {
+        values.set(secret.name, expectedPublicApiUrl);
+        publicApiUrlNeedsUpdate = value.SecretString !== expectedPublicApiUrl;
+      } else {
+        values.set(secret.name, value.SecretString);
+      }
+      pairs.push([secret.name, verifiedAwsSecretArn(aws, secret.name, id, value.ARN)]);
     } catch (error) {
-      if (!secret.required && /ResourceNotFoundException/.test(errMessage(error))) return [];
+      if (
+        stagePublicApiUrl &&
+        secret.name === "PUBLIC_API_URL" &&
+        expectedPublicApiUrl !== undefined &&
+        awsCliErrorMatches(error, "ResourceNotFoundException")
+      ) {
+        const described = awsJson<{ ARN?: unknown }>(aws, ["secretsmanager", "describe-secret", "--secret-id", id]);
+        pairs.push([secret.name, verifiedAwsSecretArn(aws, secret.name, id, described.ARN)]);
+        values.set(secret.name, expectedPublicApiUrl);
+        publicApiUrlNeedsUpdate = true;
+        continue;
+      }
+      if (!secret.required && awsCliErrorMatches(error, "ResourceNotFoundException")) continue;
       throw error;
     }
-  });
-  return Object.fromEntries(pairs);
+  }
+  const invalid = [...invalidSecretNames(values)].sort();
+  if (invalid.length === 1) {
+    const name = invalid[0]!;
+    const required = secrets.find((secret) => secret.name === name)?.required === true;
+    throw new CliError(`${required ? "required " : ""}AWS secret ${name} has no usable runtime value`);
+  }
+  if (invalid.length) throw new CliError(`AWS secrets failed runtime validation: ${invalid.join(", ")}`);
+  materializeSecretValues(config, values, { completeness: "complete", managedBy: "all" });
+  if (expectedCoreSigningSecret !== undefined && values.get("CORE_SIGNING_SECRET") !== expectedCoreSigningSecret) {
+    throw new CliError(
+      "CORE_SIGNING_SECRET selected for deployment does not match its authoritative AWS Secrets Manager value",
+    );
+  }
+  return { arns: Object.fromEntries(pairs), publicApiUrlNeedsUpdate, values };
+}
+
+async function ensureAwsPublicApiUrl(config: QmConfig, snapshot: AwsSecretSnapshot): Promise<AwsSecretSnapshot> {
+  if (!snapshot.publicApiUrlNeedsUpdate) return snapshot;
+  const expected = configuredAwsPublicApiUrl(config);
+  if (expected === undefined) return snapshot;
+  const aws = requireAws(config);
+  const id = `${aws.secretsPrefix}PUBLIC_API_URL`;
+  const confirm = (): AwsSecretSnapshot => awsSecretSnapshot(config);
+  try {
+    await awsTextAsync(
+      aws,
+      ["secretsmanager", "put-secret-value", "--secret-id", id, "--secret-string", "file:///dev/stdin"],
+      { input: expected },
+    );
+  } catch (error) {
+    let confirmed: AwsSecretSnapshot | undefined;
+    try {
+      confirmed = confirm();
+    } catch {
+      confirmed = undefined;
+    }
+    if (confirmed?.values.get("PUBLIC_API_URL") === expected) return confirmed;
+    throw error;
+  }
+  const confirmed = confirm();
+  if (confirmed.values.get("PUBLIC_API_URL") !== expected) {
+    throw new CliError("AWS did not persist the configured PUBLIC_API_URL value");
+  }
+  step("PUBLIC_API_URL: updated from the configured public API coordinate");
+  return confirmed;
+}
+
+function secretArns(config: QmConfig, expectedCoreSigningSecret?: string): Record<string, string> {
+  return awsSecretSnapshot(config, expectedCoreSigningSecret).arns;
+}
+
+function remoteAwsSecretValues(config: QmConfig, replacements: ReadonlySet<string> = new Set()): Map<string, string> {
+  const aws = requireAws(config);
+  const values = new Map<string, string>();
+  for (const secret of computedSecrets(config)) {
+    if (replacements.has(secret.name)) continue;
+    const id = `${aws.secretsPrefix}${secret.name}`;
+    try {
+      const value = awsJson<{ ARN?: unknown; SecretString?: string }>(aws, [
+        "secretsmanager",
+        "get-secret-value",
+        "--secret-id",
+        id,
+      ]);
+      assertNoNulSecret(secret.name, value.SecretString);
+      if (value.SecretString !== undefined) {
+        verifiedAwsSecretArn(aws, secret.name, id, value.ARN);
+        values.set(secret.name, value.SecretString);
+      }
+    } catch (error) {
+      if (!awsCliErrorMatches(error, "ResourceNotFoundException")) throw error;
+    }
+  }
+  return values;
+}
+
+function assertAwsSecretReplacementValid(config: QmConfig, replacements: ReadonlyMap<string, string>): void {
+  const futureValues = remoteAwsSecretValues(config, new Set(replacements.keys()));
+  for (const [name, value] of replacements) futureValues.set(name, value);
+  materializeSecretValues(config, futureValues, { completeness: "complete", managedBy: "all" });
+}
+
+function assertAwsSecretContainers(aws: AwsConfig, uploads: ReadonlyArray<{ name: string; id: string }>): void {
+  for (const secret of uploads) {
+    try {
+      const value = awsJson<{ ARN?: unknown }>(aws, ["secretsmanager", "describe-secret", "--secret-id", secret.id]);
+      verifiedAwsSecretArn(aws, secret.name, secret.id, value.ARN);
+    } catch (error) {
+      if (awsCliErrorMatches(error, "ResourceNotFoundException")) {
+        throw new CliError(
+          `AWS secret container ${secret.id} is missing; apply the rendered Terraform before pushing secrets`,
+        );
+      }
+      throw error;
+    }
+  }
 }
 
 function assertAwsPublicApiUrl(config: QmConfig): void {
-  if (!computedSecrets(config).some((secret) => secret.name === "PUBLIC_API_URL")) return;
+  const expected = configuredAwsPublicApiUrl(config);
+  if (expected === undefined) return;
   const aws = requireAws(config);
   const value = awsText(aws, [
     "secretsmanager",
@@ -615,8 +976,8 @@ function assertAwsPublicApiUrl(config: QmConfig): void {
     "--query",
     "SecretString",
   ]);
+  assertNoNulSecret("PUBLIC_API_URL", value);
   const bound = config.apiUrl ? ("apiUrl" as const) : ("publicUrl" as const);
-  const expected = new URL(config.apiUrl ?? config.publicUrl).toString().replace(/\/$/, "");
   let normalized: string;
   try {
     const parsed = new URL(value);
@@ -630,9 +991,23 @@ function assertAwsPublicApiUrl(config: QmConfig): void {
   }
 }
 
+function configuredAwsPublicApiUrl(config: QmConfig): string | undefined {
+  if (!computedSecrets(config).some((secret) => secret.name === "PUBLIC_API_URL")) return undefined;
+  const bound = config.apiUrl ? ("apiUrl" as const) : ("publicUrl" as const);
+  let expected: string;
+  try {
+    const parsed = new URL(config.apiUrl ?? config.publicUrl);
+    if (parsed.protocol !== "https:") throw new Error("not HTTPS");
+    expected = parsed.toString().replace(/\/$/, "");
+  } catch {
+    throw new CliError(`configured AWS ${bound} must be a valid HTTPS URL for PUBLIC_API_URL`);
+  }
+  return expected;
+}
+
 function liveTask(config: QmConfig, service: string): Record<string, unknown> | null {
   const aws = requireAws(config);
-  const spec = aws.services[service]!;
+  const spec = awsServiceSpec(aws, service);
   const described = awsJson<{ services?: Array<{ taskDefinition?: string }> }>(aws, [
     "ecs",
     "describe-services",
@@ -784,11 +1159,11 @@ interface EcsServiceState {
   tags?: Array<{ key?: string; value?: string }>;
 }
 
-function awsLiveSession(config: QmConfig, core: EcsServiceState): void {
+async function awsLiveSession(config: QmConfig, core: EcsServiceState): Promise<void> {
   const aws = requireAws(config);
   if (!core.taskDefinition) throw new Error("core service has no live task definition");
   if (!core.networkConfiguration?.awsvpcConfiguration) throw new Error("core service has no VPC network configuration");
-  const started = awsJson<{
+  const started = await awsJsonAsync<{
     tasks?: Array<{ taskArn?: string }>;
     failures?: Array<{ arn?: string; reason?: string; detail?: string }>;
   }>(aws, [
@@ -826,8 +1201,8 @@ function awsLiveSession(config: QmConfig, core: EcsServiceState): void {
       `could not start canary task: ${failure?.reason ?? failure?.detail ?? failure?.arn ?? "no task returned"}`,
     );
   }
-  awsText(aws, ["ecs", "wait", "tasks-stopped", "--cluster", aws.cluster, "--tasks", taskArn]);
-  const stopped = awsJson<{
+  await awsTextAsync(aws, ["ecs", "wait", "tasks-stopped", "--cluster", aws.cluster, "--tasks", taskArn]);
+  const stopped = await awsJsonAsync<{
     tasks?: Array<{
       stoppedReason?: string;
       containers?: Array<{ name?: string; exitCode?: number; reason?: string }>;
@@ -851,54 +1226,13 @@ interface DeploymentManifest {
   previous?: string;
   createdAt: string;
   imageLabel?: string;
-  sandboxImage?: string;
   dbSnapshot?: string;
   tasks: Record<string, string>;
   imageProvenance?: Record<string, DeploymentImageProvenance>;
   layer?: { key: string; sha256: string };
 }
 
-function usesFlySandboxes(config: QmConfig): boolean {
-  return config.sandbox?.backend === "sprites";
-}
-
-interface AwsSandboxPin {
-  image: string;
-  source: "config" | "manifest";
-}
-
-function resolveAwsSandboxPin(config: QmConfig, currentManifest: () => DeploymentManifest | undefined): AwsSandboxPin {
-  const override = config.sandbox?.image;
-  if (override) {
-    if (!isDigestPinned(override)) {
-      throw new CliError("the sandbox.image override must be pinned by digest (registry/repository@sha256:…)", {
-        clause: "config.v1",
-      });
-    }
-    return { image: override, source: "config" };
-  }
-  const image = currentManifest()?.sandboxImage;
-  if (image) {
-    if (!config.sandbox?.app) {
-      throw new CliError(
-        "the deployment manifest records a sandbox pin but the config has no sandbox.app to boot it in",
-        { clause: "config.v1" },
-      );
-    }
-    return { image, source: "manifest" };
-  }
-  throw new CliError(
-    "AWS deploys take the sandbox layer-image pin from the deployment manifest, which has none; for the first deploy on this stack set sandbox.image as an explicit override and run `qm up` (which records the manifest), then remove the override — `qm sandbox publish` maintains the pin from then on",
-    { clause: "config.v1" },
-  );
-}
-
-const pinSourceLabel = (pin: AwsSandboxPin): string =>
-  pin.source === "config" ? "config sandbox.image override" : "deployment manifest";
-
-function withSandboxPin(config: QmConfig, image: string): QmConfig {
-  return config.sandbox?.image === image ? config : { ...config, sandbox: { ...config.sandbox, image } };
-}
+const usesAwsMicrovmSandboxes = (config: QmConfig): boolean => sandboxBackend(config) === "aws";
 
 const DEPLOYMENT_POINTER_KEY = "deployment/current";
 const DEPLOYMENT_MANIFEST_PREFIX = "deployment/manifest/";
@@ -912,7 +1246,7 @@ function chunks<T>(values: T[], size: number): T[][] {
 
 function describedServices(config: QmConfig, workloads: string[]): Map<string, EcsServiceState> {
   const aws = requireAws(config);
-  const byEcsName = new Map(workloads.map((name) => [aws.services[name]!.ecsService, name]));
+  const byEcsName = new Map(workloads.map((name) => [awsServiceSpec(aws, name).ecsService, name]));
   const out = new Map<string, EcsServiceState>();
   const failures: string[] = [];
   for (const batch of chunks([...byEcsName.keys()], ECS_SERVICE_BATCH_SIZE)) {
@@ -930,7 +1264,7 @@ function describedServices(config: QmConfig, workloads: string[]): Map<string, E
   }
   for (const workload of workloads) {
     if (!out.has(workload))
-      failures.push(`${aws.services[workload]!.ecsService}: missing from DescribeServices response`);
+      failures.push(`${awsServiceSpec(aws, workload).ecsService}: missing from DescribeServices response`);
   }
   if (failures.length)
     throw new CliError(`could not describe AWS services:\n${failures.map((failure) => `  - ${failure}`).join("\n")}`);
@@ -970,6 +1304,7 @@ async function awaitServiceTargets(config: QmConfig, expected: Record<string, Ro
       states = describedServices(config, Object.keys(expected));
       describeFailures = 0;
     } catch (error) {
+      assertAwsLeaseHeld();
       describeFailures += 1;
       if (describeFailures > 2 || Date.now() > deadline) throw error;
       note(`could not poll AWS services (${errMessage(error)}); retrying`);
@@ -1126,7 +1461,11 @@ function deploymentManifestAtPointer(aws: AwsConfig, key: string): DeploymentMan
   return id ? deploymentManifest(aws, id) : undefined;
 }
 
-function manifestTransaction(aws: AwsConfig, manifest: DeploymentManifest | undefined, pointerId: string): void {
+async function manifestTransaction(
+  aws: AwsConfig,
+  manifest: DeploymentManifest | undefined,
+  pointerId: string,
+): Promise<void> {
   const table = deployLocksTable(aws);
   const writes: unknown[] = [];
   if (manifest) {
@@ -1162,9 +1501,10 @@ function manifestTransaction(aws: AwsConfig, manifest: DeploymentManifest | unde
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      awsText(aws, ["dynamodb", "transact-write-items", "--transact-items", JSON.stringify(writes)]);
+      await awsTextAsync(aws, ["dynamodb", "transact-write-items", "--transact-items", JSON.stringify(writes)]);
       return;
     } catch (error) {
+      assertAwsLeaseHeld();
       lastError = error;
     }
   }
@@ -1178,67 +1518,36 @@ function deploymentManifestForTarget(aws: AwsConfig, target: string): Deployment
   return labeled ?? deploymentManifest(aws, target);
 }
 
-function recordDeploymentManifest(
+async function recordDeploymentManifest(
   aws: AwsConfig,
   tasks: Record<string, string>,
   release: {
     id?: string;
-    sandboxImage?: string;
     imageLabel?: string;
     dbSnapshot?: string;
     layer?: DeploymentManifest["layer"];
     imageProvenance?: DeploymentManifest["imageProvenance"];
   },
-): DeploymentManifest {
+): Promise<DeploymentManifest> {
   const current = currentDeploymentManifest(aws);
   const manifest: DeploymentManifest = {
     id: release.id ?? randomUUID(),
     ...(current ? { previous: current.id } : {}),
     createdAt: new Date().toISOString(),
     ...(release.imageLabel ? { imageLabel: release.imageLabel } : {}),
-    ...(release.sandboxImage ? { sandboxImage: release.sandboxImage } : {}),
     ...(release.dbSnapshot ? { dbSnapshot: release.dbSnapshot } : {}),
     tasks,
     ...(release.imageProvenance ? { imageProvenance: release.imageProvenance } : {}),
     ...(release.layer ? { layer: release.layer } : {}),
   };
-  manifestTransaction(aws, manifest, manifest.id);
+  await manifestTransaction(aws, manifest, manifest.id);
   return manifest;
 }
 
-function requireSandboxPinManifest(aws: AwsConfig): DeploymentManifest {
-  const current = currentDeploymentManifest(aws);
-  if (!current) {
-    throw new CliError(
-      "cannot durably record the sandbox pin: no AWS deployment manifest exists yet; set sandbox.image as an explicit override for the first `qm up` (which records the manifest), then remove it — `sandbox publish` maintains the pin from then on",
-    );
-  }
-  return current;
-}
-
-export function assertAwsSandboxPinRecordable(config: QmConfig): void {
-  const aws = requireAws(config);
-  assertAwsCallerAccount(aws);
-  if (config.sandbox?.image) {
-    throw new CliError(
-      `the config sets sandbox.image ${config.sandbox.image}, which freezes the sandbox pin — a newly published image would be silently reverted by the next \`qm up\`; remove the override before \`qm sandbox publish\``,
-    );
-  }
-  requireSandboxPinManifest(aws);
-}
-
-function recordCarriedSandboxPin(aws: AwsConfig, image: string): DeploymentManifest {
-  const current = requireSandboxPinManifest(aws);
-  if (current.sandboxImage === image) return current;
-  return recordDeploymentManifest(aws, current.tasks, {
-    sandboxImage: image,
-    ...(current.imageLabel ? { imageLabel: current.imageLabel } : {}),
-    ...(current.layer ? { layer: current.layer } : {}),
-    ...(current.imageProvenance ? { imageProvenance: current.imageProvenance } : {}),
-  });
-}
-
-function putDeploymentLayerArtifact(config: QmConfig, body: string): NonNullable<DeploymentManifest["layer"]> {
+async function putDeploymentLayerArtifact(
+  config: QmConfig,
+  body: string,
+): Promise<NonNullable<DeploymentManifest["layer"]>> {
   if (Buffer.byteLength(body) > 1_000_000)
     throw new CliError("deployment layer exceeds the core API's 1 MB request limit");
   const aws = requireAws(config);
@@ -1248,7 +1557,16 @@ function putDeploymentLayerArtifact(config: QmConfig, body: string): NonNullable
   const file = join(dir, "layer.json");
   try {
     writeFileSync(file, body);
-    awsText(aws, ["s3api", "put-object", "--bucket", awsObjectStoreBucket(config), "--key", key, "--body", file]);
+    await awsTextAsync(aws, [
+      "s3api",
+      "put-object",
+      "--bucket",
+      awsObjectStoreBucket(config),
+      "--key",
+      key,
+      "--body",
+      file,
+    ]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1261,14 +1579,81 @@ function getDeploymentLayerArtifact(config: QmConfig, layer: DeploymentManifest[
   const dir = mkdtempSync(join(tmpdir(), "qm-layer-"));
   const file = join(dir, "layer.json");
   try {
-    awsText(aws, ["s3api", "get-object", "--bucket", awsObjectStoreBucket(config), "--key", layer.key, file]);
-    const body = readFileSync(file, "utf8");
-    if (Buffer.byteLength(body) > 1_000_000 || createHash("sha256").update(body).digest("hex") !== layer.sha256) {
-      throw new CliError("AWS deployment-layer artifact is invalid or does not match its manifest");
-    }
-    return body;
+    awsText(aws, [
+      "s3api",
+      "get-object",
+      "--bucket",
+      awsObjectStoreBucket(config),
+      "--key",
+      layer.key,
+      file,
+      "--range",
+      "bytes=0-1000000",
+    ]);
+    return readAwsDeploymentLayerArtifact(file, layer.sha256);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function sameAwsArtifactStat(left: BigIntStats, right: BigIntStats): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.mode === right.mode &&
+    left.nlink === right.nlink &&
+    left.uid === right.uid &&
+    left.gid === right.gid &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
+}
+
+function readAwsDeploymentLayerArtifact(file: string, expectedHash: string): string {
+  let descriptor: number;
+  try {
+    descriptor = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    throw new CliError("AWS deployment-layer artifact is invalid or does not match its manifest", { cause: error });
+  }
+  try {
+    const initial = fstatSync(descriptor, { bigint: true });
+    if (!initial.isFile() || initial.nlink !== 1n || initial.size < 0n || initial.size > 1_000_000n) {
+      throw new CliError("AWS deployment-layer artifact is invalid or does not match its manifest");
+    }
+    const size = Number(initial.size);
+    const snapshot = (): Buffer => {
+      const bytes = Buffer.allocUnsafe(size + 1);
+      let length = 0;
+      while (length < bytes.length) {
+        const count = readSync(descriptor, bytes, length, bytes.length - length, length);
+        if (count === 0) break;
+        length += count;
+      }
+      return bytes.subarray(0, length);
+    };
+    const first = snapshot();
+    const between = fstatSync(descriptor, { bigint: true });
+    const second = snapshot();
+    const after = fstatSync(descriptor, { bigint: true });
+    if (
+      !sameAwsArtifactStat(initial, between) ||
+      !sameAwsArtifactStat(between, after) ||
+      first.length !== size ||
+      second.length !== size ||
+      !first.equals(second) ||
+      createHash("sha256").update(first).digest("hex") !== expectedHash
+    ) {
+      throw new CliError("AWS deployment-layer artifact is invalid or does not match its manifest");
+    }
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(first);
+    } catch (error) {
+      throw new CliError("AWS deployment-layer artifact is invalid or does not match its manifest", { cause: error });
+    }
+  } finally {
+    closeSync(descriptor);
   }
 }
 
@@ -1288,6 +1673,7 @@ async function retryLiveProbe<T>(probe: () => Promise<T>): Promise<T> {
     try {
       return await probe();
     } catch (error) {
+      assertAwsLeaseHeld();
       if (Date.now() >= deadline) throw error;
       note(`live probe failed (${errMessage(error)}); retrying while old tasks drain`);
       await sleep(envNum("QM_AWS_LIVE_PROBE_POLL_MS", 5_000));
@@ -1299,10 +1685,84 @@ async function syncAwsLayerAfterRoll(
   args: Parameters<typeof syncDeploymentLayerBody>[0],
   body: string,
   expected: NonNullable<DeploymentManifest["layer"]> | string,
+  operationId: string = randomBytes(16).toString("hex"),
+  observe?: (result: DeploymentLayerSyncResult) => void,
 ): Promise<void> {
   await retryLiveProbe(async () => {
-    assertAwsLayerApplied(await syncDeploymentLayerBody(args, body), expected);
+    const result = await syncDeploymentLayerBody({ ...args, operationId }, body);
+    if (result) observe?.(result);
+    assertAwsLayerApplied(result, expected);
   });
+}
+
+async function clearAwsLayerAfterRoll(
+  args: Parameters<typeof clearDeploymentLayer>[0],
+  expected: string,
+): Promise<void> {
+  const operationId = randomBytes(16).toString("hex");
+  await retryLiveProbe(async () => {
+    assertAwsLayerApplied(await clearDeploymentLayer({ ...args, operationId }), expected);
+  });
+}
+
+function sameLayerPrecondition(left: DeploymentLayerState, right: DeploymentLayerState): boolean {
+  return (
+    left.precondition.generation === right.precondition.generation &&
+    left.precondition.source === right.precondition.source &&
+    left.precondition.contentHash === right.precondition.contentHash &&
+    left.precondition.operationId === right.precondition.operationId
+  );
+}
+
+interface AwsLayerAttempt {
+  before: DeploymentLayerState;
+  desiredHash: string;
+  operationId: string;
+  applied?: DeploymentLayerPrecondition;
+}
+
+function observeAwsLayerAttempt(attempt: AwsLayerAttempt, result: DeploymentLayerSyncResult): void {
+  if (!result.changed || result.operationId !== attempt.operationId || result.contentHash !== attempt.desiredHash)
+    return;
+  attempt.applied = {
+    generation: result.version,
+    contentHash: result.contentHash,
+    source: "durable",
+    operationId: result.operationId,
+  };
+}
+
+async function restoreAwsLayerAfterFailure(
+  args: Parameters<typeof currentDeploymentLayerState>[0],
+  attempt: AwsLayerAttempt,
+  conflict: string,
+): Promise<void> {
+  const { before, desiredHash, operationId } = attempt;
+  let applied = attempt.applied;
+  if (!applied) {
+    const current = await retryLiveProbe(() => currentDeploymentLayerState(args));
+    if (sameLayerPrecondition(current, before)) {
+      if (current.status === "applied" && current.runtimeContentHash === before.runtimeContentHash) return;
+      if (!before.bootstrapped) {
+        await syncAwsLayerAfterRoll({ ...args, precondition: current.precondition }, before.body, before.contentHash);
+        return;
+      }
+    }
+    if (
+      current.precondition.generation !== before.precondition.generation + 1 ||
+      current.precondition.source !== "durable" ||
+      current.precondition.contentHash !== desiredHash ||
+      current.precondition.operationId !== operationId
+    ) {
+      throw new CliError(conflict);
+    }
+    applied = current.precondition;
+  }
+  if (before.bootstrapped) {
+    await clearAwsLayerAfterRoll({ ...args, precondition: applied }, desiredHash);
+    return;
+  }
+  await syncAwsLayerAfterRoll({ ...args, precondition: applied }, before.body, before.contentHash);
 }
 
 function throwAfterCompensation(error: unknown, failures: string[]): never {
@@ -1311,7 +1771,7 @@ function throwAfterCompensation(error: unknown, failures: string[]): never {
 }
 
 function workloadDesiredCount(config: QmConfig, workload: string): number {
-  return requireAws(config).services[workload]?.desiredCount ?? 1;
+  return ownAwsServiceSpec(requireAws(config), workload)?.desiredCount ?? 1;
 }
 
 function serviceSnapshot(
@@ -1339,6 +1799,99 @@ function serviceSnapshotFromStates(
   return { tasks, counts };
 }
 
+function taskDefinitionEntries(
+  value: unknown,
+  valueName: "value" | "valueFrom",
+  workload: string,
+  action: string,
+): Map<string, string> {
+  if (!Array.isArray(value)) {
+    throw new CliError(`cannot ${action} with an invalid ${workload} task definition`);
+  }
+  const entries = new Map<string, string>();
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new CliError(`cannot ${action} with an invalid ${workload} task definition`);
+    }
+    const record = item as Record<string, unknown>;
+    const name = record.name;
+    const entryValue = record[valueName];
+    if (typeof name !== "string" || !name || typeof entryValue !== "string" || entries.has(name))
+      throw new CliError(`cannot ${action} with an invalid ${workload} task definition`);
+    entries.set(name, entryValue);
+  }
+  return entries;
+}
+
+function assertTaskDefinitionReactivatable(
+  config: QmConfig,
+  workload: string,
+  task: Record<string, unknown> | undefined,
+  action: string,
+): void {
+  const containers = task?.containerDefinitions;
+  const matches = Array.isArray(containers)
+    ? containers.filter(
+        (item): item is Record<string, unknown> =>
+          typeof item === "object" && item !== null && !Array.isArray(item) && item.name === workload,
+      )
+    : [];
+  const container =
+    Array.isArray(containers) && containers.length === 1 && matches.length === 1 ? matches[0] : undefined;
+  if (!container || typeof container.image !== "string" || !isPinnedWorkloadImage(config, workload, container.image)) {
+    throw new CliError(`cannot ${action} while ${workload} lacks a trusted digest-pinned task definition`);
+  }
+  const environment = taskDefinitionEntries(container.environment, "value", workload, action);
+  if (canonicalJson(Object.fromEntries(environment)) !== canonicalJson(workloadEnvironment(config, workload))) {
+    throw new CliError(`cannot ${action} while ${workload} has stale or unowned environment entries`);
+  }
+  const secrets = taskDefinitionEntries(container.secrets, "valueFrom", workload, action);
+  const aws = requireAws(config);
+  const allowed = new Map<string, string>();
+  for (const secret of allWorkloadSecrets(config, workload)) {
+    for (const name of containerSecretNames(workload, secret)) allowed.set(name, secret.name);
+  }
+  const secretArns: Record<string, string> = {};
+  const providerEnvironment = workloadEnvironment(config, workload);
+  for (const [name, valueFrom] of secrets) {
+    const storeName = allowed.get(name);
+    if (
+      !storeName ||
+      Object.hasOwn(providerEnvironment, name) ||
+      (workload === "core" && forbiddenCoreEndpointNames.has(name))
+    ) {
+      throw new CliError(`cannot ${action} while ${workload} has stale or unowned secret entries`);
+    }
+    const arn = verifiedAwsSecretArn(aws, storeName, `${aws.secretsPrefix}${storeName}`, valueFrom);
+    if (secretArns[storeName] !== undefined && secretArns[storeName] !== arn) {
+      throw new CliError(`cannot ${action} while ${workload} has inconsistent secret entries`);
+    }
+    secretArns[storeName] = arn;
+  }
+  const missing = workloadSecrets(config, workload)
+    .flatMap((secret) => containerSecretNames(workload, secret))
+    .filter((name) => !secrets.has(name));
+  if (missing.length) {
+    throw new CliError(`cannot ${action} while ${workload} is missing required secret entries`);
+  }
+  if (taskDefinitionChanges(renderTaskDefinition(config, workload, container.image, secretArns), task!).length) {
+    throw new CliError(`cannot ${action} while ${workload} has stale or unowned task-definition fields`);
+  }
+}
+
+function assertTaskDefinitionsReactivatable(config: QmConfig, targets: Record<string, string>, action: string): void {
+  const aws = requireAws(config);
+  for (const [workload, target] of Object.entries(targets)) {
+    const task = awsJson<{ taskDefinition?: Record<string, unknown> }>(aws, [
+      "ecs",
+      "describe-task-definition",
+      "--task-definition",
+      target,
+    ]).taskDefinition;
+    assertTaskDefinitionReactivatable(config, workload, task, action);
+  }
+}
+
 function trustedDeploymentBaseline(
   config: QmConfig,
   snapshot: ReturnType<typeof serviceSnapshot>,
@@ -1362,22 +1915,7 @@ function trustedDeploymentBaseline(
         `cannot ${action} while untouched workload ${workload} differs from the current deployment manifest`,
       );
     }
-    const task = awsJson<{ taskDefinition?: Record<string, unknown> }>(aws, [
-      "ecs",
-      "describe-task-definition",
-      "--task-definition",
-      current.tasks[workload]!,
-    ]).taskDefinition;
-    const container = (task?.containerDefinitions as Array<Record<string, unknown>> | undefined)?.find(
-      (item) => item.name === workload,
-    );
-    if (
-      !container ||
-      typeof container.image !== "string" ||
-      !isPinnedWorkloadImage(config, workload, container.image)
-    ) {
-      throw new CliError(`cannot ${action} while untouched workload ${workload} lacks a trusted digest-pinned image`);
-    }
+    assertTaskDefinitionsReactivatable(config, { [workload]: current.tasks[workload]! }, action);
   }
   return current;
 }
@@ -1404,7 +1942,7 @@ async function applyServiceTargets(
         "--cluster",
         aws.cluster,
         "--service",
-        aws.services[workload]!.ecsService,
+        awsServiceSpec(aws, workload).ecsService,
         "--task-definition",
         targets[workload]!,
         "--desired-count",
@@ -1413,7 +1951,7 @@ async function applyServiceTargets(
         "deploymentCircuitBreaker={enable=true,rollback=true}",
       ];
       changed.push(workload);
-      awsText(aws, args);
+      await awsTextAsync(aws, args);
     }
     await awaitServiceTargets(
       config,
@@ -1425,16 +1963,17 @@ async function applyServiceTargets(
       ),
     );
   } catch (error) {
+    assertAwsLeaseHeld();
     const restoreFailures: string[] = [];
     for (const workload of [...changed].reverse()) {
       try {
-        awsText(aws, [
+        await awsTextAsync(aws, [
           "ecs",
           "update-service",
           "--cluster",
           aws.cluster,
           "--service",
-          aws.services[workload]!.ecsService,
+          awsServiceSpec(aws, workload).ecsService,
           "--task-definition",
           before.tasks[workload]!,
           "--desired-count",
@@ -1443,6 +1982,7 @@ async function applyServiceTargets(
           "deploymentCircuitBreaker={enable=true,rollback=true}",
         ]);
       } catch (restoreError) {
+        assertAwsLeaseHeld();
         restoreFailures.push(`${workload}: ${errMessage(restoreError)}`);
       }
     }
@@ -1458,6 +1998,7 @@ async function applyServiceTargets(
           ),
         );
       } catch (restoreError) {
+        assertAwsLeaseHeld();
         restoreFailures.push(errMessage(restoreError));
       }
     }
@@ -1489,9 +2030,9 @@ function reportTaskChanges(
   });
 }
 
-function promoteStagedImage(config: QmConfig, service: string, image: string, label: string): void {
+async function promoteStagedImage(config: QmConfig, service: string, image: string, label: string): Promise<void> {
   const aws = requireAws(config);
-  const repository = aws.services[service]!.ecrRepository;
+  const repository = awsServiceSpec(aws, service).ecrRepository;
   const digest = image.split("@")[1];
   if (!digest) throw new CliError(`staged image for ${service} is not digest-pinned`);
   const staged = awsJson<{ images?: Array<{ imageManifest?: string; imageManifestMediaType?: string }> }>(aws, [
@@ -1504,7 +2045,7 @@ function promoteStagedImage(config: QmConfig, service: string, image: string, la
   ]).images?.[0];
   if (!staged?.imageManifest) throw new CliError(`ECR did not return the staged manifest for ${service}@${digest}`);
   try {
-    awsText(aws, [
+    await awsTextAsync(aws, [
       "ecr",
       "put-image",
       "--repository-name",
@@ -1516,7 +2057,7 @@ function promoteStagedImage(config: QmConfig, service: string, image: string, la
       ...(staged.imageManifestMediaType ? ["--image-manifest-media-type", staged.imageManifestMediaType] : []),
     ]);
   } catch (error) {
-    if (!/ImageAlreadyExistsException/.test(errMessage(error))) throw error;
+    if (!awsCliErrorMatches(error, "ImageAlreadyExistsException")) throw error;
   }
 }
 
@@ -1552,7 +2093,7 @@ async function takePredeployDbSnapshot(
   }
   const snapshot = `${database}${PREDEPLOY_SNAPSHOT_INFIX}${deploymentId}`;
   step(`pre-deploy database snapshot: creating ${snapshot}`);
-  awsText(aws, [
+  await awsTextAsync(aws, [
     "rds",
     "create-db-snapshot",
     "--db-instance-identifier",
@@ -1579,6 +2120,7 @@ async function takePredeployDbSnapshot(
       ]).DBSnapshots?.[0]?.Status;
       describeFailures = 0;
     } catch (error) {
+      assertAwsLeaseHeld();
       describeFailures += 1;
       if (describeFailures > 2 || Date.now() > deadline) throw error;
       note(`could not poll pre-deploy database snapshot ${snapshot} (${errMessage(error)}); retrying`);
@@ -1594,7 +2136,11 @@ async function takePredeployDbSnapshot(
     await sleep(pollMs);
   }
   ok(`pre-deploy database snapshot ${snapshot} is available (${dbSnapshotRestoreHint(aws, snapshot)})`);
-  prunePredeployDbSnapshots(aws, database, new Set([snapshot, ...(manifestDbSnapshot ? [manifestDbSnapshot] : [])]));
+  await prunePredeployDbSnapshots(
+    aws,
+    database,
+    new Set([snapshot, ...(manifestDbSnapshot ? [manifestDbSnapshot] : [])]),
+  );
   return snapshot;
 }
 
@@ -1604,7 +2150,7 @@ function prunablePredeploySnapshot(tags: Array<{ Key?: string; Value?: string }>
   return tags.some((tag) => tag.Key === "ManagedBy" && tag.Value === "qm-cli");
 }
 
-function prunePredeployDbSnapshots(aws: AwsConfig, database: string, referenced: Set<string>): void {
+async function prunePredeployDbSnapshots(aws: AwsConfig, database: string, referenced: Set<string>): Promise<void> {
   const keep = Math.max(envNum("QM_AWS_DB_SNAPSHOT_KEEP", 20), 1);
   const stale = (
     awsJson<{
@@ -1626,16 +2172,22 @@ function prunePredeployDbSnapshots(aws: AwsConfig, database: string, referenced:
     .slice(keep - 1);
   for (const snapshot of stale) {
     try {
-      awsText(aws, ["rds", "delete-db-snapshot", "--db-snapshot-identifier", snapshot.DBSnapshotIdentifier!]);
+      await awsTextAsync(aws, [
+        "rds",
+        "delete-db-snapshot",
+        "--db-snapshot-identifier",
+        snapshot.DBSnapshotIdentifier!,
+      ]);
       step(`pruned pre-deploy database snapshot ${snapshot.DBSnapshotIdentifier}`);
     } catch (error) {
+      assertAwsLeaseHeld();
       warn(`could not prune pre-deploy database snapshot ${snapshot.DBSnapshotIdentifier}: ${errMessage(error)}`);
     }
   }
 }
 
-export async function awsUp(config: QmConfig, _configDir: string, opts: AwsUpOpts = {}): Promise<void> {
-  const topology = awsTopology(config, _configDir);
+function awsUpInputs(config: QmConfig, configDir: string, opts: AwsUpOpts) {
+  const topology = awsTopology(config, configDir);
   const { aws } = topology;
   if (new URL(config.publicUrl).protocol !== "https:") {
     throw new CliError(
@@ -1654,20 +2206,67 @@ export async function awsUp(config: QmConfig, _configDir: string, opts: AwsUpOpt
   const label = aws.imageLabel;
   if (!label) throw new CliError("aws.imageLabel is required");
   if (!opts.dryRun && !opts.yes) throw new CliError("AWS deploy requires --yes after reviewing `qm plan`");
+  return { topology, aws, plugins, services, label, allServices: Object.keys(aws.services) };
+}
+
+async function awsPreflightUpWithAdmission(
+  config: QmConfig,
+  configDir: string,
+  opts: AwsUpOpts,
+  admission: AwsSourceBuildAdmission,
+): Promise<AwsUpPreflight> {
+  const { aws, allServices, services } = awsUpInputs(config, configDir, opts);
+  const expectedCoreSigningSecret = selectedSecretValue(
+    "CORE_SIGNING_SECRET",
+    admission.fileValues.get("CORE_SIGNING_SECRET"),
+    admission.baseEnv,
+  );
+  for (const name of new Set([...computedSecrets(config).map((secret) => secret.name), "DATABASE_URL"])) {
+    assertNoNulSecret(name, selectedSecretValue(name, admission.fileValues.get(name), admission.baseEnv));
+  }
   assertAwsCallerAccount(aws);
   assertAwsPublicFrontDoor(config);
   if (!opts.dryRun) await assertAwsPublicNetwork(config);
-  assertAwsPublicApiUrl(config);
-  assertAwsDeployImage(config);
-  header(`qm ${opts.dryRun ? "plan" : "up"} — ${config.orgId} (aws)`);
-  const allServices = Object.keys(aws.services);
+  configuredAwsPublicApiUrl(config);
+  const microvmRebuildRequired = services.includes("core") && awsDeployImageNeedsRebuild(config);
   assertOwnedServices(config, describedServices(config, allServices), allServices);
-  const arns = secretArns(config);
+  const secrets = awsSecretSnapshot(config, expectedCoreSigningSecret, true);
+  return {
+    microvmRebuildRequired,
+    publicApiUrlNeedsUpdate: secrets.publicApiUrlNeedsUpdate,
+    secretArns: secrets.arns,
+    secretValues: secrets.values,
+  };
+}
+
+export async function awsPreflightUp(config: QmConfig, configDir: string, opts: AwsUpOpts): Promise<AwsUpPreflight> {
+  return awsPreflightUpWithAdmission(
+    config,
+    configDir,
+    opts,
+    sourceBuildAdmission(config, configDir, opts.envFile, opts.configIdentity),
+  );
+}
+
+export async function awsUp(config: QmConfig, _configDir: string, opts: AwsUpOpts): Promise<void> {
+  const buildAdmission = sourceBuildAdmission(config, _configDir, opts.envFile, opts.configIdentity);
+  const { aws, plugins, services, label, allServices } = awsUpInputs(config, _configDir, opts);
+  const preflight = opts.preflight ?? (await awsPreflightUpWithAdmission(config, _configDir, opts, buildAdmission));
+  const requiresDeployImage = services.includes("core");
+  const microvmBuildPlanned =
+    requiresDeployImage &&
+    opts.dryRun === true &&
+    (opts.microvmBuildPlanned === true || preflight.microvmRebuildRequired);
+  if (requiresDeployImage && !opts.dryRun && !opts.preflight && preflight.microvmRebuildRequired) {
+    throw new CliError("AWS deployment publisher MicroVM image requires a rebuild before service deployment");
+  }
+  header(`qm ${opts.dryRun ? "plan" : "up"} — ${config.orgId} (aws)`);
+  if (microvmBuildPlanned) step("deployment publisher MicroVM image: rebuild required before the core deployment");
+  let arns = preflight.secretArns;
   if (opts.dryRun) {
-    if (usesFlySandboxes(config) && services.includes("core")) {
-      const pin = resolveAwsSandboxPin(config, () => currentDeploymentManifest(aws));
-      step(`sandbox pin: ${pin.image} (${pinSourceLabel(pin)})`);
-      config = withSandboxPin(config, pin.image);
+    const buildEnv = awsSourceBuildEnvironment(buildAdmission, preflight.secretValues);
+    if (services.includes("core")) {
+      step(`sandbox substrate: ${sandboxBackend(config)}`);
     }
     step(
       aws.predeployDbSnapshot === false
@@ -1685,14 +2284,14 @@ export async function awsUp(config: QmConfig, _configDir: string, opts: AwsUpOpt
     }
     const images: Record<string, string> = {};
     for (const service of services) {
-      const spec = aws.services[service]!;
+      const spec = awsServiceSpec(aws, service);
       const sourceBuild = (opts.buildFrom && isServiceName(service)) || plugins.get(service)?.kind === "source";
       if (sourceBuild) {
         images[service] = `${ecrHost(aws)}/${spec.ecrRepository}@sha256:${"0".repeat(64)}`;
         step(`${service}: source build planned; image digest is unresolved until build`);
         continue;
       }
-      images[service] = plannedWorkloadImage(config, service, plugins.get(service));
+      images[service] = await plannedWorkloadImage(config, service, plugins.get(service), buildEnv);
     }
     reportTaskChanges(config, services, images, arns);
     for (const service of services) {
@@ -1712,9 +2311,11 @@ export async function awsUp(config: QmConfig, _configDir: string, opts: AwsUpOpt
     note("Plan only. Re-run `qm up --yes` to deploy.");
     return;
   }
-  const lease = acquireLease(aws);
+  for (const name of new Set([...computedSecrets(config).map((secret) => secret.name), "DATABASE_URL"])) {
+    assertNoNulSecret(name, selectedSecretValue(name, buildAdmission.fileValues.get(name), buildAdmission.baseEnv));
+  }
   const releaseId = randomUUID();
-  const stagingLabel = "qm-staging";
+  const stagingLabel = `qm-staging-${releaseId}`;
   const staged = new Set<string>();
   const promotedServices = new Set<string>();
   let before: ReturnType<typeof serviceSnapshot> | undefined;
@@ -1727,229 +2328,247 @@ export async function awsUp(config: QmConfig, _configDir: string, opts: AwsUpOpt
   let desiredLayerBody: string | undefined;
   let desiredLayer: DeploymentManifest["layer"];
   let layerChanged = false;
-  let layerAttempted = false;
-  let sandboxPinImage: string | undefined;
+  let layerAttempt: AwsLayerAttempt | undefined;
   let dbSnapshot: string | undefined;
-  try {
-    assertAwsDeployImage(config);
-    before = serviceSnapshot(config, allServices);
-    current = currentDeploymentManifest(aws);
-    if (usesFlySandboxes(config)) {
-      if (services.includes("core")) {
-        const pin = resolveAwsSandboxPin(config, () => current);
-        step(`sandbox pin: ${pin.image} (${pinSourceLabel(pin)})`);
-        sandboxPinImage = pin.image;
-        config = withSandboxPin(config, pin.image);
-      } else {
-        sandboxPinImage = current?.sandboxImage;
+  await withAwsLease(aws, async () => {
+    try {
+      const refreshed = await awsPreflightUpWithAdmission(config, _configDir, opts, buildAdmission);
+      if (requiresDeployImage && refreshed.microvmRebuildRequired) {
+        throw new CliError("AWS deployment publisher MicroVM image requires a rebuild before service deployment");
       }
-    }
-    if (aws.predeployDbSnapshot === false) note("pre-deploy database snapshot: disabled (aws.predeployDbSnapshot)");
-    else dbSnapshot = await takePredeployDbSnapshot(config, releaseId, current?.dbSnapshot);
-    if (current?.layer) {
-      desiredLayer = current.layer;
-    } else {
-      if (current || before.counts.core !== 0) {
-        const previousState = await currentDeploymentLayerState({
-          config,
-          transport: awsDeploymentLayerTransport,
-          configDir: _configDir,
-          ...(opts.envFile ? { envFile: opts.envFile } : {}),
-        });
-        previousLayerBody = previousState.body;
-        previousLayerBootstrapped = previousState.bootstrapped;
-      } else {
-        previousLayerBody = JSON.stringify({ contract: 1, tools: [], skills: [] });
-        previousLayerBootstrapped = true;
-      }
-      if (!previousLayerBootstrapped) {
-        desiredLayer = putDeploymentLayerArtifact(config, previousLayerBody);
-        if (current) {
-          current.layer = desiredLayer;
-          manifestTransaction(aws, current, current.id);
-        }
-      }
-    }
-    if (opts.sandboxDir && existsSync(opts.sandboxDir) && (!opts.only || opts.only.includes("core"))) {
-      previousLayerBody ??= getDeploymentLayerArtifact(config, desiredLayer);
-      desiredLayerBody = deploymentLayerBody(opts.sandboxDir);
-      desiredLayer = putDeploymentLayerArtifact(config, desiredLayerBody);
-      layerChanged = desiredLayer.sha256 !== current?.layer?.sha256;
-      if (!layerChanged) {
-        const state = await currentDeploymentLayerState({
-          config,
-          transport: awsDeploymentLayerTransport,
-          configDir: _configDir,
-          ...(opts.envFile ? { envFile: opts.envFile } : {}),
-        });
-        if (
-          state.status === "applied" &&
-          state.contentHash === desiredLayer.sha256 &&
-          state.runtimeContentHash === desiredLayer.sha256
-        ) {
-          desiredLayerBody = undefined;
-        }
-      }
-    }
-    const selected = new Set(services);
-    if (allServices.some((service) => !selected.has(service))) {
-      trustedDeploymentBaseline(
-        config,
-        before,
-        allServices.filter((name) => !selected.has(name)),
-      );
-    }
-    dockerLogin(aws);
-    const images: Record<string, string> = {};
-    const selectedImageProvenance: Record<string, DeploymentImageProvenance> = {};
-    for (const service of services) {
-      staged.add(service);
-      selectedImageProvenance[service] = workloadImageProvenance(config, service, plugins.get(service), opts);
-      images[service] = publishWorkloadImage(config, service, plugins.get(service), stagingLabel, opts);
-    }
-    const desired = reportTaskChanges(config, services, images, arns);
-    const targets: Record<string, string> = {};
-    for (const item of desired) {
-      if (!item.changed) {
-        targets[item.service] = before.tasks[item.service]!;
-        continue;
-      }
-      const file = join(mkdtempSync(join(tmpdir(), "qm-task-")), `${item.service}.json`);
-      writeFileSync(file, JSON.stringify(item.task));
-      const taskDefinition = registerTaskDefinition(config, file);
-      targets[item.service] = taskDefinition;
-    }
-    const rolloutTargets = Object.fromEntries(
-      services
-        .filter(
-          (service) =>
-            desired.find((item) => item.service === service)!.changed ||
-            before!.counts[service] !== workloadDesiredCount(config, service),
-        )
-        .map((service) => [service, targets[service]!]),
-    );
-    if (Object.keys(rolloutTargets).length) {
-      await applyServiceTargets(
-        config,
-        rolloutTargets,
-        Object.fromEntries(
-          Object.keys(rolloutTargets).map((service) => [service, workloadDesiredCount(config, service)]),
-        ),
-      );
-      applied = true;
-    }
-    await awaitServiceTargets(
-      config,
-      Object.fromEntries(
-        services.map((service) => [
-          service,
-          { taskDefinition: targets[service]!, desiredCount: workloadDesiredCount(config, service) },
-        ]),
-      ),
-    );
-    if (desiredLayerBody) {
-      layerAttempted = true;
-      await syncAwsLayerAfterRoll(
-        {
-          config,
-          transport: awsDeploymentLayerTransport,
-          configDir: _configDir,
-          ...(opts.envFile ? { envFile: opts.envFile } : {}),
-        },
-        desiredLayerBody,
-        desiredLayer!,
-      );
-    }
-    const releaseTasks = { ...before.tasks, ...targets };
-    const releaseImageProvenance = { ...current?.imageProvenance, ...selectedImageProvenance };
-    const sameTasks = current && allServices.every((service) => current!.tasks[service] === releaseTasks[service]);
-    const sameImageProvenance =
-      current && canonicalJson(current.imageProvenance ?? {}) === canonicalJson(releaseImageProvenance);
-    releaseSucceeded = true;
-    if (
-      !current ||
-      !sameTasks ||
-      !sameImageProvenance ||
-      current.imageLabel !== label ||
-      layerChanged ||
-      current.sandboxImage !== sandboxPinImage
-    ) {
-      recorded = recordDeploymentManifest(aws, releaseTasks, {
-        id: releaseId,
-        ...(sandboxPinImage ? { sandboxImage: sandboxPinImage } : {}),
-        imageLabel: label,
-        ...(dbSnapshot ? { dbSnapshot } : {}),
-        ...(desiredLayer ? { layer: desiredLayer } : {}),
-        imageProvenance: releaseImageProvenance,
+      const reconciledSecrets = await ensureAwsPublicApiUrl(config, {
+        arns: refreshed.secretArns,
+        publicApiUrlNeedsUpdate: refreshed.publicApiUrlNeedsUpdate,
+        values: refreshed.secretValues,
       });
-    } else if (dbSnapshot) {
-      try {
-        awsText(aws, ["rds", "delete-db-snapshot", "--db-snapshot-identifier", dbSnapshot]);
-        note(`nothing changed, so no manifest references pre-deploy database snapshot ${dbSnapshot}; deleted it`);
-      } catch (error) {
-        warn(`could not delete the unreferenced pre-deploy database snapshot ${dbSnapshot}: ${errMessage(error)}`);
-      }
-    }
-    for (const service of services) {
-      try {
-        promoteStagedImage(config, service, images[service]!, label);
-        promotedServices.add(service);
-      } catch (error) {
-        warn(
-          `AWS deployment succeeded, but could not promote ${service}:${label}: ${errMessage(error)}; preserving staging tag ${stagingLabel} so the deployed digest remains pullable; rerun \`qm up --yes\` to retry promotion`,
+      arns = reconciledSecrets.arns;
+      const buildEnv = awsSourceBuildEnvironment(buildAdmission, reconciledSecrets.values);
+      before = serviceSnapshot(config, allServices);
+      current = currentDeploymentManifest(aws);
+      const selected = new Set(services);
+      if (allServices.some((service) => !selected.has(service))) {
+        trustedDeploymentBaseline(
+          config,
+          before,
+          allServices.filter((name) => !selected.has(name)),
         );
       }
-    }
-  } catch (error) {
-    if (releaseSucceeded) throw error;
-    const compensationFailures: string[] = [];
-    if (layerAttempted && previousLayerBody && !previousLayerBootstrapped) {
-      try {
+      if (aws.predeployDbSnapshot === false) note("pre-deploy database snapshot: disabled (aws.predeployDbSnapshot)");
+      else dbSnapshot = await takePredeployDbSnapshot(config, releaseId, current?.dbSnapshot);
+      if (current?.layer) {
+        desiredLayer = current.layer;
+      } else {
+        if (current || before.counts.core !== 0) {
+          const previousState = await currentDeploymentLayerState({
+            config,
+            configIdentity: opts.configIdentity,
+            transport: awsDeploymentLayerTransport,
+            configDir: _configDir,
+            ...(opts.envFile !== undefined ? { envFile: opts.envFile } : {}),
+          });
+          previousLayerBody = previousState.body;
+          previousLayerBootstrapped = previousState.bootstrapped;
+        } else {
+          previousLayerBody = JSON.stringify({ contract: 1, tools: [], skills: [] });
+          previousLayerBootstrapped = true;
+        }
+        if (!previousLayerBootstrapped) {
+          desiredLayer = await putDeploymentLayerArtifact(config, previousLayerBody);
+          if (current) {
+            current.layer = desiredLayer;
+            await manifestTransaction(aws, current, current.id);
+          }
+        }
+      }
+      if (opts.sandboxDir && existsSync(opts.sandboxDir) && (!opts.only || opts.only.includes("core"))) {
+        previousLayerBody ??= getDeploymentLayerArtifact(config, desiredLayer);
+        desiredLayerBody = deploymentLayerBody(opts.sandboxDir);
+        desiredLayer = await putDeploymentLayerArtifact(config, desiredLayerBody);
+        layerChanged = desiredLayer.sha256 !== current?.layer?.sha256;
+        if (!layerChanged) {
+          const state = await currentDeploymentLayerState({
+            config,
+            configIdentity: opts.configIdentity,
+            transport: awsDeploymentLayerTransport,
+            configDir: _configDir,
+            ...(opts.envFile !== undefined ? { envFile: opts.envFile } : {}),
+          });
+          if (
+            state.status === "applied" &&
+            state.contentHash === desiredLayer.sha256 &&
+            state.runtimeContentHash === desiredLayer.sha256
+          ) {
+            desiredLayerBody = undefined;
+          }
+        }
+      }
+      await dockerLogin(aws, buildEnv);
+      const images: Record<string, string> = {};
+      const selectedImageProvenance: Record<string, DeploymentImageProvenance> = {};
+      for (const service of services) {
+        staged.add(service);
+        const snapshot = sourceBuildSnapshot(service, plugins.get(service), opts);
+        selectedImageProvenance[service] = workloadImageProvenance(config, service, plugins.get(service), opts);
+        images[service] = await publishWorkloadImage(
+          config,
+          service,
+          plugins.get(service),
+          stagingLabel,
+          opts,
+          snapshot,
+          buildEnv,
+        );
+      }
+      const desired = reportTaskChanges(config, services, images, arns);
+      const targets: Record<string, string> = {};
+      for (const item of desired) {
+        if (!item.changed) {
+          targets[item.service] = before.tasks[item.service]!;
+          continue;
+        }
+        const file = join(mkdtempSync(join(tmpdir(), "qm-task-")), `${item.service}.json`);
+        writeFileSync(file, JSON.stringify(item.task));
+        const taskDefinition = await registerTaskDefinition(config, file);
+        targets[item.service] = taskDefinition;
+      }
+      const rolloutTargets = Object.fromEntries(
+        services
+          .filter(
+            (service) =>
+              desired.find((item) => item.service === service)!.changed ||
+              before!.counts[service] !== workloadDesiredCount(config, service),
+          )
+          .map((service) => [service, targets[service]!]),
+      );
+      if (Object.keys(rolloutTargets).length) {
+        await applyServiceTargets(
+          config,
+          rolloutTargets,
+          Object.fromEntries(
+            Object.keys(rolloutTargets).map((service) => [service, workloadDesiredCount(config, service)]),
+          ),
+        );
+        applied = true;
+      }
+      await awaitServiceTargets(
+        config,
+        Object.fromEntries(
+          services.map((service) => [
+            service,
+            { taskDefinition: targets[service]!, desiredCount: workloadDesiredCount(config, service) },
+          ]),
+        ),
+      );
+      if (desiredLayerBody) {
+        const layerPreSyncState = await currentDeploymentLayerState({
+          config,
+          configIdentity: opts.configIdentity,
+          transport: awsDeploymentLayerTransport,
+          configDir: _configDir,
+          ...(opts.envFile !== undefined ? { envFile: opts.envFile } : {}),
+        });
+        const operationId = randomBytes(16).toString("hex");
+        layerAttempt = { before: layerPreSyncState, desiredHash: desiredLayer!.sha256, operationId };
         await syncAwsLayerAfterRoll(
           {
             config,
+            configIdentity: opts.configIdentity,
             transport: awsDeploymentLayerTransport,
             configDir: _configDir,
-            ...(opts.envFile ? { envFile: opts.envFile } : {}),
+            ...(opts.envFile !== undefined ? { envFile: opts.envFile } : {}),
+            precondition: layerPreSyncState.precondition,
           },
-          previousLayerBody,
-          createHash("sha256").update(previousLayerBody).digest("hex"),
+          desiredLayerBody,
+          desiredLayer!,
+          operationId,
+          (result) => observeAwsLayerAttempt(layerAttempt!, result),
         );
-      } catch (restoreError) {
-        compensationFailures.push(`restoring the pre-deploy deployment layer: ${errMessage(restoreError)}`);
       }
-    } else if (layerAttempted && previousLayerBootstrapped) {
-      warn(
-        `the pre-deploy layer snapshot was synthesized (the core had no durable layer record) — leaving the core's layer as the failed sync left it rather than durably installing the empty bundle`,
-      );
-    }
-    if (applied && before) {
-      try {
-        await applyServiceTargets(config, before.tasks, before.counts);
-      } catch (restoreError) {
-        compensationFailures.push(`restoring the pre-deploy manifest: ${errMessage(restoreError)}`);
+      const releaseTasks = { ...before.tasks, ...targets };
+      const releaseImageProvenance = { ...current?.imageProvenance, ...selectedImageProvenance };
+      const sameTasks = current && allServices.every((service) => current!.tasks[service] === releaseTasks[service]);
+      const sameImageProvenance =
+        current && canonicalJson(current.imageProvenance ?? {}) === canonicalJson(releaseImageProvenance);
+      releaseSucceeded = true;
+      if (!current || !sameTasks || !sameImageProvenance || current.imageLabel !== label || layerChanged) {
+        recorded = await recordDeploymentManifest(aws, releaseTasks, {
+          id: releaseId,
+          imageLabel: label,
+          ...(dbSnapshot ? { dbSnapshot } : {}),
+          ...(desiredLayer ? { layer: desiredLayer } : {}),
+          imageProvenance: releaseImageProvenance,
+        });
+      } else if (dbSnapshot) {
+        try {
+          await awsTextAsync(aws, ["rds", "delete-db-snapshot", "--db-snapshot-identifier", dbSnapshot]);
+          note(`nothing changed, so no manifest references pre-deploy database snapshot ${dbSnapshot}; deleted it`);
+        } catch (error) {
+          assertAwsLeaseHeld();
+          warn(`could not delete the unreferenced pre-deploy database snapshot ${dbSnapshot}: ${errMessage(error)}`);
+        }
+      }
+      for (const service of services) {
+        try {
+          await promoteStagedImage(config, service, images[service]!, label);
+          promotedServices.add(service);
+        } catch (error) {
+          assertAwsLeaseHeld();
+          warn(
+            `AWS deployment succeeded, but could not promote ${service}:${label}: ${errMessage(error)}; preserving staging tag ${stagingLabel} so the deployed digest remains pullable; rerun \`qm up --yes\` to retry promotion`,
+          );
+        }
+      }
+    } catch (error) {
+      if (releaseSucceeded) throw error;
+      assertAwsLeaseHeld();
+      const compensationFailures: string[] = [];
+      if (layerAttempt) {
+        try {
+          await restoreAwsLayerAfterFailure(
+            {
+              config,
+              configIdentity: opts.configIdentity,
+              transport: awsDeploymentLayerTransport,
+              configDir: _configDir,
+              ...(opts.envFile !== undefined ? { envFile: opts.envFile } : {}),
+            },
+            layerAttempt,
+            "deployment layer changed concurrently after the failed AWS deployment; refusing to overwrite it",
+          );
+        } catch (restoreError) {
+          assertAwsLeaseHeld();
+          compensationFailures.push(`restoring the pre-deploy deployment layer: ${errMessage(restoreError)}`);
+        }
+      }
+      if (applied && before) {
+        try {
+          await applyServiceTargets(config, before.tasks, before.counts);
+        } catch (restoreError) {
+          assertAwsLeaseHeld();
+          compensationFailures.push(`restoring the pre-deploy manifest: ${errMessage(restoreError)}`);
+        }
+      }
+      throwAfterCompensation(error, compensationFailures);
+    } finally {
+      for (const service of staged) {
+        if (releaseSucceeded && !promotedServices.has(service)) continue;
+        try {
+          await awsTextAsync(aws, [
+            "ecr",
+            "batch-delete-image",
+            "--repository-name",
+            awsServiceSpec(aws, service).ecrRepository,
+            "--image-ids",
+            `imageTag=${stagingLabel}`,
+          ]);
+        } catch (error) {
+          assertAwsLeaseHeld();
+          if (!awsCliErrorMatches(error, "ImageNotFoundException"))
+            warn(`could not clean staging image ${service}:${stagingLabel}: ${errMessage(error)}`);
+        }
       }
     }
-    throwAfterCompensation(error, compensationFailures);
-  } finally {
-    for (const service of staged) {
-      if (releaseSucceeded && !promotedServices.has(service)) continue;
-      try {
-        awsText(aws, [
-          "ecr",
-          "batch-delete-image",
-          "--repository-name",
-          aws.services[service]!.ecrRepository,
-          "--image-ids",
-          `imageTag=${stagingLabel}`,
-        ]);
-      } catch (error) {
-        if (!/ImageNotFoundException/.test(errMessage(error)))
-          warn(`could not clean staging image ${service}:${stagingLabel}: ${errMessage(error)}`);
-      }
-    }
-    releaseLease(aws, lease);
-  }
+  });
   ok(`AWS services stable on ${label} (deployment ${recorded?.id ?? current?.id})`);
 }
 
@@ -1976,7 +2595,7 @@ export function awsLogs(
   if (opts.tail !== undefined)
     note(`(--tail is a docker-only line count; aws logs tail has none, so it's ignored on the aws target)`);
   const logArgs = (name: string): string[] => {
-    const spec = aws.services[name];
+    const spec = ownAwsServiceSpec(aws, name);
     if (!spec) throw new CliError(`unknown AWS workload ${name}`);
     return awsArgs(aws, [
       "logs",
@@ -1988,7 +2607,7 @@ export function awsLogs(
   if (service) {
     const resolved = isVirtualService(service) ? "core" : service;
     if (isVirtualService(service)) note(`${service} is a virtual service; showing core logs`);
-    runInherit(process.env.AWS_BIN ?? "aws", logArgs(resolved));
+    awsRunInherit(process.env.AWS_BIN ?? "aws", logArgs(resolved));
     return;
   }
   return streamLabeled(
@@ -2001,13 +2620,10 @@ export async function awsDown(config: QmConfig, configDir = process.cwd()): Prom
   const { aws, workloads } = awsTopology(config, configDir);
   assertAwsCallerAccount(aws);
   assertOwnedServices(config, describedServices(config, workloads), workloads);
-  const lease = acquireLease(aws);
-  try {
+  await withAwsLease(aws, async () => {
     const before = serviceSnapshot(config, workloads);
     await applyServiceTargets(config, before.tasks, Object.fromEntries(workloads.map((workload) => [workload, 0])));
-  } finally {
-    releaseLease(aws, lease);
-  }
+  });
   ok(
     "AWS services set to zero desired tasks; protected tasks finish in-flight turns before stopping. Infrastructure and data were retained.",
   );
@@ -2034,325 +2650,389 @@ function firstRolledBackDbSnapshot(aws: AwsConfig, current: DeploymentManifest, 
 export async function awsRollback(
   config: QmConfig,
   to?: string,
-  layerOpts?: { configDir: string; envFile?: string },
+  layerOpts?: { configDir: string; configIdentity: FileIdentity; envFile?: string },
 ): Promise<void> {
   const { aws, workloads: services } = awsTopology(config, layerOpts?.configDir ?? process.cwd());
   assertAwsCallerAccount(aws);
-  const lease = acquireLease(aws);
   let before: ReturnType<typeof serviceSnapshot> | undefined;
   let applied = false;
-  let currentLayerBody: string | undefined;
-  let layerAttempted = false;
+  let layerAttempt: AwsLayerAttempt | undefined;
   let rolledBack = false;
-  try {
-    before = serviceSnapshot(config, services);
-    const currentManifest = currentDeploymentManifest(aws);
-    let targetManifest: DeploymentManifest | undefined;
-    if (!to) {
-      if (!currentManifest?.previous) throw new CliError("no previous recorded AWS deployment to roll back to");
-      targetManifest = deploymentManifest(aws, currentManifest.previous);
-    } else {
-      targetManifest = deploymentManifestForTarget(aws, to);
-    }
-    const missing = services.filter((service) => !targetManifest.tasks[service]);
-    if (missing.length)
-      throw new CliError(`target AWS deployment manifest is missing workloads: ${missing.join(", ")}`);
-    if (usesFlySandboxes(config) && !targetManifest.sandboxImage && !config.sandbox?.image) {
-      warn(
-        `target deployment manifest ${targetManifest.id} predates recorded sandbox pins; the next \`qm up\` needs \`qm sandbox publish\` or an explicit sandbox.image first`,
-      );
-    }
-    let targetLayerBody: string | undefined;
-    let layerNeedsSync = false;
-    if (layerOpts) {
-      targetLayerBody = getDeploymentLayerArtifact(config, targetManifest.layer);
-      if (currentManifest?.layer) currentLayerBody = getDeploymentLayerArtifact(config, currentManifest.layer);
-      else if (currentManifest)
-        throw new CliError(`current AWS deployment manifest ${currentManifest.id} has no restorable deployment layer`);
-      layerNeedsSync = currentManifest?.layer?.sha256 !== targetManifest.layer!.sha256;
-    }
-    const targets = Object.fromEntries(services.map((service) => [service, targetManifest!.tasks[service]!]));
-    const changedTargets = Object.fromEntries(
-      services
-        .filter((service) => before!.tasks[service] !== targets[service])
-        .map((service) => [service, targets[service]!]),
-    );
-    if (Object.keys(changedTargets).length) {
-      await applyServiceTargets(
-        config,
-        changedTargets,
-        Object.fromEntries(Object.keys(changedTargets).map((service) => [service, before!.counts[service]!])),
-      );
-      applied = true;
-    }
-    await awaitServiceTargets(
-      config,
-      Object.fromEntries(
-        services.map((service) => [
-          service,
-          { taskDefinition: targets[service]!, desiredCount: before!.counts[service]! },
-        ]),
-      ),
-    );
-    if (targetLayerBody && layerOpts && layerNeedsSync) {
-      if (before.counts.core === 0) {
-        note(
-          "deployment layer sync deferred: core is scaled to zero, so `check --live` will flag the layer until the next `qm up` applies it",
-        );
+  let targetManifest: DeploymentManifest | undefined;
+  await withAwsLease(aws, async () => {
+    try {
+      before = serviceSnapshot(config, services);
+      const currentManifest = currentDeploymentManifest(aws);
+      if (!to) {
+        if (!currentManifest?.previous) throw new CliError("no previous recorded AWS deployment to roll back to");
+        targetManifest = deploymentManifest(aws, currentManifest.previous);
       } else {
-        layerAttempted = true;
-        await syncAwsLayerAfterRoll(
-          {
+        targetManifest = deploymentManifestForTarget(aws, to);
+      }
+      const target = targetManifest;
+      const missing = services.filter((service) => !target.tasks[service]);
+      if (missing.length)
+        throw new CliError(`target AWS deployment manifest is missing workloads: ${missing.join(", ")}`);
+      const targets = Object.fromEntries(services.map((service) => [service, target.tasks[service]!]));
+      assertTaskDefinitionsReactivatable(config, targets, "roll back");
+      await ensureAwsPublicApiUrl(config, awsSecretSnapshot(config, undefined, true));
+      let targetLayerBody: string | undefined;
+      let layerNeedsSync = false;
+      if (layerOpts) {
+        targetLayerBody = getDeploymentLayerArtifact(config, target.layer);
+        if (currentManifest?.layer) getDeploymentLayerArtifact(config, currentManifest.layer);
+        else if (currentManifest)
+          throw new CliError(
+            `current AWS deployment manifest ${currentManifest.id} has no restorable deployment layer`,
+          );
+        layerNeedsSync = currentManifest?.layer?.sha256 !== target.layer!.sha256;
+      }
+      const changedTargets = Object.fromEntries(
+        services
+          .filter((service) => before!.tasks[service] !== targets[service])
+          .map((service) => [service, targets[service]!]),
+      );
+      if (Object.keys(changedTargets).length) {
+        await applyServiceTargets(
+          config,
+          changedTargets,
+          Object.fromEntries(Object.keys(changedTargets).map((service) => [service, before!.counts[service]!])),
+        );
+        applied = true;
+      }
+      await awaitServiceTargets(
+        config,
+        Object.fromEntries(
+          services.map((service) => [
+            service,
+            { taskDefinition: targets[service]!, desiredCount: before!.counts[service]! },
+          ]),
+        ),
+      );
+      if (targetLayerBody && layerOpts && layerNeedsSync) {
+        if (before.counts.core === 0) {
+          note(
+            "deployment layer sync deferred: core is scaled to zero, so `check --live` will flag the layer until the next `qm up` applies it",
+          );
+        } else {
+          const rollbackLayerPreSyncState = await currentDeploymentLayerState({
             config,
+            configIdentity: layerOpts.configIdentity,
             transport: awsDeploymentLayerTransport,
             configDir: layerOpts.configDir,
-            ...(layerOpts.envFile ? { envFile: layerOpts.envFile } : {}),
-          },
-          targetLayerBody,
-          targetManifest.layer!,
-        );
+            ...(layerOpts.envFile !== undefined ? { envFile: layerOpts.envFile } : {}),
+          });
+          const operationId = randomBytes(16).toString("hex");
+          layerAttempt = { before: rollbackLayerPreSyncState, desiredHash: target.layer!.sha256, operationId };
+          await syncAwsLayerAfterRoll(
+            {
+              config,
+              configIdentity: layerOpts.configIdentity,
+              transport: awsDeploymentLayerTransport,
+              configDir: layerOpts.configDir,
+              ...(layerOpts.envFile !== undefined ? { envFile: layerOpts.envFile } : {}),
+              precondition: rollbackLayerPreSyncState.precondition,
+            },
+            targetLayerBody,
+            target.layer!,
+            operationId,
+            (result) => observeAwsLayerAttempt(layerAttempt!, result),
+          );
+        }
       }
-    }
-    rolledBack = true;
-    if (currentManifest?.id !== targetManifest.id) {
-      manifestTransaction(aws, undefined, targetManifest.id);
-      const dbSnapshot = currentManifest && firstRolledBackDbSnapshot(aws, currentManifest, targetManifest.id);
-      if (dbSnapshot) {
-        note(
-          `rollback restores code and configuration, not data; the database snapshot taken before the first rolled-back deployment is ${dbSnapshot} (${dbSnapshotRestoreHint(aws, dbSnapshot)})`,
-        );
+      rolledBack = true;
+      if (currentManifest?.id !== target.id) {
+        await manifestTransaction(aws, undefined, target.id);
+        const dbSnapshot = currentManifest && firstRolledBackDbSnapshot(aws, currentManifest, target.id);
+        if (dbSnapshot) {
+          note(
+            `rollback restores code and configuration, not data; the database snapshot taken before the first rolled-back deployment is ${dbSnapshot} (${dbSnapshotRestoreHint(aws, dbSnapshot)})`,
+          );
+        }
       }
-    }
-  } catch (error) {
-    if (rolledBack) throw error;
-    const compensationFailures: string[] = [];
-    if (layerAttempted && currentLayerBody && layerOpts) {
-      try {
-        await syncAwsLayerAfterRoll(
-          {
-            config,
-            transport: awsDeploymentLayerTransport,
-            configDir: layerOpts.configDir,
-            ...(layerOpts.envFile ? { envFile: layerOpts.envFile } : {}),
-          },
-          currentLayerBody,
-          createHash("sha256").update(currentLayerBody).digest("hex"),
-        );
-      } catch (restoreError) {
-        compensationFailures.push(`restoring the pre-rollback deployment layer: ${errMessage(restoreError)}`);
+    } catch (error) {
+      if (rolledBack) throw error;
+      assertAwsLeaseHeld();
+      const compensationFailures: string[] = [];
+      if (layerAttempt && layerOpts) {
+        try {
+          await restoreAwsLayerAfterFailure(
+            {
+              config,
+              configIdentity: layerOpts.configIdentity,
+              transport: awsDeploymentLayerTransport,
+              configDir: layerOpts.configDir,
+              ...(layerOpts.envFile !== undefined ? { envFile: layerOpts.envFile } : {}),
+            },
+            layerAttempt,
+            "deployment layer changed concurrently after the failed AWS rollback; refusing to overwrite it",
+          );
+        } catch (restoreError) {
+          assertAwsLeaseHeld();
+          compensationFailures.push(`restoring the pre-rollback deployment layer: ${errMessage(restoreError)}`);
+        }
       }
-    }
-    if (applied && before) {
-      try {
-        await applyServiceTargets(config, before.tasks, before.counts);
-      } catch (restoreError) {
-        compensationFailures.push(`restoring the pre-rollback manifest: ${errMessage(restoreError)}`);
+      if (applied && before) {
+        try {
+          await applyServiceTargets(config, before.tasks, before.counts);
+        } catch (restoreError) {
+          assertAwsLeaseHeld();
+          compensationFailures.push(`restoring the pre-rollback manifest: ${errMessage(restoreError)}`);
+        }
       }
+      throwAfterCompensation(error, compensationFailures);
     }
-    throwAfterCompensation(error, compensationFailures);
-  } finally {
-    releaseLease(aws, lease);
-  }
+  });
   ok(`rolled back ${config.orgId}`);
 }
 
-function envValues(configDir: string, path: string | undefined): Map<string, string> {
-  const file = resolve(path ?? join(configDir, ".env"));
-  if (!existsSync(file)) {
-    if (path) throw new CliError(`secret source not found: ${file}`);
-    return new Map();
+function selectedSecretValue(
+  name: string,
+  fileValue: string | undefined,
+  ambientEnv: Readonly<NodeJS.ProcessEnv> = process.env,
+): string | undefined {
+  if (name !== "CORE_SIGNING_SECRET") return deploymentStoreSecretValue(name, fileValue, ambientEnv);
+  if (ambientEnv.QM_DEPLOY_ENV_FILE_ONLY === "1") {
+    return fileValue === undefined || fileValue === "" ? undefined : fileValue;
   }
-  return readEnvFile(file);
+  return fileValue === undefined || fileValue === "" ? ambientEnv.CORE_SIGNING_SECRET : fileValue;
 }
 
-export async function awsSecretsPush(config: QmConfig, configDir: string, envFile?: string): Promise<void> {
+export async function awsSecretsPush(
+  config: QmConfig,
+  configDir: string,
+  sourceValues: ReadonlyMap<string, string>,
+): Promise<void> {
+  const ambientEnv = { ...process.env };
   const { aws, workloads } = awsTopology(config, configDir);
-  assertAwsCallerAccount(aws);
-  const values = envValues(configDir, envFile);
-  const staged: Array<{ name: string; id: string; dir: string; file: string }> = [];
-  try {
-    for (const secret of computedSecrets(config).filter((item) => item.managedBy === "operator")) {
-      const supplied = deploymentSecretValue(secret.name, values.get(secret.name));
-      if (!secret.required && !supplied) {
-        step(`${secret.name}: optional, not supplied`);
-        continue;
-      }
-      const value = supplied ?? (await promptHidden(secret.name));
-      if (isInvalidSecret(secret.name, value)) {
-        throw new CliError(
-          `${secret.name} must have a non-empty, non-placeholder value; signing keys must be at least 32 characters`,
-        );
-      }
-      const dir = mkdtempSync(join(tmpdir(), "qm-secret-"));
-      const file = join(dir, "value");
-      writeFileSync(file, value, { mode: 0o600 });
-      staged.push({ name: secret.name, id: `${aws.secretsPrefix}${secret.name}`, dir, file });
+  const resolved: Array<{ name: string; value: string }> = [];
+  for (const secret of computedSecrets(config).filter((item) => item.managedBy === "operator")) {
+    const supplied =
+      secret.name === "PUBLIC_API_URL"
+        ? configuredAwsPublicApiUrl(config)
+        : selectedSecretValue(secret.name, sourceValues.get(secret.name), ambientEnv);
+    assertNoNulSecret(secret.name, supplied);
+    if (!secret.required && !supplied) {
+      step(`${secret.name}: optional, not supplied`);
+      continue;
     }
-    await withAwsLease(aws, async () => {
-      const baseline = currentDeploymentManifest(aws);
-      const states = describedServices(config, workloads);
-      assertOwnedServices(config, states, workloads);
-      const before = baseline ? serviceSnapshotFromStates(states, workloads) : undefined;
-      if (baseline) {
-        const drifted = workloads.filter(
-          (workload) => !baseline.tasks[workload] || before!.tasks[workload] !== baseline.tasks[workload],
-        );
-        if (drifted.length)
-          throw new CliError(
-            `cannot rotate secrets while workloads differ from the current deployment manifest: ${drifted.join(", ")}`,
-          );
-      } else {
-        const active = workloads.filter((workload) => {
-          const state = states.get(workload)!;
-          return state.desiredCount !== 0 || state.runningCount !== 0;
-        });
-        if (active.length) {
-          throw new CliError(
-            `cannot defer secret activation without a current deployment manifest while workloads are active: ${active.join(", ")}`,
-          );
-        }
-      }
-      const uploaded = Object.fromEntries(staged.map((secret) => [secret.name, secret.id]));
-      const affected = workloads.filter((workload) =>
-        workloadSecrets(config, workload, uploaded).some((secret) => uploaded[secret.name]),
+    const value = supplied ?? (await promptHidden(secret.name));
+    assertNoNulSecret(secret.name, value);
+    assertSecretByteLength(secret.name, value);
+    resolved.push({ name: secret.name, value });
+  }
+  const invalid = [...invalidSecretNames(new Map(resolved.map(({ name, value }) => [name, value])))].sort();
+  if (invalid.length === 1) {
+    throw new CliError(
+      `${invalid[0]} must have a non-empty, non-placeholder runtime value; signing keys must be at least 32 characters`,
+    );
+  }
+  if (invalid.length) throw new CliError(`selected AWS secrets failed runtime validation: ${invalid.join(", ")}`);
+  const resolvedValues = new Map(resolved.map(({ name, value }) => [name, value]));
+  validateCompleteSecretValues(config, resolvedValues);
+  assertAwsCallerAccount(aws);
+  assertAwsSecretReplacementValid(config, resolvedValues);
+  const uploads = resolved.map((secret) => ({
+    name: secret.name,
+    id: `${aws.secretsPrefix}${secret.name}`,
+    value: secret.value,
+  }));
+  await withAwsLease(aws, async () => {
+    assertAwsSecretReplacementValid(config, resolvedValues);
+    assertAwsSecretContainers(aws, uploads);
+    const baseline = currentDeploymentManifest(aws);
+    const states = describedServices(config, workloads);
+    assertOwnedServices(config, states, workloads);
+    const before = baseline ? serviceSnapshotFromStates(states, workloads) : undefined;
+    if (baseline) {
+      const drifted = workloads.filter(
+        (workload) => !baseline.tasks[workload] || before!.tasks[workload] !== baseline.tasks[workload],
       );
-      if (usesFlySandboxes(config) && baseline && affected.includes("core")) {
-        config = withSandboxPin(config, resolveAwsSandboxPin(config, () => baseline).image);
-      }
-      for (const secret of staged) {
-        try {
-          awsText(aws, [
-            "secretsmanager",
-            "put-secret-value",
-            "--secret-id",
-            secret.id,
-            "--secret-string",
-            `file://${secret.file}`,
-          ]);
-        } catch (error) {
-          if (/ResourceNotFoundException/.test(errMessage(error))) {
-            throw new CliError(
-              `AWS secret container ${secret.id} is missing; apply the rendered Terraform before pushing secrets`,
-            );
-          }
-          throw error;
-        }
-        step(`${secret.name}: uploaded`);
-      }
-      if (!baseline || !before) {
-        if (affected.length) step("secret activation deferred to the first complete AWS deployment");
-        return;
-      }
-      const arns = secretArns(config);
-      const targets = { ...before.tasks };
-      const changed: Record<string, string> = {};
-      for (const workload of affected) {
-        const live =
-          awsJson<{ taskDefinition?: Record<string, unknown> }>(aws, [
-            "ecs",
-            "describe-task-definition",
-            "--task-definition",
-            before.tasks[workload]!,
-          ]).taskDefinition ?? null;
-        const container = (live?.containerDefinitions as Array<Record<string, unknown>> | undefined)?.find(
-          (item) => item.name === workload,
+      if (drifted.length)
+        throw new CliError(
+          `cannot rotate secrets while workloads differ from the current deployment manifest: ${drifted.join(", ")}`,
         );
-        if (
-          !container ||
-          typeof container.image !== "string" ||
-          !isPinnedWorkloadImage(config, workload, container.image)
-        ) {
-          throw new CliError(`cannot rotate secrets while ${workload} lacks a trusted digest-pinned image`);
-        }
-        const desired = renderTaskDefinition(config, workload, container.image, arns);
-        if (!taskDefinitionChanges(desired, live).length) continue;
-        const dir = mkdtempSync(join(tmpdir(), "qm-task-"));
-        try {
-          const file = join(dir, `${workload}.json`);
-          writeFileSync(file, JSON.stringify(desired));
-          targets[workload] = registerTaskDefinition(config, file);
-          changed[workload] = targets[workload]!;
-        } finally {
-          rmSync(dir, { recursive: true, force: true });
-        }
+    } else {
+      const active = workloads.filter((workload) => {
+        const state = states.get(workload)!;
+        return state.desiredCount !== 0 || state.runningCount !== 0;
+      });
+      if (active.length) {
+        throw new CliError(
+          `cannot defer secret activation without a current deployment manifest while workloads are active: ${active.join(", ")}`,
+        );
       }
-      let changedApplied = false;
-      let rotated = false;
+    }
+    const uploaded = Object.fromEntries(uploads.map((secret) => [secret.name, secret.id]));
+    const affected = workloads.filter((workload) =>
+      workloadSecrets(config, workload, uploaded).some((secret) => uploaded[secret.name]),
+    );
+    if (baseline && before) {
+      assertTaskDefinitionsReactivatable(
+        config,
+        Object.fromEntries(affected.map((workload) => [workload, baseline.tasks[workload]!])),
+        "rotate secrets",
+      );
+    }
+    for (const secret of uploads) {
       try {
-        if (Object.keys(changed).length) {
-          await applyServiceTargets(
-            config,
-            changed,
-            Object.fromEntries(Object.keys(changed).map((workload) => [workload, before.counts[workload]!])),
+        await awsTextAsync(
+          aws,
+          ["secretsmanager", "put-secret-value", "--secret-id", secret.id, "--secret-string", "file:///dev/stdin"],
+          { input: secret.value },
+        );
+      } catch (error) {
+        if (awsCliErrorMatches(error, "ResourceNotFoundException")) {
+          throw new CliError(
+            `AWS secret container ${secret.id} is missing; apply the rendered Terraform before pushing secrets`,
           );
-          changedApplied = true;
         }
-        const unchanged = affected.filter((workload) => !changed[workload]);
-        const forcedDeployments: Record<string, string> = {};
-        for (const workload of unchanged) {
-          const service = awsJson<{ service?: { deployments?: EcsDeploymentState[] } }>(aws, [
+        throw error;
+      }
+      step(`${secret.name}: uploaded`);
+    }
+    if (!baseline || !before) {
+      if (affected.length) step("secret activation deferred to the first complete AWS deployment");
+      return;
+    }
+    const arns = secretArns(config);
+    const targets = { ...before.tasks };
+    const changed: Record<string, string> = {};
+    for (const workload of affected) {
+      const live =
+        awsJson<{ taskDefinition?: Record<string, unknown> }>(aws, [
+          "ecs",
+          "describe-task-definition",
+          "--task-definition",
+          before.tasks[workload]!,
+        ]).taskDefinition ?? null;
+      const container = (live?.containerDefinitions as Array<Record<string, unknown>> | undefined)?.find(
+        (item) => item.name === workload,
+      );
+      if (
+        !container ||
+        typeof container.image !== "string" ||
+        !isPinnedWorkloadImage(config, workload, container.image)
+      ) {
+        throw new CliError(`cannot rotate secrets while ${workload} lacks a trusted digest-pinned image`);
+      }
+      const desired = renderTaskDefinition(config, workload, container.image, arns);
+      if (!taskDefinitionChanges(desired, live).length) continue;
+      const dir = mkdtempSync(join(tmpdir(), "qm-task-"));
+      try {
+        const file = join(dir, `${workload}.json`);
+        writeFileSync(file, JSON.stringify(desired));
+        targets[workload] = await registerTaskDefinition(config, file);
+        changed[workload] = targets[workload]!;
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+    let changedApplied = false;
+    let rotated = false;
+    try {
+      if (Object.keys(changed).length) {
+        await applyServiceTargets(
+          config,
+          changed,
+          Object.fromEntries(Object.keys(changed).map((workload) => [workload, before.counts[workload]!])),
+        );
+        changedApplied = true;
+      }
+      const unchanged = affected.filter((workload) => !changed[workload]);
+      const forcedDeployments: Record<string, string> = {};
+      for (const workload of unchanged) {
+        const service = (
+          await awsJsonAsync<{ service?: { deployments?: EcsDeploymentState[] } }>(aws, [
             "ecs",
             "update-service",
             "--cluster",
             aws.cluster,
             "--service",
-            aws.services[workload]!.ecsService,
+            awsServiceSpec(aws, workload).ecsService,
             "--force-new-deployment",
-          ]).service;
-          const primary = (service?.deployments ?? []).filter((deployment) => deployment.status === "PRIMARY");
-          if (primary.length !== 1 || !primary[0]?.id)
-            throw new CliError(`AWS did not identify the replacement deployment for ${workload}`);
-          forcedDeployments[workload] = primary[0].id;
-        }
-        if (unchanged.length) {
-          await awaitServiceTargets(
-            config,
-            Object.fromEntries(
-              unchanged.map((workload) => [
-                workload,
-                {
-                  taskDefinition: before.tasks[workload]!,
-                  desiredCount: before.counts[workload]!,
-                  deploymentId: forcedDeployments[workload]!,
-                },
-              ]),
-            ),
-          );
-        }
-        rotated = true;
-        if (Object.keys(changed).length) {
-          recordDeploymentManifest(aws, targets, {
-            ...(baseline.sandboxImage ? { sandboxImage: baseline.sandboxImage } : {}),
-            imageLabel: baseline.imageLabel ?? aws.imageLabel,
-            ...(baseline.layer ? { layer: baseline.layer } : {}),
-            ...(baseline.imageProvenance ? { imageProvenance: baseline.imageProvenance } : {}),
-          });
-        }
-      } catch (error) {
-        if (rotated || !changedApplied) throw error;
-        const compensationFailures: string[] = [];
-        try {
-          await applyServiceTargets(
-            config,
-            Object.fromEntries(Object.keys(changed).map((workload) => [workload, before.tasks[workload]!])),
-            Object.fromEntries(Object.keys(changed).map((workload) => [workload, before.counts[workload]!])),
-          );
-        } catch (restoreError) {
-          compensationFailures.push(`restoring pre-rotation task definitions: ${errMessage(restoreError)}`);
-        }
-        throwAfterCompensation(error, compensationFailures);
+          ])
+        ).service;
+        const primary = (service?.deployments ?? []).filter((deployment) => deployment.status === "PRIMARY");
+        if (primary.length !== 1 || !primary[0]?.id)
+          throw new CliError(`AWS did not identify the replacement deployment for ${workload}`);
+        forcedDeployments[workload] = primary[0].id;
       }
-      for (const workload of affected) step(`${workload}: restarted with rotated secrets`);
-    });
-  } finally {
-    for (const secret of staged) rmSync(secret.dir, { recursive: true, force: true });
-  }
+      if (unchanged.length) {
+        await awaitServiceTargets(
+          config,
+          Object.fromEntries(
+            unchanged.map((workload) => [
+              workload,
+              {
+                taskDefinition: before.tasks[workload]!,
+                desiredCount: before.counts[workload]!,
+                deploymentId: forcedDeployments[workload]!,
+              },
+            ]),
+          ),
+        );
+      }
+      rotated = true;
+      if (Object.keys(changed).length) {
+        await recordDeploymentManifest(aws, targets, {
+          imageLabel: baseline.imageLabel ?? aws.imageLabel,
+          ...(baseline.layer ? { layer: baseline.layer } : {}),
+          ...(baseline.imageProvenance ? { imageProvenance: baseline.imageProvenance } : {}),
+        });
+      }
+    } catch (error) {
+      if (rotated || !changedApplied) throw error;
+      assertAwsLeaseHeld();
+      const compensationFailures: string[] = [];
+      try {
+        await applyServiceTargets(
+          config,
+          Object.fromEntries(Object.keys(changed).map((workload) => [workload, before.tasks[workload]!])),
+          Object.fromEntries(Object.keys(changed).map((workload) => [workload, before.counts[workload]!])),
+        );
+      } catch (restoreError) {
+        assertAwsLeaseHeld();
+        compensationFailures.push(`restoring pre-rotation task definitions: ${errMessage(restoreError)}`);
+      }
+      throwAfterCompensation(error, compensationFailures);
+    }
+    for (const workload of affected) step(`${workload}: restarted with rotated secrets`);
+  });
   ok("operator secrets uploaded to AWS Secrets Manager");
 }
 
+function githubRemoteRepository(remote: string): string | undefined {
+  const scp = /^git@github\.com:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(remote);
+  if (scp) return scp[1];
+  const authority = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/]*)/.exec(remote)?.[1];
+  let url: URL;
+  try {
+    url = new URL(remote);
+  } catch {
+    return undefined;
+  }
+  const ssh = url.protocol === "ssh:";
+  if (
+    !["git:", "http:", "https:", "ssh:"].includes(url.protocol) ||
+    url.hostname !== "github.com" ||
+    url.port ||
+    (ssh
+      ? authority?.toLowerCase() !== "git@github.com" || url.username !== "git" || Boolean(url.password)
+      : authority?.toLowerCase() !== "github.com" || Boolean(url.username) || Boolean(url.password)) ||
+    url.search ||
+    url.hash
+  ) {
+    return undefined;
+  }
+  const path = /^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(url.pathname);
+  return path ? `${path[1]}/${path[2]}` : undefined;
+}
+
 export function githubTrustSubject(configDir: string, deployBranch?: string, deployEnvironment?: string): string {
-  const tfvars = join(configDir, "infra", "terraform.tfvars");
-  const source = existsSync(tfvars) ? readFileSync(tfvars, "utf8") : undefined;
+  const source = existsSync(join(configDir, "infra"))
+    ? readRenderedFile(configDir, ["infra", "terraform.tfvars"])
+    : undefined;
   const tfValue = (name: string): string | undefined => {
     const raw = source?.match(new RegExp(`^${name}\\s*=\\s*("(?:[^"\\\\]|\\\\.)*")\\s*$`, "m"))?.[1];
     return raw ? (JSON.parse(raw) as string) : undefined;
@@ -2365,8 +3045,15 @@ export function githubTrustSubject(configDir: string, deployBranch?: string, dep
     }
   }
   if (!repo) {
-    const remote = capture("git", ["-C", configDir, "config", "--get", "remote.origin.url"]).trim();
-    repo = remote.match(/github\.com[/:]([^/]+\/[^/.]+)(?:\.git)?$/)?.[1];
+    let remote: string;
+    try {
+      remote = capture("git", ["-C", configDir, "config", "--local", "--get", "remote.origin.url"], {
+        env: gitSubprocessEnvironment(),
+      }).trim();
+    } catch {
+      throw new Error("cannot derive the GitHub repository from this deployment checkout");
+    }
+    repo = githubRemoteRepository(remote);
     if (!repo) throw new Error("cannot derive the GitHub repository from this deployment checkout");
   }
   if (deployEnvironment) return `repo:${repo}:environment:${deployEnvironment}`;
@@ -2450,6 +3137,75 @@ export function assertAwsPublicListener(
     return;
   }
   throw new Error(`publicUrl must use http or https (got ${protocol})`);
+}
+
+function assertAwsAppsCertificate(config: QmConfig, listenerArn: string): void {
+  const appsDomain = effectiveDeployAppsDomain(config);
+  if (!appsDomain) return;
+  const aws = requireAws(config);
+  const required = `*.${appsDomain}`;
+  const arns: string[] = [];
+  const markers = new Set<string>();
+  let marker: string | undefined;
+  do {
+    const listed = awsJson<unknown>(aws, [
+      "elbv2",
+      "describe-listener-certificates",
+      "--listener-arn",
+      listenerArn,
+      "--no-paginate",
+      ...(marker ? ["--marker", marker] : []),
+    ]);
+    if (!listed || typeof listed !== "object" || Array.isArray(listed)) {
+      throw new Error("AWS returned an invalid public-listener certificate list");
+    }
+    const record = listed as Record<string, unknown>;
+    if (!Array.isArray(record.Certificates)) {
+      throw new Error("AWS public listener certificate list is missing");
+    }
+    for (const certificate of record.Certificates) {
+      if (!certificate || typeof certificate !== "object" || Array.isArray(certificate)) {
+        throw new Error("AWS returned an invalid public-listener certificate entry");
+      }
+      const arn = (certificate as Record<string, unknown>).CertificateArn;
+      if (typeof arn !== "string" || arn.length === 0) {
+        throw new Error("AWS public listener certificate entry is missing its ARN");
+      }
+      arns.push(arn);
+    }
+    const next = record.NextMarker;
+    if (next === undefined) {
+      marker = undefined;
+    } else if (typeof next !== "string" || next.length === 0 || markers.has(next)) {
+      throw new Error("AWS public listener certificate list returned an invalid pagination marker");
+    } else {
+      markers.add(next);
+      marker = next;
+    }
+  } while (marker);
+  if (arns.length === 0) throw new Error("AWS public listener certificate list is missing");
+  for (const arn of new Set(arns)) {
+    const described = awsJson<unknown>(aws, ["acm", "describe-certificate", "--certificate-arn", arn]);
+    if (!described || typeof described !== "object" || Array.isArray(described)) {
+      throw new Error(`AWS returned an invalid ACM certificate response for ${arn}`);
+    }
+    const certificate = (described as Record<string, unknown>).Certificate;
+    if (!certificate || typeof certificate !== "object" || Array.isArray(certificate)) {
+      throw new Error(`AWS ACM certificate ${arn} is missing`);
+    }
+    const record = certificate as Record<string, unknown>;
+    if (record.CertificateArn !== arn || !Array.isArray(record.SubjectAlternativeNames)) {
+      throw new Error(`AWS ACM certificate ${arn} returned invalid identity or subject-alternative names`);
+    }
+    const names = record.SubjectAlternativeNames;
+    if (!names.every((name) => typeof name === "string")) {
+      throw new Error(`AWS ACM certificate ${arn} returned invalid subject-alternative names`);
+    }
+    if (names.some((name) => name.trim().toLowerCase().replace(/\.$/, "") === required)) return;
+  }
+  throw new Error(
+    `AWS public listener certificates do not cover ${required}; attach an ACM certificate whose subject-alternative names include ${required} and apply Terraform`,
+  );
 }
 
 interface AwsPublicListener {
@@ -2560,11 +3316,12 @@ function awsPublicFrontDoor(config: QmConfig): AwsPublicFrontDoor {
   const listener = candidates[0];
   if (!listener?.ListenerArn) throw new Error("public listener is missing");
   assertAwsPublicListener(origin.toString(), listener);
+  assertAwsAppsCertificate(config, listener.ListenerArn);
   return { loadBalancerArn: loadBalancer.LoadBalancerArn, dnsName: loadBalancer.DNSName, listener };
 }
 
 const validAlbHostname = (value: string): boolean =>
-  value.length <= 253 &&
+  value.length <= 128 &&
   value.includes(".") &&
   value
     .split(".")
@@ -2592,9 +3349,15 @@ function awsCoreHostnames(config: QmConfig): string[] {
     const apiHost = normalize(hostname, "apiUrl");
     if (apiHost !== new URL(config.publicUrl).hostname.toLowerCase().replace(/\.$/, "")) hosts.push(apiHost);
   }
-  const apps = config.env.core?.DEPLOY_APPS_DOMAIN?.trim() || config.env.core?.AWS_DEPLOY_APPS_DOMAIN?.trim();
-  if (apps)
-    hosts.push(`*.${normalize(apps, "the apps domain (env.core.DEPLOY_APPS_DOMAIN or AWS_DEPLOY_APPS_DOMAIN)")}`);
+  const apps = effectiveDeployAppsDomain(config);
+  if (apps) {
+    const source = "the apps domain (env.core.DEPLOY_APPS_DOMAIN or AWS_DEPLOY_APPS_DOMAIN)";
+    const wildcard = `*.${normalize(apps, source)}`;
+    if (wildcard.length > 128) {
+      throw new Error(`${source} ${JSON.stringify(apps)} does not derive a valid ALB host-header hostname`);
+    }
+    hosts.push(wildcard);
+  }
   return [...new Set(hosts)];
 }
 
@@ -2606,9 +3369,9 @@ function assertAwsPublicRouting(
   const hash = (value: string, length: number): string =>
     createHash("sha1").update(value).digest("hex").slice(0, length);
   const targetName = (name: string): string =>
-    aws.services[name]?.targetGroup ??
+    ownAwsServiceSpec(aws, name)?.targetGroup ??
     `${aws.cluster.slice(0, 20)}-${name.replaceAll("-", "").slice(0, 4)}-${hash(`${aws.cluster}:${name}`, 6)}`;
-  const hasPortal = Boolean(aws.services.portal);
+  const hasPortal = Boolean(ownAwsServiceSpec(aws, "portal"));
   const coreHosts = hasPortal ? awsCoreHostnames(config) : [];
   let ingress = ["core"];
   if (hasPortal) ingress = coreHosts.length ? ["portal", "core"] : ["portal"];
@@ -2720,36 +3483,56 @@ function assertAwsPublicFrontDoor(config: QmConfig): void {
 }
 
 async function assertAwsPublicNetwork(config: QmConfig, rejectServerErrors = false): Promise<void> {
-  const originHostname = awsPublicOrigin(config).hostname.toLowerCase().replace(/\.$/, "");
+  assertAwsLeaseHeld();
   const albHostname = awsPublicFrontDoor(config).dnsName.toLowerCase().replace(/\.$/, "");
-  if (originHostname !== albHostname) {
-    const [cnames, publicAddresses, albAddresses] = await Promise.all([
-      resolveCname(originHostname).catch(() => []),
-      lookup(originHostname, { all: true })
-        .then((values) => values.map((value) => value.address))
-        .catch(() => []),
-      lookup(albHostname, { all: true })
-        .then((values) => values.map((value) => value.address))
-        .catch(() => []),
-    ]);
-    const cnameMatch = cnames.some((name) => name.toLowerCase().replace(/\.$/, "") === albHostname);
-    const albSet = new Set(albAddresses);
-    const addressMatch = publicAddresses.some((address) => albSet.has(address));
-    if (!cnameMatch && !addressMatch) {
-      throw new CliError(`AWS public origin ${originHostname} does not resolve to this stack's ALB ${albHostname}`);
+  const endpoints = [
+    { label: "public URL", origin: awsPublicOrigin(config), url: config.publicUrl },
+    ...(config.apiUrl && config.apiUrl !== config.publicUrl
+      ? [{ label: "public API URL", origin: new URL(config.apiUrl), url: config.apiUrl }]
+      : []),
+  ];
+  for (const endpoint of endpoints) {
+    const originHostname = endpoint.origin.hostname.toLowerCase().replace(/\.$/, "");
+    if (originHostname !== albHostname) {
+      const [cnames, publicAddresses, albAddresses] = await Promise.all([
+        resolveCname(originHostname).catch(() => []),
+        lookup(originHostname, { all: true })
+          .then((values) => values.map((value) => value.address))
+          .catch(() => []),
+        lookup(albHostname, { all: true })
+          .then((values) => values.map((value) => value.address))
+          .catch(() => []),
+      ]);
+      assertAwsLeaseHeld();
+      const cnameMatch = cnames.some((name) => name.toLowerCase().replace(/\.$/, "") === albHostname);
+      const albSet = new Set(albAddresses);
+      const addressMatch = publicAddresses.some((address) => albSet.has(address));
+      if (!cnameMatch && !addressMatch) {
+        const originLabel = endpoint.label === "public URL" ? "public" : "public API";
+        throw new CliError(
+          `AWS ${originLabel} origin ${originHostname} does not resolve to this stack's ALB ${albHostname}`,
+        );
+      }
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10_000);
+    try {
+      assertAwsLeaseHeld();
+      const response = await fetch(endpoint.url, { redirect: "manual", signal: controller.signal });
+      assertAwsLeaseHeld();
+      await response.body?.cancel();
+      assertAwsLeaseHeld();
+      if (rejectServerErrors && response.status >= 500) throw new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      assertAwsLeaseHeld();
+      throw new CliError(
+        `AWS ${endpoint.label} is not reachable with trusted TLS and matching DNS: ${errMessage(error)}`,
+      );
+    } finally {
+      clearTimeout(timeout);
     }
   }
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 10_000);
-  try {
-    const response = await fetch(config.publicUrl, { redirect: "manual", signal: controller.signal });
-    await response.body?.cancel();
-    if (rejectServerErrors && response.status >= 500) throw new Error(`HTTP ${response.status}`);
-  } catch (error) {
-    throw new CliError(`AWS public URL is not reachable with trusted TLS and matching DNS: ${errMessage(error)}`);
-  } finally {
-    clearTimeout(timeout);
-  }
+  assertAwsLeaseHeld();
 }
 
 function assertAwsHealthyIngress(config: QmConfig, targets: ReadonlyMap<string, string>): void {
@@ -2807,12 +3590,13 @@ export function probeAwsSecretStore(
     const label = secret.required ? `secret ${secret.name}` : `optional secret ${secret.name}`;
     try {
       const value = read(secret.name);
+      assertNoNulSecret(secret.name, value);
       if (isInvalidSecret(secret.name, value)) throw new Error("missing, placeholder, or insecure value");
       values.set(secret.name, value);
       if (secret.required && secret.name === "PUBLIC_API_URL") checkPublicApiUrl();
       step(secret.required ? `${label}: ok` : `${label}: configured`);
     } catch (error) {
-      if (/ResourceNotFoundException/.test(errMessage(error))) {
+      if (awsCliErrorMatches(error, "ResourceNotFoundException")) {
         if (secret.required) {
           pending.push(secret.name);
           step(`${label}: not pushed yet — run \`qm secrets push\` before the first deploy`);
@@ -2825,11 +3609,16 @@ export function probeAwsSecretStore(
       }
     }
   }
+  const invalid = [...invalidSecretNames(values)].sort();
+  if (invalid.length) failures.push(`secrets failed runtime validation: ${invalid.join(", ")}`);
   return { values, pending, failures };
 }
 
 export async function awsDoctor(config: QmConfig, configDir: string): Promise<void> {
   const { aws } = awsTopology(config, configDir);
+  const hasVendoredInfra = existsSync(join(configDir, "infra"));
+  const tfvars = hasVendoredInfra ? readRenderedFile(configDir, ["infra", "terraform.tfvars"]) : undefined;
+  const variables = tfvars === undefined ? undefined : readRenderedFile(configDir, ["infra", "variables.tf"]);
   header(`qm doctor — ${config.orgId} (aws)`);
   assertAwsCallerAccount(aws);
   step("AWS caller account: ok");
@@ -2852,14 +3641,9 @@ export async function awsDoctor(config: QmConfig, configDir: string): Promise<vo
       warn(`${label}: failed`);
     }
   };
-  const tfvarsPath = join(configDir, "infra", "terraform.tfvars");
-  if (existsSync(tfvarsPath))
+  if (tfvars !== undefined)
     check("Terraform coordinates", () => {
-      const path = tfvarsPath;
-      const existing = readFileSync(path, "utf8");
-      const variablesPath = join(configDir, "infra", "variables.tf");
-      const declared = existsSync(variablesPath) ? declaredVariables(readFileSync(variablesPath, "utf8")) : [];
-      const drift = terraformVarsDrift(config, existing, declared);
+      const drift = terraformVarsDrift(config, tfvars, variables === undefined ? [] : declaredVariables(variables));
       if (drift.length)
         throw new Error(`terraform.tfvars drift (${drift.join(", ")}); run \`qm infra render\` and commit the result`);
     });
@@ -2885,7 +3669,7 @@ export async function awsDoctor(config: QmConfig, configDir: string): Promise<vo
         });
       }
     });
-  check("Lambda MicroVM deploy image", () => assertAwsDeployImage(config));
+  check("deployment publisher MicroVM image", () => assertAwsDeployImage(config));
   check("deploy role", () => {
     const expectedSubject = githubTrustSubject(configDir, aws.deployBranch, aws.deployEnvironment);
     const role = awsJson<{ Role?: { Arn?: string; AssumeRolePolicyDocument?: { Statement?: unknown } } }>(aws, [
@@ -2966,12 +3750,13 @@ export async function awsDoctor(config: QmConfig, configDir: string): Promise<vo
       "--query",
       "SecretString",
     ]);
+    assertNoNulSecret("DATABASE_URL", databaseUrl);
     if (!database.Endpoint?.Address || new URL(databaseUrl).hostname !== database.Endpoint.Address)
       throw new Error("DATABASE_URL does not point at the configured RDS endpoint");
   });
   const ecsServices = new Map<string, AwsEcsRoutingService>();
   for (const service of Object.keys(aws.services)) {
-    const spec = aws.services[service]!;
+    const spec = awsServiceSpec(aws, service);
     check(`ECS service ${spec.ecsService}`, () => {
       const found = awsJson<{
         services?: Array<{
@@ -3074,9 +3859,16 @@ export async function awsDoctor(config: QmConfig, configDir: string): Promise<vo
 
 async function checkLive(
   config: QmConfig,
-  opts: { report?: boolean; configDir?: string; envFile?: string; sandboxDir?: string } = {},
+  opts: {
+    report?: boolean;
+    configDir?: string;
+    configIdentity: FileIdentity;
+    envFile?: string;
+    sandboxDir?: string;
+  },
 ): Promise<void> {
   const configDir = opts.configDir ?? process.cwd();
+  const buildAdmission = sourceBuildAdmission(config, configDir, opts.envFile, opts.configIdentity);
   const { aws, workloads: services, plugins: resolvedPlugins } = awsTopology(config, configDir);
   const plugins = new Map(resolvedPlugins.map((plugin) => [plugin.name, plugin]));
   assertAwsCallerAccount(aws);
@@ -3086,27 +3878,13 @@ async function checkLive(
   } catch (error) {
     failures.push(`deploy image drift: ${errMessage(error)}`);
   }
-  const arns = secretArns(config);
+  const secrets = awsSecretSnapshot(config);
+  const arns = secrets.arns;
+  const buildEnv = awsSourceBuildEnvironment(buildAdmission, secrets.values);
   const states = describedServices(config, services);
   const manifest = currentDeploymentManifest(aws);
   if (!manifest)
     throw new CliError("live drift detected: no current AWS deployment manifest", { clause: "aws.live-drift" });
-  let sandboxPinUnresolved = false;
-  if (usesFlySandboxes(config)) {
-    let pin: AwsSandboxPin | undefined;
-    try {
-      pin = resolveAwsSandboxPin(config, () => manifest);
-    } catch (error) {
-      sandboxPinUnresolved = true;
-      failures.push(
-        `sandbox pin: ${errMessage(error)} (skipped only the core expected-environment and rendered task-definition comparisons; runtime, health, and manifest checks still ran)`,
-      );
-    }
-    if (pin) {
-      if (opts.report ?? true) step(`sandbox pin: ${pin.image} (${pinSourceLabel(pin)})`);
-      config = withSandboxPin(config, pin.image);
-    }
-  }
   const desiredImages: Record<string, string> = {};
   for (const service of services) {
     const provenance = manifest.imageProvenance?.[service];
@@ -3132,7 +3910,7 @@ async function checkLive(
       continue;
     }
     try {
-      desiredImages[service] = plannedWorkloadImage(config, service, plugin);
+      desiredImages[service] = await plannedWorkloadImage(config, service, plugin, buildEnv);
     } catch (error) {
       failures.push(`${service}: could not resolve desired image: ${errMessage(error)}`);
     }
@@ -3180,21 +3958,18 @@ async function checkLive(
       failures.push(`${service}: no live task definition`);
       continue;
     }
-    const renderable = service !== "core" || !sandboxPinUnresolved;
     const container = (live.containerDefinitions as Array<Record<string, unknown>> | undefined)?.find(
       (item) => item.name === service,
     );
-    if (renderable) {
-      const liveEnv = Object.fromEntries(
-        ((container?.environment as Array<{ name: string; value: string }> | undefined) ?? []).map((item) => [
-          item.name,
-          item.value,
-        ]),
-      );
-      const expectedEnv = workloadEnvironment(config, service);
-      if (canonicalJson(liveEnv) !== canonicalJson(expectedEnv))
-        failures.push(`${service}: environment drift (including live-only keys)`);
-    }
+    const liveEnv = Object.fromEntries(
+      ((container?.environment as Array<{ name: string; value: string }> | undefined) ?? []).map((item) => [
+        item.name,
+        item.value,
+      ]),
+    );
+    const expectedEnv = workloadEnvironment(config, service);
+    if (canonicalJson(liveEnv) !== canonicalJson(expectedEnv))
+      failures.push(`${service}: environment drift (including live-only keys)`);
     const expectedSecrets = workloadSecrets(config, service, arns)
       .flatMap((secret) => containerSecretNames(service, secret))
       .sort();
@@ -3209,13 +3984,11 @@ async function checkLive(
       if (desiredImage && container.image !== desiredImage) {
         failures.push(`${service}: image drift (live ${container.image}, desired ${desiredImage})`);
       }
-      if (renderable) {
-        const comparisonImage = desiredImage ?? `${repository}@sha256:${"0".repeat(64)}`;
-        const fields = taskDefinitionDiff(renderTaskDefinition(config, service, comparisonImage, arns), live).filter(
-          (field) => desiredImage || field !== `taskDefinition.containerDefinitions.${service}.image`,
-        );
-        if (fields.length) failures.push(`${service}: task-definition drift (${fields.join(", ")})`);
-      }
+      const comparisonImage = desiredImage ?? `${repository}@sha256:${"0".repeat(64)}`;
+      const fields = taskDefinitionDiff(renderTaskDefinition(config, service, comparisonImage, arns), live).filter(
+        (field) => desiredImage || field !== `taskDefinition.containerDefinitions.${service}.image`,
+      );
+      if (fields.length) failures.push(`${service}: task-definition drift (${fields.join(", ")})`);
     }
   }
   try {
@@ -3242,9 +4015,10 @@ async function checkLive(
       await retryLiveProbe(async () => {
         const state = await currentDeploymentLayerState({
           config,
+          configIdentity: opts.configIdentity,
           transport: awsDeploymentLayerTransport,
           configDir,
-          ...(opts.envFile ? { envFile: opts.envFile } : {}),
+          ...(opts.envFile !== undefined ? { envFile: opts.envFile } : {}),
         });
         if (state.contentHash !== manifest.layer!.sha256)
           throw new Error("deployment layer content does not match the current manifest");
@@ -3257,7 +4031,7 @@ async function checkLive(
   }
   if (!failures.length) {
     try {
-      awsLiveSession(config, states.get("core")!);
+      await awsLiveSession(config, states.get("core")!);
       if (opts.report ?? true) step("core: private live session smoke passed");
     } catch (error) {
       failures.push(`core: private live session smoke failed: ${errMessage(error)}`);
@@ -3272,7 +4046,13 @@ async function checkLive(
 
 export async function awsCheckLive(
   config: QmConfig,
-  opts: { report?: boolean; configDir?: string; envFile?: string; sandboxDir?: string } = {},
+  opts: {
+    report?: boolean;
+    configDir?: string;
+    configIdentity: FileIdentity;
+    envFile?: string;
+    sandboxDir?: string;
+  },
 ): Promise<void> {
   try {
     await checkLive(config, opts);
@@ -3280,195 +4060,4 @@ export async function awsCheckLive(
     if (error instanceof CliError && error.clause === "aws.live-drift") throw error;
     throw new CliError(errMessage(error), { clause: "aws.live-drift", cause: error });
   }
-}
-
-export async function awsPinSandbox(
-  config: QmConfig,
-  image: string,
-  layerOpts?: { configDir: string; sandboxDir: string; envFile?: string },
-): Promise<void> {
-  if (!usesFlySandboxes(config)) {
-    throw new CliError(
-      `this AWS deployment runs Lambda MicroVM sandboxes (sandbox.backend is not "sprites"); use \`qm infra build-image\` instead of \`sandbox publish\``,
-    );
-  }
-  if (config.sandbox?.image && config.sandbox.image !== image) {
-    throw new CliError(
-      `the config sets sandbox.image ${config.sandbox.image}, which freezes the sandbox pin — pinning ${image} now would be silently reverted by the next \`qm up\`; remove the override (or update it to this image) before publishing`,
-    );
-  }
-  const { aws } = awsTopology(config, layerOpts?.configDir ?? process.cwd());
-  assertAwsCallerAccount(aws);
-  const service = "core";
-  const spec = aws.services[service]!;
-  const lease = acquireLease(aws);
-  let before: ReturnType<typeof serviceSnapshot> | undefined;
-  let baseline: DeploymentManifest | undefined;
-  let applied = false;
-  let recorded: DeploymentManifest | undefined;
-  let previousLayerBody: string | undefined;
-  let previousLayerBootstrapped = false;
-  let layerAttempted = false;
-  let pinned = false;
-  try {
-    before = serviceSnapshot(config, Object.keys(aws.services));
-    if (before.counts.core === 0) {
-      recorded = recordCarriedSandboxPin(aws, image);
-      note(
-        `sandbox pin recorded in deployment manifest ${recorded.id}; ${spec.ecsService} is scaled to zero and will use it on the next \`qm up\``,
-      );
-      return;
-    }
-    const live =
-      awsJson<{ taskDefinition?: Record<string, unknown> }>(aws, [
-        "ecs",
-        "describe-task-definition",
-        "--task-definition",
-        before.tasks.core!,
-      ]).taskDefinition ?? null;
-    const container = (live?.containerDefinitions as Array<Record<string, unknown>> | undefined)?.find(
-      (item) => item.name === service,
-    );
-    if (!container || typeof container.image !== "string" || !isPinnedWorkloadImage(config, service, container.image)) {
-      recorded = recordCarriedSandboxPin(aws, image);
-      note(
-        `sandbox pin recorded in deployment manifest ${recorded.id}; ${spec.ecsService} has no trusted digest-pinned workload image and will use it on the next \`qm up\``,
-      );
-      return;
-    }
-    baseline = trustedDeploymentBaseline(
-      config,
-      before,
-      Object.keys(aws.services).filter((name) => name !== service),
-      "publish the sandbox pin",
-    );
-    let desiredLayer: DeploymentManifest["layer"] = baseline.layer;
-    let desiredLayerBody: string | undefined;
-    let layerChanged = false;
-    if (layerOpts) {
-      await assertAwsPublicNetwork(config);
-      const liveLayer = await currentDeploymentLayerState({
-        config,
-        transport: awsDeploymentLayerTransport,
-        configDir: layerOpts.configDir,
-        ...(layerOpts.envFile ? { envFile: layerOpts.envFile } : {}),
-      });
-      previousLayerBody = liveLayer.body;
-      previousLayerBootstrapped = liveLayer.bootstrapped;
-      if (!baseline.layer && !previousLayerBootstrapped) {
-        baseline.layer = putDeploymentLayerArtifact(config, previousLayerBody);
-        manifestTransaction(aws, baseline, baseline.id);
-      }
-      if (existsSync(layerOpts.sandboxDir)) {
-        desiredLayerBody = deploymentLayerBody(layerOpts.sandboxDir);
-        desiredLayer = putDeploymentLayerArtifact(config, desiredLayerBody);
-        layerChanged = desiredLayer.sha256 !== baseline.layer?.sha256;
-        if (
-          !layerChanged &&
-          liveLayer.status === "applied" &&
-          liveLayer.contentHash === desiredLayer.sha256 &&
-          liveLayer.runtimeContentHash === desiredLayer.sha256
-        ) {
-          desiredLayerBody = undefined;
-        }
-      }
-    }
-    const pinnedConfig = withSandboxPin(config, image);
-    const task = renderTaskDefinition(pinnedConfig, service, container.image, secretArns(config));
-    const taskChanged = taskDefinitionChanges(task, live).length > 0;
-    const coreCarried = before.tasks.core === baseline.tasks.core;
-    if (!coreCarried) {
-      const manifestTask = awsJson<{ taskDefinition?: Record<string, unknown> }>(aws, [
-        "ecs",
-        "describe-task-definition",
-        "--task-definition",
-        baseline.tasks.core!,
-      ]).taskDefinition;
-      const pinOnlyDrift =
-        manifestTask !== undefined &&
-        taskDefinitionChanges(manifestTask as unknown as EcsTaskDefinition, live).every(
-          (change) => change.path === `taskDefinition.containerDefinitions.${service}.environment.FLY_BASE_IMAGE`,
-        );
-      if (!pinOnlyDrift) {
-        throw new CliError(
-          `cannot publish the sandbox pin while core runs ${before.tasks.core}, which differs from the deployment manifest's core task beyond the sandbox pin; run \`qm up --yes\` to converge first`,
-        );
-      }
-    }
-    let taskDefinition = before.tasks.core!;
-    if (taskChanged) {
-      const file = join(mkdtempSync(join(tmpdir(), "qm-task-")), "core.json");
-      writeFileSync(file, JSON.stringify(task));
-      taskDefinition = registerTaskDefinition(config, file);
-      await applyServiceTargets(config, { core: taskDefinition }, { core: before.counts.core! });
-      applied = true;
-    }
-    await awaitServiceTargets(config, { core: { taskDefinition, desiredCount: before.counts.core! } });
-    if (desiredLayerBody && layerOpts) {
-      layerAttempted = true;
-      await syncAwsLayerAfterRoll(
-        {
-          config,
-          transport: awsDeploymentLayerTransport,
-          configDir: layerOpts.configDir,
-          ...(layerOpts.envFile ? { envFile: layerOpts.envFile } : {}),
-        },
-        desiredLayerBody,
-        desiredLayer!,
-      );
-    }
-    pinned = true;
-    if (taskChanged || layerChanged || !coreCarried || baseline.sandboxImage !== image) {
-      const layer = desiredLayer ?? baseline.layer;
-      recorded = recordDeploymentManifest(
-        aws,
-        { ...baseline.tasks, core: taskDefinition },
-        {
-          sandboxImage: image,
-          imageLabel: baseline.imageLabel ?? aws.imageLabel,
-          ...(layer ? { layer } : {}),
-          ...(baseline.imageProvenance ? { imageProvenance: baseline.imageProvenance } : {}),
-        },
-      );
-    }
-  } catch (error) {
-    if (pinned) {
-      throw new CliError(
-        `${errMessage(error)}; ${spec.ecsService} already boots sandboxes from ${image} — rerun \`qm sandbox publish\` to record the pin in the deployment manifest`,
-        { cause: error },
-      );
-    }
-    const compensationFailures: string[] = [];
-    if (layerAttempted && previousLayerBody && layerOpts && !previousLayerBootstrapped) {
-      try {
-        await syncAwsLayerAfterRoll(
-          {
-            config,
-            transport: awsDeploymentLayerTransport,
-            configDir: layerOpts.configDir,
-            ...(layerOpts.envFile ? { envFile: layerOpts.envFile } : {}),
-          },
-          previousLayerBody,
-          createHash("sha256").update(previousLayerBody).digest("hex"),
-        );
-      } catch (restoreError) {
-        compensationFailures.push(`restoring the pre-pin deployment layer: ${errMessage(restoreError)}`);
-      }
-    } else if (layerAttempted && previousLayerBootstrapped) {
-      warn(
-        `the pre-pin layer snapshot was synthesized (the core had no durable layer record) — leaving the core's layer as the failed sync left it rather than durably installing the empty bundle`,
-      );
-    }
-    if (applied && before) {
-      try {
-        await applyServiceTargets(config, { core: before.tasks.core! }, { core: before.counts.core! });
-      } catch (restoreError) {
-        compensationFailures.push(`restoring the pre-pin core task: ${errMessage(restoreError)}`);
-      }
-    }
-    throwAfterCompensation(error, compensationFailures);
-  } finally {
-    releaseLease(aws, lease);
-  }
-  ok(`${spec.ecsService} now boots sandboxes from ${image} (deployment ${recorded?.id ?? baseline?.id})`);
 }

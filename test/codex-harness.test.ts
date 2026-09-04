@@ -1,12 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
@@ -733,7 +736,7 @@ test("Codex diagnostics redact credential-shaped stderr", () => {
   assert.equal(generic.includes("opaque-secret-value-123456789012345678901234"), false);
 });
 
-test("Codex ignores OAuth auth files that are readable by other users", (t) => {
+test("Codex accepts only exact 0600 OAuth auth files", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "qm-codex-oauth-mode-test-"));
   const authFile = join(dir, "auth.json");
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -760,6 +763,115 @@ test("Codex ignores OAuth auth files that are readable by other users", (t) => {
     },
   });
   chmodSync(authFile, 0o644);
+  assert.equal(readCodexOAuthAuthFile(authFile), null);
+  chmodSync(authFile, 0o400);
+  assert.equal(readCodexOAuthAuthFile(authFile), null);
+  chmodSync(authFile, 0o4600);
+  assert.equal(readCodexOAuthAuthFile(authFile), null);
+});
+
+test("Codex accepts the legacy OAuth mode only from an unlinked owner-only file", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-oauth-alias-test-"));
+  const authFile = join(dir, "auth.json");
+  const alias = join(dir, "auth-alias.json");
+  const symbolicAlias = join(dir, "auth-symbolic-alias.json");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const auth = {
+    auth_mode: "chatgptAuthTokens",
+    tokens: {
+      access_token: "alias-access",
+      refresh_token: "alias-refresh",
+      account_id: "alias-account",
+      id_token: oauthIdToken("alias-account"),
+    },
+  };
+  writeFileSync(authFile, JSON.stringify(auth), { mode: 0o600 });
+  assert.deepEqual(readCodexOAuthAuthFile(authFile), auth);
+  symlinkSync(authFile, symbolicAlias);
+  assert.equal(readCodexOAuthAuthFile(symbolicAlias), null);
+  assert.equal(readCodexOAuthAuthFile(dir), null);
+  linkSync(authFile, alias);
+  assert.equal(readCodexOAuthAuthFile(authFile), null);
+  assert.equal(readCodexOAuthAuthFile(alias), null);
+});
+
+test("Codex reads OAuth auth from one descriptor across an atomic pathname swap", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-oauth-swap-test-"));
+  const authFile = join(dir, "auth.json");
+  const replacement = join(dir, "replacement.json");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const auth = (account: string) => ({
+    auth_mode: "chatgpt",
+    tokens: {
+      access_token: `${account}-access`,
+      refresh_token: `${account}-refresh`,
+      account_id: account,
+      id_token: oauthIdToken(account),
+    },
+  });
+  writeFileSync(authFile, JSON.stringify(auth("opened")), { mode: 0o600 });
+  writeFileSync(replacement, JSON.stringify(auth("replacement")), { mode: 0o600 });
+  const script = `
+const fs = (await import("node:fs")).default;
+const { syncBuiltinESMExports } = await import("node:module");
+const [target, replacement, moduleUrl] = process.argv.slice(1);
+const originalOpen = fs.openSync;
+const originalStat = fs.statSync;
+let swapped = false;
+const swap = () => {
+  if (swapped) return;
+  swapped = true;
+  fs.renameSync(target, target + ".opened");
+  fs.renameSync(replacement, target);
+};
+fs.openSync = function(path, ...args) {
+  const descriptor = originalOpen.call(this, path, ...args);
+  if (String(path) === target) swap();
+  return descriptor;
+};
+fs.statSync = function(path, ...args) {
+  const stat = originalStat.call(this, path, ...args);
+  if (String(path) === target) swap();
+  return stat;
+};
+syncBuiltinESMExports();
+const { readCodexOAuthAuthFile } = await import(moduleUrl);
+const loaded = readCodexOAuthAuthFile(target);
+if (!swapped || loaded?.tokens?.refresh_token !== "opened-refresh") process.exitCode = 1;
+`;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      script,
+      authFile,
+      replacement,
+      new URL("../src/harness/codex-auth-file.ts", import.meta.url).href,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.error?.message || result.stderr || result.stdout);
+});
+
+test("Codex rejects malformed and oversized OAuth auth files", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-codex-oauth-bounds-test-"));
+  const authFile = join(dir, "auth.json");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(authFile, '{"auth_mode":"chatgpt","tokens":', { mode: 0o600 });
+  assert.equal(readCodexOAuthAuthFile(authFile), null);
+  writeFileSync(
+    authFile,
+    JSON.stringify({
+      auth_mode: "chatgpt",
+      padding: "x".repeat(1024 * 1024),
+      tokens: {
+        access_token: "oversized-access",
+        refresh_token: "oversized-refresh",
+        id_token: oauthIdToken("oversized-account"),
+      },
+    }),
+  );
   assert.equal(readCodexOAuthAuthFile(authFile), null);
 });
 

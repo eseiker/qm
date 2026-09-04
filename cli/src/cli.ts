@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { CliError, bold, dim, errMessage, note, ok, red } from "./log.ts";
 import {
@@ -23,11 +23,27 @@ import { runSandboxBuild } from "./commands/sandbox.ts";
 import { runChecks, runCheckCommand } from "./commands/check.ts";
 import { assertNodeEngine } from "./preflight.ts";
 import { devCiDown, devCiUp } from "./backends/dev-ci.ts";
-import { hostingProvider, hostingProviderUpFlags, type DeployContext } from "./backends/registry.ts";
+import {
+  assertDeploymentEnvironmentDisjoint,
+  hostingProvider,
+  hostingProviderUpFlags,
+  prepareUpSubstrate,
+  type DeployContext,
+} from "./backends/registry.ts";
 import { runConformance } from "./commands/conformance.ts";
 import { renderSlackFiles, runOutputs } from "./commands/outputs.ts";
 import { cliVersion } from "./manifest.ts";
-import { gitTopLevel, promptHidden, writeEnvValue } from "./util.ts";
+import {
+  assertSecretByteLength,
+  decodeUtf8,
+  gitTopLevel,
+  parseEnvFile,
+  promptHidden,
+  readEnvFile,
+  readRegularFile,
+  readRegularFileSnapshot,
+  writeEnvValue,
+} from "./util.ts";
 import { scopeStorageKey } from "./scope-storage-key.ts";
 
 interface Parsed {
@@ -41,12 +57,18 @@ const BOOLEAN_FLAGS = new Set(["build-only", "ci", "dry-run", "f", "follow", "js
 
 function parse(args: string[]): Parsed {
   const positionals: string[] = [];
-  const flags: Record<string, string | boolean> = {};
+  const flags = Object.create(null) as Record<string, string | boolean>;
+  let options = true;
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!;
-    if (a.startsWith("--")) {
+    if (options && a === "--") {
+      options = false;
+    } else if (options && a.startsWith("--")) {
       const eq = a.indexOf("=");
       const name = a.slice(2, eq === -1 ? undefined : eq);
+      if (Object.hasOwn(flags, name)) {
+        throw new CliError(`--${name} may be specified only once`, { clause: "cli.invocation" });
+      }
       if (BOOLEAN_FLAGS.has(name)) {
         if (eq !== -1) {
           if (name !== "ci") throw new CliError(`--${name} does not take a value`, { clause: "cli.invocation" });
@@ -60,8 +82,12 @@ function parse(args: string[]): Parsed {
           i++;
         } else flags[name] = true;
       }
-    } else if (a.startsWith("-") && a.length > 1) {
-      flags[a.slice(1)] = true;
+    } else if (options && a.startsWith("-") && a.length > 1) {
+      const name = a.slice(1);
+      if (Object.hasOwn(flags, name)) {
+        throw new CliError(`-${name} may be specified only once`, { clause: "cli.invocation" });
+      }
+      flags[name] = true;
     } else positionals.push(a);
   }
   return { positionals, flags };
@@ -71,7 +97,46 @@ function strFlag(flags: Flags, name: string): string | undefined {
   const v = flags[name];
   if (v === undefined) return undefined;
   if (typeof v !== "string") throw new CliError(`--${name} needs a value`, { clause: "cli.invocation" });
+  if (!v.trim()) throw new CliError(`--${name} needs a non-empty value`, { clause: "cli.invocation" });
   return v;
+}
+
+function pathOperand(value: string | undefined, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (!value.trim()) throw new CliError(`${label} needs a non-empty path`, { clause: "cli.invocation" });
+  if (value.includes("\0"))
+    throw new CliError(`${label} path must not contain a NUL byte`, { clause: "cli.invocation" });
+  return value;
+}
+
+function pathFlag(flags: Flags, name: string): string | undefined {
+  const value = flags[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new CliError(`--${name} needs a value`, { clause: "cli.invocation" });
+  return pathOperand(value, `--${name}`);
+}
+
+function existingDirectoryPath(path: string, label: string): string {
+  try {
+    if (!statSync(path).isDirectory()) throw new Error("not a directory");
+  } catch (error) {
+    throw new CliError(`${label} must point to an existing directory`, {
+      cause: error,
+      clause: "cli.invocation",
+    });
+  }
+  return path;
+}
+
+function readableFileContents(path: string, label: string): Buffer {
+  try {
+    return readRegularFile(path);
+  } catch (error) {
+    throw new CliError(`${label} must point to an existing readable regular file`, {
+      cause: error,
+      clause: "cli.invocation",
+    });
+  }
 }
 
 const boolFlag = (flags: Flags, name: string): boolean => flags[name] === true;
@@ -120,8 +185,8 @@ ${bold("DEPLOY (operator)")} ${dim("— runs in the deployment directory")}
                                            and only the chosen transport's keys are scaffolded)
   setup [path]                             interactive wizard: scaffold if needed, then walk the
                                            missing secrets with per-provider instructions
-  update [--yes] [--version <version>]     check for a QM release outside the seven-day cooldown;
-                                           --yes pins it exactly and reconciles the deployment
+  update [--yes] [--version <version>]     check npm's current stable QM release; --yes requires
+                                           the exact version, updates its substrate, and deploys
   up                                       build images and bring the deployment up
      --build-from[=<qm-repo>]              build from local Dockerfiles instead of pulling
      --dry-run                             resolve the config + report the plan, change nothing
@@ -147,12 +212,10 @@ ${bold("DEPLOY (operator)")} ${dim("— runs in the deployment directory")}
   status                                   show what's running
   logs [<service>] [-f] [--tail <n>]       tail service logs (omit <service> for all, interleaved)
   down [--purge]                           stop the deployment (--purge drops docker volumes)
-  rollback [--to <target>]                 roll back workloads (AWS: prior deployment manifest,
-                                           or manifest id/release label; Fly: sandbox image/tag)
+  rollback [--to <target>]                 roll back AWS workloads to a prior deployment manifest
+                                           or manifest id/release label
   sandbox build [--from <img>] [--tag <t>] [--dry-run]
                                            build and validate the sandbox image locally
-  sandbox publish [--from <img>] [--app <registry/repo>] [--tag <t>] [--dry-run]
-                                           build, push, resolve digest, and record the immutable pin
 
   ${dim("Options (apply to all deploy commands):")}
     --config <path>                        path to deploy config (default: qm.config.jsonc in deploy dir)
@@ -167,28 +230,35 @@ ${bold("DEVELOP (contributor)")} ${dim("— runs in the QM repo")}
   help · version
 
 ${dim("target is set in the config: docker runs local containers, fly deploys Fly apps, and aws deploys ECS.")}
-${dim("status/logs/down act on the configured target. Fly uses Fly Machines; AWS uses Lambda MicroVMs.")}
+${dim("status/logs/down act on the configured target; agent computers use the sandbox backend selected in config.")}
 `;
 
 const deploymentBackend = (ctx: DeployContext) => hostingProvider(ctx.target).createBackend(ctx);
 
-function deployContext(flags: Flags, dir?: string): DeployContext {
-  const explicit = strFlag(flags, "config");
+function deployContext(flags: Flags, dir?: string, opts: { allowMissingEnvFile?: boolean } = {}): DeployContext {
+  const explicit = pathFlag(flags, "config");
+  const envFile = pathFlag(flags, "env-file");
+  const explicitSandboxDir = pathFlag(flags, "sandbox-dir");
+  const resolvedSandboxDir =
+    explicitSandboxDir === undefined ? undefined : existingDirectoryPath(resolve(explicitSandboxDir), "--sandbox-dir");
   const target = targetFlag(flags);
-  const loaded = explicit
-    ? loadConfigAt(explicit, target ? { target } : undefined)
-    : loadConfigInDir(resolve(dir ?? process.cwd()), target ? { target } : undefined);
+  const loaded =
+    explicit !== undefined
+      ? loadConfigAt(explicit, target ? { target } : undefined)
+      : loadConfigInDir(resolve(dir ?? process.cwd()), target ? { target } : undefined);
   const configDir = dirname(loaded.path);
-  const sandboxDir = resolve(strFlag(flags, "sandbox-dir") ?? join(configDir, "sandbox"));
-  const envFile = strFlag(flags, "env-file");
-  return {
+  const sandboxDir = resolvedSandboxDir ?? resolve(join(configDir, "sandbox"));
+  const ctx: DeployContext = {
     config: loaded.config,
     configPath: loaded.path,
+    configIdentity: loaded.configIdentity,
     configDir,
     sandboxDir,
     target: loaded.config.target,
-    ...(envFile ? { envFile } : {}),
+    ...(envFile !== undefined ? { envFile } : {}),
   };
+  assertDeploymentEnvironmentDisjoint(ctx, opts.allowMissingEnvFile);
+  return ctx;
 }
 
 function rejectUnknownFlags(flags: Flags, allowed: readonly string[]): void {
@@ -261,10 +331,10 @@ async function dispatch(argv: string[]): Promise<void> {
       const modelProvider = modelProviderFlag(flags);
       const emailTransport = emailTransportFlag(flags);
       const org = strFlag(flags, "org");
-      const dir = positionals[0] !== undefined ? resolve(positionals[0]) : resolve(process.cwd());
+      const dir = resolve(pathOperand(positionals[0], "init path") ?? process.cwd());
       runInit({
         dir,
-        ...(org ? { org } : {}),
+        ...(org !== undefined ? { org } : {}),
         ...(target ? { target } : {}),
         ...(modelProvider ? { modelProvider } : {}),
         ...(emailTransport ? { emailTransport } : {}),
@@ -275,7 +345,7 @@ async function dispatch(argv: string[]): Promise<void> {
     case "setup": {
       rejectUnknownFlags(flags, []);
       rejectExtraPositionals(positionals, 1);
-      await runSetup({ dir: positionals[0] !== undefined ? resolve(positionals[0]) : resolve(process.cwd()) });
+      await runSetup({ dir: resolve(pathOperand(positionals[0], "setup path") ?? process.cwd()) });
       return;
     }
 
@@ -284,14 +354,15 @@ async function dispatch(argv: string[]): Promise<void> {
       rejectExtraPositionals(positionals, 0);
       const requestedVersion = strFlag(flags, "version");
       const ctx = deployContext(flags);
-      runUpdate({
+      await runUpdate({
+        config: ctx.config,
         configDir: ctx.configDir,
         configPath: ctx.configPath,
         sandboxDir: ctx.sandboxDir,
-        ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
+        ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
         target: ctx.target,
         yes: boolFlag(flags, "yes"),
-        ...(requestedVersion ? { version: requestedVersion } : {}),
+        ...(requestedVersion !== undefined ? { version: requestedVersion } : {}),
       });
       return;
     }
@@ -400,11 +471,11 @@ async function dispatch(argv: string[]): Promise<void> {
         const checkLive = deploymentBackend(ctx).checkLive;
         if (!checkLive)
           throw new CliError(`check --live is not implemented for target ${ctx.target}`, { clause: "cli.invocation" });
-        await runCheckCommand(ctx.config, ctx.configDir, ctx.sandboxDir, ctx.envFile);
+        await runCheckCommand(ctx.config, ctx.configDir, ctx.sandboxDir, ctx.envFile, ctx.configIdentity);
         await checkLive();
         return;
       }
-      await runCheckCommand(ctx.config, ctx.configDir, ctx.sandboxDir, ctx.envFile);
+      await runCheckCommand(ctx.config, ctx.configDir, ctx.sandboxDir, ctx.envFile, ctx.configIdentity);
       return;
     }
 
@@ -419,7 +490,7 @@ async function dispatch(argv: string[]): Promise<void> {
       let value: unknown = ctx.config;
       for (const key of path.split(".")) {
         value =
-          value !== null && typeof value === "object" && key in value
+          value !== null && typeof value === "object" && Object.hasOwn(value, key)
             ? (value as Record<string, unknown>)[key]
             : undefined;
         if (value === undefined) throw new CliError(`config get: "${path}" is not set in ${ctx.configPath}`);
@@ -448,7 +519,7 @@ async function dispatch(argv: string[]): Promise<void> {
     case "conformance": {
       rejectUnknownFlags(flags, ["static", "config", "env-file", "sandbox-dir", "target"]);
       rejectExtraPositionals(positionals, 1);
-      const ctx = deployContext(flags, positionals[0]);
+      const ctx = deployContext(flags, pathOperand(positionals[0], "conformance directory"));
       await runConformance(ctx, { runtime: !boolFlag(flags, "static") });
       return;
     }
@@ -482,55 +553,47 @@ async function dispatch(argv: string[]): Promise<void> {
       const common = ["config", "env-file", "sandbox-dir", "target", "dry-run"];
       rejectUnknownFlags(flags, [...common, ...hostingProviderUpFlags()]);
       rejectExtraPositionals(positionals, 0);
+      if (typeof flags["build-from"] === "string") pathOperand(flags["build-from"], "--build-from");
       const dryRun = cmd === "plan" || boolFlag(flags, "dry-run");
-      const ctx = deployContext(flags);
+      let ctx = deployContext(flags);
       const provider = hostingProvider(ctx.target);
       rejectUnknownFlags(flags, [...common, ...provider.upFlags]);
       const upOptions = provider.upOptions(ctx, flags, dryRun);
       runChecks(ctx.config, ctx.configDir, ctx.sandboxDir, { report: false });
+      ctx = await provider.preflightUp(ctx, upOptions);
+      ctx = await prepareUpSubstrate(ctx, upOptions);
       await provider.createBackend(ctx).up(upOptions);
       return;
     }
 
     case "sandbox": {
       const sub = positionals[0];
-      if (sub !== "build" && sub !== "publish") {
+      if (sub === "publish") {
         throw new CliError(
-          `usage: ${CLI_NAME} sandbox build|publish [--from <image>] [--app <registry/repo>] [--tag <label>] [--dry-run]`,
+          "sandbox publish is unavailable because the supported sandbox backends do not consume OCI layer images",
         );
       }
+      if (sub !== "build") {
+        throw new CliError(`usage: ${CLI_NAME} sandbox build [--from <image>] [--tag <label>] [--dry-run]`);
+      }
       rejectExtraPositionals(positionals, 1);
-      rejectUnknownFlags(flags, [
-        "config",
-        "env-file",
-        "sandbox-dir",
-        "target",
-        "from",
-        "tag",
-        "dry-run",
-        ...(sub === "publish" ? ["app"] : []),
-      ]);
+      rejectUnknownFlags(flags, ["config", "env-file", "sandbox-dir", "target", "from", "tag", "dry-run"]);
       const ctx = deployContext(flags);
       runChecks(ctx.config, ctx.configDir, ctx.sandboxDir, { report: false });
       const from = strFlag(flags, "from");
-      const app = strFlag(flags, "app");
       const tag = strFlag(flags, "tag");
       const common = {
         sandboxDir: ctx.sandboxDir,
         config: ctx.config,
-        ...(from ? { from } : {}),
-        ...(tag ? { tag } : {}),
+        configDir: ctx.configDir,
+        configPath: ctx.configPath,
+        configIdentity: ctx.configIdentity,
+        ...(ctx.envFile !== undefined ? { envFile: ctx.envFile } : {}),
+        ...(from !== undefined ? { from } : {}),
+        ...(tag !== undefined ? { tag } : {}),
         dryRun: boolFlag(flags, "dry-run"),
       };
-      if (sub === "build") runSandboxBuild(common);
-      else {
-        await hostingProvider(ctx.target).publishSandbox(ctx, {
-          ...common,
-          configPath: ctx.configPath,
-          ...(app ? { app } : {}),
-          ...(ctx.envFile ? { envFile: ctx.envFile } : {}),
-        });
-      }
+      runSandboxBuild(common);
       return;
     }
 
@@ -594,20 +657,29 @@ async function dispatch(argv: string[]): Promise<void> {
             clause: "cli.invocation",
           });
         }
-        const fromFile = strFlag(flags, "from-file");
-        if (positionals[2] !== undefined && fromFile !== undefined) {
+        const requestedFromFile = pathFlag(flags, "from-file");
+        if (positionals[2] !== undefined && requestedFromFile !== undefined) {
           throw new CliError(`secrets set takes a value argument or --from-file, not both`, {
             clause: "cli.invocation",
           });
         }
-        const ctx = deployContext(flags);
-        let value = positionals[2];
-        if (value === undefined && fromFile !== undefined) value = readFileSync(fromFile, "utf8");
+        let fromFileValue: string | undefined;
+        if (requestedFromFile !== undefined) {
+          try {
+            fromFileValue = decodeUtf8(readableFileContents(requestedFromFile, "--from-file"));
+          } catch (error) {
+            if (error instanceof CliError && error.clause === "cli.invocation") throw error;
+            throw new CliError(errMessage(error), { cause: error, clause: "cli.invocation" });
+          }
+        }
+        const ctx = deployContext(flags, undefined, { allowMissingEnvFile: true });
+        let value = positionals[2] ?? fromFileValue;
         if (value === undefined) value = process.stdin.isTTY ? await promptHidden(key) : await readStdin();
         value = value.replace(/\r?\n$/, "");
         if (!value) throw new CliError(`secrets set: no value provided for ${key}`, { clause: "cli.invocation" });
+        assertSecretByteLength(key, value);
         const envPath = ctx.envFile ?? join(ctx.configDir, ".env");
-        writeEnvValue(envPath, key, value);
+        writeEnvValue(envPath, key, value, ctx.configPath);
         ok(`set ${key} in ${envPath}`);
         return;
       }
@@ -618,9 +690,40 @@ async function dispatch(argv: string[]): Promise<void> {
       }
       rejectExtraPositionals(positionals, 1);
       rejectUnknownFlags(flags, ["config", "env-file", "sandbox-dir", "target", "from"]);
+      const source = pathFlag(flags, "from");
+      let sourceValues: Map<string, string> | undefined;
+      let sourceIdentity: { dev: bigint; ino: bigint } | undefined;
+      if (source !== undefined) {
+        try {
+          const snapshot = readRegularFileSnapshot(source);
+          sourceIdentity = snapshot.identity;
+          sourceValues = parseEnvFile(snapshot.content);
+        } catch (error) {
+          throw new CliError(
+            `--from must point to an existing readable regular file containing a UTF-8 deployment environment: ${errMessage(error)}`,
+            {
+              cause: error,
+              clause: "cli.invocation",
+            },
+          );
+        }
+      }
       const ctx = deployContext(flags);
-      const from = strFlag(flags, "from") ?? ctx.envFile;
-      return deploymentBackend(ctx).secretsPush(from);
+      if (
+        sourceIdentity !== undefined &&
+        sourceIdentity.dev === ctx.configIdentity.dev &&
+        sourceIdentity.ino === ctx.configIdentity.ino
+      ) {
+        throw new CliError("deployment environment file must be separate from the deployment config");
+      }
+      const values =
+        sourceValues ??
+        readEnvFile(ctx.envFile ?? join(ctx.configDir, ".env"), {
+          required: ctx.envFile !== undefined,
+          protectedIdentity: ctx.configIdentity,
+        });
+      await deploymentBackend(ctx).secretsPush(values);
+      return;
     }
 
     default:
@@ -631,7 +734,11 @@ async function dispatch(argv: string[]): Promise<void> {
 async function readStdin(): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks).toString("utf8");
+  try {
+    return decodeUtf8(Buffer.concat(chunks));
+  } catch (error) {
+    throw new CliError(errMessage(error), { cause: error, clause: "cli.invocation" });
+  }
 }
 
 export async function main(argv: string[]): Promise<void> {

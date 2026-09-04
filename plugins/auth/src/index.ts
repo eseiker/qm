@@ -4,7 +4,7 @@ import { json } from "../../chassis/src/http.ts";
 import { portFromEnv } from "../../chassis/src/env.ts";
 import { bootProblems, readConfig } from "./config.ts";
 import { coreClaimStore } from "../../chassis/src/claims.ts";
-import { signedHeaders, withSourceAuthNonce } from "../../chassis/src/core-client.ts";
+import { signedCoreFetch, withSourceAuthNonce } from "../../chassis/src/core-client.ts";
 import { createBrandingCache } from "../../chassis/src/branding.ts";
 import { mailerFor } from "./email.ts";
 import { loadSigningKey } from "./keys.ts";
@@ -27,8 +27,7 @@ export async function startServer(): Promise<void> {
   const signingKey = await loadSigningKey(CFG.signingJwk!);
   const branding = createBrandingCache(async () => {
     const path = withSourceAuthNonce("/v1/surface-config", CFG.coreSigningSecret);
-    const r = await fetch(`${CFG.coreApiUrl}${path}`, {
-      headers: signedHeaders(CFG.coreSigningSecret, "GET", path),
+    const r = await signedCoreFetch(CFG.coreApiUrl, CFG.coreSigningSecret, "GET", path, {
       signal: AbortSignal.timeout(2_000),
     });
     if (!r.ok) throw new Error(`surface-config ${r.status}`);

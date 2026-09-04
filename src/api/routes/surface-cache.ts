@@ -4,9 +4,9 @@ import { type ApiCtx, type Route } from "./route.ts";
 import type { IngestEvent } from "../../surface-cache/surface-cache.ts";
 
 function strMap(o: Record<string, unknown>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(o)) if (typeof v === "string") out[k] = v;
-  return out;
+  return Object.fromEntries(
+    Object.entries(o).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
 }
 
 export function toEvent(raw: unknown): IngestEvent | null {

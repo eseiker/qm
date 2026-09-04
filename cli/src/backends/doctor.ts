@@ -2,15 +2,32 @@ import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   MODEL_PROVIDER_KEYS,
+  effectiveCoreEnvironment,
+  effectiveModelProvider,
   localSandboxActive,
   mockHarnessWarning,
+  sandboxBackend,
   validatePortalTrust,
   type ModelProvider,
   type QmConfig,
 } from "../config.ts";
 import { CliError, errMessage, step, warn } from "../log.ts";
-import { capture, deploymentSecretValue, flyBin, isInvalidSecret, readEnvFile, which } from "../util.ts";
-import { computedSecrets } from "../secrets.ts";
+import {
+  capture,
+  deploymentSecretValue,
+  flyBin,
+  readEnvFile,
+  senderAddress,
+  validEmail,
+  which,
+  type FileIdentity,
+} from "../util.ts";
+import {
+  computedSecrets,
+  materializeSecretValues,
+  type MaterializedSecretValues,
+  type MissingSecretDestination,
+} from "../secrets.ts";
 
 export function slackManifestBotScopes(manifest: string): string[] {
   try {
@@ -84,7 +101,7 @@ async function slackApi(
   }
 }
 
-async function slackCheck(botToken: string, appToken: string, configDir?: string): Promise<void> {
+async function slackCheck(botToken: string, appToken: string | undefined, configDir?: string): Promise<void> {
   const auth = await slackApi("https://slack.com/api/auth.test", { headers: { authorization: `Bearer ${botToken}` } });
   if (!auth.res.ok || !auth.body.ok)
     throw new CliError(`Slack bot token rejected (${auth.body.error ?? auth.res.status})`);
@@ -99,6 +116,7 @@ async function slackCheck(botToken: string, appToken: string, configDir?: string
     throw new CliError(
       `Slack app is missing scopes: ${missing.join(", ")}; update from slack-app-manifest.yml and reinstall`,
     );
+  if (appToken === undefined) return;
   const socket = await slackApi("https://slack.com/api/apps.connections.open", {
     method: "POST",
     headers: { authorization: `Bearer ${appToken}`, "content-type": "application/x-www-form-urlencoded" },
@@ -107,10 +125,13 @@ async function slackCheck(botToken: string, appToken: string, configDir?: string
     throw new CliError(`Slack app token rejected (${socket.body.error ?? socket.res.status})`);
 }
 
-export function localDoctorSecrets(configDir: string, envFile?: string): Map<string, string> {
+export function localDoctorSecrets(
+  configDir: string,
+  envFile: string | undefined,
+  configIdentity: FileIdentity,
+): Map<string, string> {
   const path = resolve(envFile ?? join(configDir, ".env"));
-  if (envFile && !existsSync(path)) throw new CliError(`--env-file not found: ${envFile}`);
-  return existsSync(path) ? readEnvFile(path) : new Map();
+  return readEnvFile(path, { required: envFile !== undefined, protectedIdentity: configIdentity });
 }
 
 export function requireFlyAuth(): void {
@@ -126,52 +147,120 @@ export function requireFlyAuth(): void {
   }
 }
 
+function availableSecretValues(config: QmConfig, secrets: ReadonlyMap<string, string>): Map<string, string> {
+  const values = new Map<string, string>();
+  for (const secret of computedSecrets(config)) {
+    const value = deploymentSecretValue(secret.name, secrets.get(secret.name));
+    if (value === undefined) continue;
+    values.set(secret.name, value);
+  }
+  return values;
+}
+
+function trustConfig(config: QmConfig, materialized: MaterializedSecretValues): QmConfig {
+  const workloads = config.services.includes("auth") ? (["portal", "auth"] as const) : (["portal"] as const);
+  return {
+    ...config,
+    env: {
+      ...config.env,
+      ...Object.fromEntries(
+        workloads.map((workload) => [
+          workload,
+          {
+            ...config.env[workload],
+            ...Object.fromEntries(materialized.runtimeValues.get(workload) ?? []),
+          },
+        ]),
+      ),
+    },
+  };
+}
+
+function isTrustDestination(config: QmConfig, destination: MissingSecretDestination): boolean {
+  if (config.services.includes("auth")) {
+    return (
+      destination.workload === "auth" &&
+      (destination.name === "AUTH_ALLOWED_EMAILS" || destination.name === "AUTH_ALLOWED_EMAIL_DOMAIN")
+    );
+  }
+  return (
+    destination.workload === "portal" &&
+    ["OIDC_ALLOWED_EMAILS", "OIDC_ALLOWED_EMAIL_DOMAIN", "OIDC_CLIENT_ID", "PORTAL_EXPECTED_TEAM_ID"].includes(
+      destination.name,
+    )
+  );
+}
+
+function missingTrustMessage(destinations: readonly MissingSecretDestination[]): string {
+  const stores = new Map<string, string[]>();
+  for (const destination of destinations) {
+    const names = stores.get(destination.storeName) ?? [];
+    names.push(`${destination.workload}.${destination.name}`);
+    stores.set(destination.storeName, names);
+  }
+  return [...stores].map(([storeName, names]) => `${storeName} (${[...new Set(names)].sort().join(", ")})`).join(", ");
+}
+
 export async function doctorCommon(
   config: QmConfig,
   secrets: Map<string, string>,
   opts: { requiredSecretValues?: boolean; configDir?: string } = {},
 ): Promise<void> {
-  if (opts.requiredSecretValues) {
-    const missing = computedSecrets(config)
-      .filter((secret) => secret.required)
-      .filter((secret) => {
-        const value = deploymentSecretValue(secret.name, secrets.get(secret.name));
-        return isInvalidSecret(secret.name, value);
-      });
-    if (missing.length)
-      throw new CliError(
-        `required secrets are missing or placeholders: ${missing.map((secret) => secret.name).join(", ")}`,
-      );
-    step("required local secret values: ok");
-  }
+  const materialized = materializeSecretValues(config, availableSecretValues(config, secrets), {
+    completeness: opts.requiredSecretValues ? "complete" : "partial",
+    managedBy: "all",
+  });
+  if (opts.requiredSecretValues) step("required local secret values: ok");
   if (localSandboxActive(config)) {
     step("local Docker sandbox: configured");
-  } else if (config.target === "aws") {
+  } else if (sandboxBackend(config) === "sprites") {
+    step(`Sprites sandbox namespace ${config.sandbox?.namePrefix ?? "qm"}: configured`);
+  } else if (sandboxBackend(config) === "aws") {
     step("AWS Lambda MicroVM sandbox: configured");
-  } else if (config.sandbox?.app) {
-    requireFlyAuth();
-    try {
-      capture(flyBin(), ["status", "-a", config.sandbox.app]);
-    } catch (e) {
-      throw new CliError(
-        `fly status -a ${config.sandbox.app} failed: ${errMessage(e)} — does the sandbox app exist and can this account see it?`,
-      );
-    }
-    step(`Fly sandbox ${config.sandbox.app}: ok`);
   } else {
-    step("sandbox: not configured — agents cannot execute commands (HARNESS=mock turns only)");
+    step(`${sandboxBackend(config)} sandbox: configured`);
   }
 
+  if (config.services.includes("portal")) {
+    const missingTrust = materialized.missingRequiredDestinations.filter((destination) =>
+      isTrustDestination(config, destination),
+    );
+    if (missingTrust.length) {
+      warn(
+        `${
+          config.services.includes("auth")
+            ? "built-in sign-in broker and email trust boundary"
+            : "portal OIDC client and tenant trust boundary"
+        }: unverified/write-only; required values are unavailable for ${missingTrustMessage(missingTrust)}`,
+      );
+    } else {
+      const workload = config.services.includes("auth") ? "auth" : "portal";
+      validatePortalTrust(trustConfig(config, materialized), "config", materialized.runtimeValues.get(workload));
+      step(
+        config.services.includes("auth")
+          ? "built-in sign-in broker and email trust boundary: ok"
+          : "portal OIDC client and tenant trust boundary: ok",
+      );
+    }
+  }
   if (config.services.includes("slack")) {
+    const coreEnv = effectiveCoreEnvironment(config);
+    const eventsMode = coreEnv.SLACK_EVENTS_MODE?.trim() === "http" ? "http" : "socket";
+    if (eventsMode === "http") {
+      const port = Number(coreEnv.SLACK_EVENTS_PORT?.trim());
+      if (!Number.isInteger(port) || port < 1 || port > 65_535) {
+        throw new CliError("Slack HTTP events mode requires SLACK_EVENTS_PORT to be an integer from 1 to 65535");
+      }
+    }
     const bot = deploymentSecretValue("SLACK_BOT_TOKEN", secrets.get("SLACK_BOT_TOKEN"));
     const app = deploymentSecretValue("SLACK_APP_TOKEN", secrets.get("SLACK_APP_TOKEN"));
-    if (Boolean(bot) !== Boolean(app)) {
+    if (eventsMode === "socket" && Boolean(bot) !== Boolean(app)) {
       throw new CliError(
         "Slack setup needs both SLACK_BOT_TOKEN and SLACK_APP_TOKEN, or neither when setup is deferred",
       );
     }
-    if (bot && app) {
-      await slackCheck(bot, app, opts.configDir);
+    if (bot && (eventsMode === "http" || app)) {
+      await slackCheck(bot, eventsMode === "socket" ? app : undefined, opts.configDir);
       if (opts.requiredSecretValues) {
         step("Slack tokens and manifest scopes: ok");
       } else if (config.target === "aws") {
@@ -184,20 +273,13 @@ export async function doctorCommon(
     } else if (opts.requiredSecretValues) {
       step("Slack setup: deferred to the admin connector page");
     } else {
+      const names = eventsMode === "http" ? "SLACK_BOT_TOKEN" : "SLACK_BOT_TOKEN/SLACK_APP_TOKEN";
       warn(
         config.target === "aws"
-          ? "SLACK_BOT_TOKEN/SLACK_APP_TOKEN are not in the AWS secret store yet — skipping the live Slack check"
-          : "SLACK_BOT_TOKEN/SLACK_APP_TOKEN values are not available locally — skipping the live Slack check (secret names were verified on the Fly apps)",
+          ? `${names} are not in the AWS secret store yet — skipping the live Slack check`
+          : `${names} values are not available locally — skipping the live Slack check (secret names were verified on the Fly apps)`,
       );
     }
-  }
-  if (config.services.includes("portal")) {
-    validatePortalTrust(config, "config", opts.requiredSecretValues ? secrets : undefined);
-    step(
-      config.services.includes("auth")
-        ? "built-in sign-in broker and email trust boundary: ok"
-        : "portal OIDC client and tenant trust boundary: ok",
-    );
   }
   if (config.services.includes("auth")) await authBrokerCheck(config, secrets, opts.requiredSecretValues === true);
   await baseModelCheck(config, secrets);
@@ -206,7 +288,7 @@ export async function doctorCommon(
 async function baseModelCheck(config: QmConfig, secrets: Map<string, string>): Promise<void> {
   const mockHarness = mockHarnessWarning(config);
   if (mockHarness) warn(mockHarness);
-  const provider = config.modelProvider;
+  const provider = effectiveModelProvider(config);
   if (!provider) {
     step("base model: no modelProvider set — an administrator supplies the key from the Admin page");
     return;
@@ -286,10 +368,10 @@ async function authBrokerCheck(config: QmConfig, secrets: Map<string, string>, h
   const transport = config.env.auth?.AUTH_EMAIL_TRANSPORT?.trim() === "smtp" ? "smtp" : "resend";
   const sender = deploymentSecretValue("AUTH_EMAIL_FROM", secrets.get("AUTH_EMAIL_FROM"));
   if (haveValues) {
-    const address = (/<([^>]+)>\s*$/.exec((sender ?? "").trim())?.[1] ?? sender ?? "").trim();
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(address)) {
+    const address = senderAddress(sender ?? "");
+    if (!validEmail(address)) {
       throw new CliError(
-        `AUTH_EMAIL_FROM must be a verified sender address, optionally as "Name <sender@example.com>" (got ${JSON.stringify(sender ?? "")})`,
+        `AUTH_EMAIL_FROM must be a verified sender address, optionally as "Name <sender@example.com>"`,
       );
     }
     step(`sign-in links send from ${address}`);

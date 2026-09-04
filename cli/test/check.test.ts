@@ -7,8 +7,6 @@ import { runChecks } from "../src/commands/check.ts";
 import type { QmConfig } from "../src/config.ts";
 import { computedSecrets, renderEnvExample } from "../src/secrets.ts";
 
-const PINNED_SANDBOX_IMAGE = `registry.fly.io/acme-sandboxes@sha256:${"b".repeat(64)}`;
-
 const CONFIG: QmConfig = {
   contract: 1,
   orgId: "acme",
@@ -19,13 +17,15 @@ const CONFIG: QmConfig = {
   skills: [],
   env: {},
   imageOverrides: {},
-  sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE },
+  sandbox: { backend: "local", image: "qm-sandbox-local:latest" },
 };
 
 function deployment(setup: (dir: string) => void, config: Partial<QmConfig> = {}): { dir: string; config: QmConfig } {
   const dir = mkdtempSync(join(tmpdir(), "qm-check-"));
   setup(dir);
-  return { dir, config: { ...CONFIG, ...config } };
+  const merged = { ...CONFIG, ...config };
+  if (config.target === "aws" && config.sandbox === undefined) delete merged.sandbox;
+  return { dir, config: merged };
 }
 
 function writeTool(dir: string, id: string, descriptor: object, withExe = true): void {
@@ -72,6 +72,7 @@ test("every Fly deployment requires durable S3-compatible stores", () => {
     region: "sjc",
     flyOrg: "personal",
     services: ["core", "portal"] as QmConfig["services"],
+    sandbox: { backend: "sprites" as const, namePrefix: "acme-sandboxes" },
   };
   const ephemeral = deployment(() => {}, base);
   const durable = deployment(() => {}, {
@@ -109,6 +110,21 @@ test("a SKILL.md missing required frontmatter fails the check", () => {
   }
 });
 
+test("empty and junk-only skill directories fail the check", () => {
+  for (const junk of [false, true]) {
+    const d = deployment((dir) => {
+      const skill = join(dir, "sandbox", "skills", "empty");
+      mkdirSync(skill, { recursive: true });
+      if (junk) writeFileSync(join(skill, ".DS_Store"), "ignored");
+    });
+    try {
+      assert.throws(() => check(d), /skills\/empty\/ has no SKILL\.md/);
+    } finally {
+      rmSync(d.dir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("a tool with no executable and no Dockerfile fails (can't get its binary on PATH)", () => {
   const d = deployment((dir) =>
     writeTool(dir, "needs-bin", { id: "needs-bin", install: { binary: "needs-bin" } }, false),
@@ -134,13 +150,27 @@ test("a tool with no executable BUT a sandbox/Dockerfile passes (Dockerfile inst
   }
 });
 
+test("an external sandbox Dockerfile symlink fails the check", () => {
+  const d = deployment((dir) => {
+    writeTool(dir, "apt-tool", { id: "apt-tool", install: { binary: "apt-tool" } }, false);
+    const external = join(dir, "external.Dockerfile");
+    writeFileSync(external, "FROM external\n");
+    symlinkSync(external, join(dir, "sandbox", "Dockerfile"));
+  });
+  try {
+    assert.throws(() => check(d), /regular file within its root/);
+  } finally {
+    rmSync(d.dir, { recursive: true, force: true });
+  }
+});
+
 test("duplicate tool ids are flagged", () => {
   const d = deployment((dir) => {
     writeTool(dir, "folderA", { id: "same", install: { binary: "same" } });
     writeTool(dir, "folderB", { id: "same", install: { binary: "same" } });
   });
   try {
-    assert.throws(() => check(d), /duplicate tool id "same"/);
+    assert.throws(() => check(d), /duplicate deployment tool id: same/);
   } finally {
     rmSync(d.dir, { recursive: true, force: true });
   }
@@ -263,40 +293,21 @@ test("OS junk files inside a skill dir pass check (push skips them too)", () => 
   }
 });
 
-test("secret-looking literals in plugin and sandbox env fail config.no-secret-values", () => {
+test("secret-looking literals in plugin and service env fail config.no-secret-values", () => {
   const viaPlugin = deployment(() => {}, {
     plugins: [{ name: "linear", image: "ghcr.io/x:1", env: { LINEAR_API_KEY: "lin_x" } }],
   });
-  const viaSandbox = deployment(() => {}, {
-    sandbox: { app: "acme-sandboxes", image: PINNED_SANDBOX_IMAGE, env: { GH_TOKEN: "ghp_x" } },
-  });
   const viaKey = deployment(() => {}, { env: { core: { AWS_SECRET_ACCESS_KEY: "aws_x" } } });
-  const viaCred = deployment(() => {}, {
-    sandbox: {
-      app: "acme-sandboxes",
-      image: PINNED_SANDBOX_IMAGE,
-      env: { PGPASSWORD: "pg_x", GOOGLE_CREDENTIALS: "{}" },
-    },
-  });
   const benign = deployment(() => {}, {
-    sandbox: {
-      app: "acme-sandboxes",
-      image: PINNED_SANDBOX_IMAGE,
-      env: { JWT_PUBLIC_KEY: "MFkw...", GOOGLE_APPLICATION_CREDENTIALS: "/run/secrets/gcp.json" },
-    },
+    env: { core: { JWT_PUBLIC_KEY: "MFkw...", GOOGLE_APPLICATION_CREDENTIALS: "/run/secrets/gcp.json" } },
   });
   try {
     assert.throws(() => check(viaPlugin), /plugins\.linear\.LINEAR_API_KEY belongs in the target secret store/);
-    assert.throws(() => check(viaSandbox), /sandbox\.GH_TOKEN belongs in the target secret store/);
     assert.throws(() => check(viaKey), /core\.AWS_SECRET_ACCESS_KEY belongs in the target secret store/);
-    assert.throws(() => check(viaCred), /sandbox\.PGPASSWORD belongs in the target secret store/);
-    assert.throws(() => check(viaCred), /sandbox\.GOOGLE_CREDENTIALS belongs in the target secret store/);
     check(benign);
   } finally {
     rmSync(viaPlugin.dir, { recursive: true, force: true });
-    rmSync(viaSandbox.dir, { recursive: true, force: true });
     rmSync(viaKey.dir, { recursive: true, force: true });
-    rmSync(viaCred.dir, { recursive: true, force: true });
     rmSync(benign.dir, { recursive: true, force: true });
   }
 });
@@ -427,11 +438,11 @@ test("plaintext config env colliding with a secretEnv name (plain or alias) fail
   });
   const aliased = deployment(() => {}, {
     env: { core: { APPS_SESSION_ALIAS: "plaintext" } },
-    secretEnv: { core: { APPS_SESSION_ALIAS: "PORTAL_SESSION_SECRET" } },
+    secretEnv: { core: { APPS_SESSION_ALIAS: "EXTRA_API_KEY" } },
   });
   try {
-    assert.throws(() => check(plain), /core\.EXTRA_CDP_URL belongs in the target secret store/);
-    assert.throws(() => check(aliased), /core\.APPS_SESSION_ALIAS belongs in the target secret store/);
+    assert.throws(() => check(plain), /core would receive secret env EXTRA_CDP_URL .* configured as plaintext/);
+    assert.throws(() => check(aliased), /core would receive secret env APPS_SESSION_ALIAS .* configured as plaintext/);
   } finally {
     rmSync(plain.dir, { recursive: true, force: true });
     rmSync(aliased.dir, { recursive: true, force: true });
@@ -465,7 +476,7 @@ test("a delivered secret name shadowing renderer-derived env fails config.secret
     );
     assert.throws(
       () => check(overridden),
-      /core\.S3_BUCKET belongs in the target secret store|core env S3_BUCKET/,
+      /core\.S3_BUCKET belongs in the target secret store|core env S3_BUCKET|core would receive secret env S3_BUCKET/,
       "a config-env override colliding with a delivered secret is still an error",
     );
     check(benign);

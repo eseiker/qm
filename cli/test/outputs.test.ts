@@ -1,5 +1,15 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  linkSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -86,6 +96,66 @@ test("outputs rejects stale manifests and slack render repairs them", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("Slack rendering rejects final symlink and hardlink aliases", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-outputs-safe-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const sentinel = join(dir, "sentinel.yml");
+  const manifest = join(dir, "slack-app-manifest.yml");
+  writeFileSync(sentinel, "sentinel\n");
+  symlinkSync(sentinel, manifest);
+  assert.throws(() => renderSlackFiles(config, dir), /safe rendered output file/);
+  assert.equal(readFileSync(sentinel, "utf8"), "sentinel\n");
+  rmSync(manifest);
+  linkSync(sentinel, manifest);
+  assert.throws(() => renderSlackFiles(config, dir), /safe rendered output file/);
+  assert.equal(readFileSync(sentinel, "utf8"), "sentinel\n");
+});
+
+test("Slack rendering rejects unsafe aliases when removing an obsolete SSO manifest", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-outputs-safe-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const sentinel = join(dir, "sentinel.yml");
+  const manifest = join(dir, "slack-sso-manifest.yml");
+  writeFileSync(sentinel, "sentinel\n");
+  symlinkSync(sentinel, manifest);
+  assert.throws(() => renderSlackFiles(config, dir), /safe rendered output file/);
+  assert.equal(readFileSync(sentinel, "utf8"), "sentinel\n");
+  rmSync(manifest);
+  linkSync(sentinel, manifest);
+  assert.throws(() => renderSlackFiles(config, dir), /safe rendered output file/);
+  assert.equal(readFileSync(sentinel, "utf8"), "sentinel\n");
+});
+
+test("outputs rejects bot and SSO manifest aliases without following them", (t) => {
+  for (const [current, name] of [
+    [config, "slack-app-manifest.yml"],
+    [slackOidcConfig, "slack-sso-manifest.yml"],
+  ] as const) {
+    const dir = mkdtempSync(join(tmpdir(), "qm-outputs-safe-read-"));
+    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    renderSlackFiles(current, dir);
+    const manifest = join(dir, name);
+    const sentinel = join(dir, `${name}.sentinel`);
+    writeFileSync(sentinel, readFileSync(manifest));
+    rmSync(manifest);
+    symlinkSync(sentinel, manifest);
+    assert.throws(() => deploymentOutputs(current, dir), /safe rendered output file/);
+    rmSync(manifest);
+    linkSync(sentinel, manifest);
+    assert.throws(() => deploymentOutputs(current, dir), /safe rendered output file/);
+  }
+});
+
+test("outputs rejects an oversized sparse manifest without changing it", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-outputs-bounded-read-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  renderSlackFiles(config, dir);
+  const manifest = join(dir, "slack-app-manifest.yml");
+  truncateSync(manifest, 1_048_577);
+  assert.throws(() => deploymentOutputs(config, dir), /1048576-byte rendered file limit/);
+  assert.equal(statSync(manifest).size, 1_048_577);
 });
 
 test("outputs requires the hosted user surfaces", () => {

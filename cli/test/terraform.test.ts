@@ -1,7 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { awsObjectStoreBucket, declaredVariables, terraformVars, terraformVarsDrift } from "../src/terraform.ts";
+import {
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  awsObjectStoreBucket,
+  declaredVariables,
+  renderTerraformVars,
+  terraformVars,
+  terraformVarsDrift,
+} from "../src/terraform.ts";
 import type { QmConfig } from "../src/config.ts";
 
 const DEPLOY_IMAGE = "acme-qm-sandbox";
@@ -16,7 +34,6 @@ const config: QmConfig = {
   skills: [],
   env: { core: { AWS_DEPLOY_IMAGE: DEPLOY_IMAGE } },
   imageOverrides: {},
-  sandbox: { app: "acme-sandboxes" },
   aws: {
     accountId: "123456789012",
     region: "us-west-2",
@@ -410,4 +427,64 @@ test("drift check flags wrong derived values but never operator formatting", () 
   const wrongServices = rendered.replace('"cpu": 2048', '"cpu": 1024');
   assert.deepEqual(terraformVarsDrift(config, wrongServices, declared), ["services"]);
   assert.ok(terraformVarsDrift(config, "", declared).length >= 8, "an empty file drifts on every derived var");
+});
+
+test("Terraform rendering rejects final symlink and hardlink aliases", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-terraform-safe-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const infra = join(dir, "infra");
+  const sentinel = join(dir, "sentinel.tfvars");
+  const target = join(infra, "terraform.tfvars");
+  mkdirSync(infra);
+  writeFileSync(sentinel, "sentinel\n");
+  symlinkSync(sentinel, target);
+  assert.throws(() => renderTerraformVars(config, dir), /safe rendered output file/);
+  assert.equal(readFileSync(sentinel, "utf8"), "sentinel\n");
+  rmSync(target);
+  linkSync(sentinel, target);
+  assert.throws(() => renderTerraformVars(config, dir), /safe rendered output file/);
+  assert.equal(readFileSync(sentinel, "utf8"), "sentinel\n");
+});
+
+test("Terraform rendering rejects a symlinked infra ancestor", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-terraform-safe-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const outside = join(dir, "outside");
+  const target = join(outside, "terraform.tfvars");
+  mkdirSync(outside);
+  writeFileSync(target, "sentinel\n");
+  symlinkSync(outside, join(dir, "infra"), "dir");
+  assert.throws(() => renderTerraformVars(config, dir), /unsafe parent directory/);
+  assert.equal(readFileSync(target, "utf8"), "sentinel\n");
+});
+
+test("Terraform rendering rejects variables.tf symlink and hardlink aliases", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-terraform-safe-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const infra = join(dir, "infra");
+  const target = join(infra, "terraform.tfvars");
+  const variables = join(infra, "variables.tf");
+  const sentinel = join(dir, "sentinel.tf");
+  mkdirSync(infra);
+  writeFileSync(target, "sentinel\n");
+  writeFileSync(sentinel, 'variable "github_repository" {}\n');
+  symlinkSync(sentinel, variables);
+  assert.throws(() => renderTerraformVars(config, dir), /safe rendered output file/);
+  assert.equal(readFileSync(target, "utf8"), "sentinel\n");
+  rmSync(variables);
+  linkSync(sentinel, variables);
+  assert.throws(() => renderTerraformVars(config, dir), /safe rendered output file/);
+  assert.equal(readFileSync(target, "utf8"), "sentinel\n");
+});
+
+test("Terraform rendering rejects an oversized sparse tfvars without changing it", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-terraform-bounded-read-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const infra = join(dir, "infra");
+  const target = join(infra, "terraform.tfvars");
+  mkdirSync(infra);
+  writeFileSync(target, "sentinel\n");
+  truncateSync(target, 1_048_577);
+  assert.throws(() => renderTerraformVars(config, dir), /1048576-byte rendered file limit/);
+  assert.equal(statSync(target).size, 1_048_577);
 });

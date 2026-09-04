@@ -5,15 +5,17 @@ description: Drive a real stealth browser from your shell — act on websites (o
 
 # Browse (the skill-based browser)
 
-This is the platform's browser: the logic lives in this skill and runs in your shell; only
-the heavy runtime (browser-use + Chromium) is baked into your computer's image at
-`/opt/browser-engine/venv`. The browser itself is a remote stealth browser you drive over
-CDP, hosted by whichever provider the deployment configures. It is slow and expensive — for _acting on_ a site, not
-reading one. To retrieve information (read a page, check a price, hit an API), reach for
-`curl`/`wget` first; browse only when you must interact — sign in, fill and submit forms,
-click through a flow — or when a plain fetch is genuinely blocked by heavy JS or a bot wall.
-(To verify a localhost site you built, don't use this at all — a remote browser can't reach
-your loopback; use the local headless `chromium` binary.)
+This is the platform's browser: the logic lives in this skill and runs in your shell. It
+needs the browser-use runtime at `/opt/browser-engine/venv`, but agent-computer inventory
+varies by backend; Docker's released local base includes it, while current Sprites and
+Lambda MicroVM computers do not. Check the path before starting. The browser itself is a
+remote stealth browser you drive over CDP, hosted by whichever provider the deployment
+configures. It is slow and expensive — for _acting on_ a site, not reading one. To retrieve
+information (read a page, check a price, hit an API), reach for `curl`/`wget` first; browse
+only when you must interact — sign in, fill and submit forms, click through a flow — or when
+a plain fetch is genuinely blocked by heavy JS or a bot wall. To verify a localhost site,
+use a local browser only when the computer inventory confirms one is installed; a remote
+browser cannot reach loopback.
 
 ## Pick the provider
 
@@ -152,8 +154,16 @@ in it; it rides only as a runner argument, never into chat or logs.
 
 ## 2. Run the task with the embedded runner
 
-The runtime is already on your computer at `/opt/browser-engine/venv` — do not pip install.
-Write the runner once per session, then invoke it per task:
+First verify the managed runtime exists:
+
+```bash
+test -x /opt/browser-engine/venv/bin/python
+```
+
+If it is absent, stop and report that this agent-computer backend does not provide the
+browser engine. Do not assume a Sprites or Lambda MicroVM deployment can consume the Docker
+local base, and do not pip-install over a managed runtime. When it exists, write the runner
+once per session, then invoke it per task:
 
 ```bash
 cat > /tmp/browse-runner.py <<'PY'

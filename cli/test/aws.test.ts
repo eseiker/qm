@@ -1,22 +1,37 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash, generateKeyPairSync } from "node:crypto";
+import { EventEmitter, once } from "node:events";
+import fs, {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import {
   assertAwsDeploymentStorage,
   assertAwsPublicListener,
+  awsDeploymentLayerTransport,
   assertGithubDeployTrust,
-  awsCheckLive,
+  awsCheckLive as awsCheckLiveWithIdentity,
+  awsDoctor,
   awsDown,
   awsLogs,
-  awsPinSandbox,
+  awsPreflightUp as awsPreflightUpWithIdentity,
   awsRollback,
   awsSecretsPush,
   awsStatus,
-  awsUp,
+  awsUp as awsUpWithIdentity,
   githubTrustSubject,
   imageTransferArgs,
   isPinnedWorkloadImage,
@@ -26,11 +41,14 @@ import {
   taskDefinitionChanges,
   taskDefinitionDiff,
 } from "../src/backends/aws.ts";
-import type { QmConfig } from "../src/config.ts";
+import { effectiveDeployAppsDomain, type QmConfig } from "../src/config.ts";
 import { computedSecrets } from "../src/secrets.ts";
 import { awsObjectStoreBucket } from "../src/terraform.ts";
-import { withAwsLease } from "../src/aws-lease.ts";
-import { cliVersion, manifestRef } from "../src/manifest.ts";
+import { awsRunInherit, awsText, withAwsLease } from "../src/aws-lease.ts";
+import { manifestRef } from "../src/manifest.ts";
+import { hostingProvider, prepareUpSubstrate, type DeployContext } from "../src/backends/registry.ts";
+import { microvmBuildArchiveSha256 } from "../src/commands/infra.ts";
+import { readEnvFile, type FileIdentity } from "../src/util.ts";
 
 process.env.QM_AWS_ROLLOUT_POLL_MS = "5";
 process.env.QM_AWS_LIVE_PROBE_POLL_MS = "5";
@@ -43,6 +61,87 @@ const EMPTY_LAYER = {
   sha256: createHash("sha256").update(EMPTY_LAYER_BODY).digest("hex"),
 };
 const TEST_SECRET_VALUE = "test-secret-value".repeat(3);
+const TEST_AUTH_SIGNING_JWK = JSON.stringify(
+  generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export({ format: "jwk" }),
+);
+const TEST_CONFIG_IDENTITY: FileIdentity = { dev: -1n, ino: -1n };
+
+function configIdentity(path: string): FileIdentity {
+  const stat = statSync(path, { bigint: true });
+  return { dev: stat.dev, ino: stat.ino };
+}
+
+function awsUp(
+  config: QmConfig,
+  configDir: string,
+  opts: Omit<Parameters<typeof awsUpWithIdentity>[2], "configIdentity"> & { configIdentity?: FileIdentity },
+): Promise<void> {
+  return awsUpWithIdentity(config, configDir, {
+    ...opts,
+    configIdentity: opts.configIdentity ?? TEST_CONFIG_IDENTITY,
+  });
+}
+
+function awsPreflightUp(
+  config: QmConfig,
+  configDir: string,
+  opts: Omit<Parameters<typeof awsPreflightUpWithIdentity>[2], "configIdentity"> & {
+    configIdentity?: FileIdentity;
+  },
+) {
+  return awsPreflightUpWithIdentity(config, configDir, {
+    ...opts,
+    configIdentity: opts.configIdentity ?? TEST_CONFIG_IDENTITY,
+  });
+}
+
+function awsCheckLive(
+  config: QmConfig,
+  opts: Omit<Parameters<typeof awsCheckLiveWithIdentity>[1], "configIdentity"> & {
+    configIdentity?: FileIdentity;
+  } = {},
+): Promise<void> {
+  return awsCheckLiveWithIdentity(config, {
+    ...opts,
+    configIdentity: opts.configIdentity ?? TEST_CONFIG_IDENTITY,
+  });
+}
+
+function selectedTestSecretValue(name: string): string {
+  if (name === "AUTH_SIGNING_JWK") return TEST_AUTH_SIGNING_JWK;
+  if (name === "AUTH_EMAIL_FROM") return "Acme <no-reply@example.com>";
+  if (name === "AUTH_ALLOWED_EMAILS") return "admin@example.com";
+  if (name === "CORE_SIGNING_SECRET") return TEST_SECRET_VALUE;
+  if (name === "PUBLIC_API_URL") return "https://agent.acme.example";
+  return `${name.toLowerCase()}-${TEST_SECRET_VALUE}`;
+}
+
+function testSecretArn(name: string): string {
+  return `arn:aws:secretsmanager:us-west-2:123456789012:secret:acme/qm/${name}-AbCdEf`;
+}
+
+function testSecretValues(dir: string, path = join(dir, ".env")): ReadonlyMap<string, string> {
+  return readEnvFile(path);
+}
+
+async function withFakeStdin<T>(fn: (emit: (bytes: Buffer) => void) => Promise<T>): Promise<T> {
+  const fake = Object.assign(new EventEmitter(), {
+    isTTY: true,
+    setRawMode(): void {},
+    resume(): void {},
+    pause(): void {},
+  });
+  const descriptor = Object.getOwnPropertyDescriptor(process, "stdin")!;
+  const write = process.stdout.write.bind(process.stdout);
+  Object.defineProperty(process, "stdin", { value: fake, configurable: true });
+  process.stdout.write = (() => true) as typeof process.stdout.write;
+  try {
+    return await fn((bytes) => void fake.emit("data", bytes));
+  } finally {
+    process.stdout.write = write;
+    Object.defineProperty(process, "stdin", descriptor);
+  }
+}
 
 function fakeAws(
   dir: string,
@@ -78,6 +177,7 @@ function fakeAws(
             Conditions: [{ Field: "path-pattern", PathPatternConfig: { Values: ["/v1/*"] } }],
           },
         ];
+  const appCertificateNames = coreHosts.filter((host) => host.startsWith("*."));
   writeFileSync(log, "");
   writeFileSync(
     bin,
@@ -87,12 +187,42 @@ const a = process.argv.slice(2).join(" ");
 fs.appendFileSync(${JSON.stringify(log)}, a + "\\n");
 if (a.includes("sts get-caller-identity")) console.log(process.env.AWS_FAKE_ACCOUNT || "123456789012");
 else if (a.includes("lambda-microvms get-microvm-image")) {
+  if (process.env.AWS_FAKE_LAMBDA_UNSUPPORTED === "1") {
+    console.error("invalid choice: 'lambda-microvms'");
+    process.exit(2);
+  }
+  if (process.env.AWS_FAKE_IMAGE_MISSING === "1") {
+    console.error("ResourceNotFoundException: image does not exist");
+    process.exit(2);
+  }
+  if (process.env.AWS_FAKE_IMAGE_DENIED === "1") {
+    console.error("AccessDeniedException: denied");
+    process.exit(2);
+  }
+  if (process.env.AWS_FAKE_IMAGE_DENIED === "secondary") {
+    console.error("An error occurred (AccessDeniedException) when calling the GetMicrovmImage operation: resource acme-ResourceNotFoundException is denied");
+    process.exit(2);
+  }
+  if (process.env.AWS_FAKE_IMAGE_RESPONSE === "empty") process.exit(0);
+  if (process.env.AWS_FAKE_IMAGE_RESPONSE === "malformed") {
+    console.log("{}");
+    process.exit(0);
+  }
+  if (process.env.AWS_FAKE_IMAGE_RESPONSE === "null") {
+    console.log("null");
+    process.exit(0);
+  }
   const args = process.argv.slice(2);
   const id = args[args.indexOf("--image-identifier") + 1];
   const imageArn = id.startsWith("arn:") ? id : "arn:aws:lambda:us-west-2:123456789012:microvm-image:" + id;
   console.log(JSON.stringify({ imageArn }));
 }
-else if (a.includes("lambda-microvms list-microvm-image-versions")) console.log(JSON.stringify({ items: [{ imageVersion: process.env.AWS_FAKE_IMAGE_VERSION || "1", state: process.env.AWS_FAKE_IMAGE_STATE || "SUCCESSFUL", status: process.env.AWS_FAKE_IMAGE_STATUS || "ACTIVE" }] }));
+else if (a.includes("lambda-microvms list-microvm-image-versions")) {
+  if (process.env.AWS_FAKE_IMAGE_RESPONSE === "empty-versions") process.exit(0);
+  if (process.env.AWS_FAKE_IMAGE_RESPONSE === "malformed-versions") console.log("{}");
+  else if (process.env.AWS_FAKE_IMAGE_RESPONSE === "malformed-version-type") console.log(JSON.stringify({ items: [{ imageVersion: ["1"], state: "SUCCESSFUL", status: "ACTIVE" }] }));
+  else console.log(JSON.stringify({ items: [{ imageVersion: process.env.AWS_FAKE_IMAGE_VERSION || "1", state: process.env.AWS_FAKE_IMAGE_RESPONSE === "unknown-version-state" ? "UNKNOWN" : process.env.AWS_FAKE_IMAGE_STATE || "SUCCESSFUL", status: process.env.AWS_FAKE_IMAGE_RESPONSE === "unknown-version-status" ? "UNKNOWN" : process.env.AWS_FAKE_IMAGE_STATUS || "ACTIVE" }] }));
+}
 else if (a.includes("elbv2 describe-load-balancers")) console.log(JSON.stringify({ LoadBalancers: [{ LoadBalancerArn: "arn:aws:elasticloadbalancing:us-west-2:123456789012:loadbalancer/app/test/1", DNSName: process.env.AWS_FAKE_ALB_DNS || "agent.acme.example", State: { Code: "active" } }] }));
 else if (a.includes("elbv2 describe-listeners")) {
   const protocol = process.env.AWS_FAKE_LISTENER_PROTOCOL || "HTTPS";
@@ -101,6 +231,28 @@ else if (a.includes("elbv2 describe-listeners")) {
   if (process.env.AWS_FAKE_EXTRA_HTTP_LISTENER === "redirect") listeners.push({ ListenerArn: "arn:aws:elasticloadbalancing:us-west-2:123456789012:listener/app/test/1/3", Protocol: "HTTP", Port: 80, Certificates: [], DefaultActions: [{ Type: "redirect", RedirectConfig: { Protocol: "HTTPS", Port: "443", StatusCode: "HTTP_301" } }] });
   if (process.env.AWS_FAKE_EXTRA_HTTP_LISTENER === "forward") listeners.push({ ListenerArn: "arn:aws:elasticloadbalancing:us-west-2:123456789012:listener/app/test/1/3", Protocol: "HTTP", Port: 80, Certificates: [], DefaultActions: [{ Type: "forward", TargetGroupArn: ${JSON.stringify(targetArn)} }] });
   console.log(JSON.stringify({ Listeners: listeners }));
+}
+else if (a.includes("elbv2 describe-listener-certificates")) {
+  const mode = process.env.AWS_FAKE_LISTENER_CERTIFICATE_RESPONSE;
+  if (mode === "malformed") console.log("[]");
+  else if (mode === "missing") console.log("{}");
+  else if (mode === "missing-arn") console.log(JSON.stringify({ Certificates: [{}] }));
+  else if (mode === "repeated-marker") console.log(JSON.stringify({ Certificates: [{ CertificateArn: "arn:aws:acm:us-west-2:123456789012:certificate/portal" }], NextMarker: "same" }));
+  else if (mode === "paginated" && !a.includes("--marker page-2")) console.log(JSON.stringify({ Certificates: [{ CertificateArn: "arn:aws:acm:us-west-2:123456789012:certificate/portal" }], NextMarker: "page-2" }));
+  else if (mode === "paginated") console.log(JSON.stringify({ Certificates: [{ CertificateArn: "arn:aws:acm:us-west-2:123456789012:certificate/apps" }] }));
+  else console.log(JSON.stringify({ Certificates: [{ CertificateArn: "arn:aws:acm:us-west-2:123456789012:certificate/test" }] }));
+}
+else if (a.includes("acm describe-certificate")) {
+  const arn = process.argv[process.argv.indexOf("--certificate-arn") + 1];
+  const mode = process.env.AWS_FAKE_ACM_RESPONSE;
+  if (mode === "malformed") console.log("[]");
+  else if (mode === "missing") console.log("{}");
+  else if (mode === "missing-sans") console.log(JSON.stringify({ Certificate: { CertificateArn: arn } }));
+  else if (mode === "mismatch") console.log(JSON.stringify({ Certificate: { CertificateArn: arn + "-other", SubjectAlternativeNames: ${JSON.stringify(appCertificateNames)} } }));
+  else {
+    const names = mode === "portal-only" || arn.endsWith("/portal") ? ["*.agent.acme.example"] : ${JSON.stringify(appCertificateNames)};
+    console.log(JSON.stringify({ Certificate: { CertificateArn: arn, SubjectAlternativeNames: names } }));
+  }
 }
 else if (a.includes("elbv2 describe-target-groups")) console.log(JSON.stringify({ TargetGroups: ${JSON.stringify(groups)} }));
 else if (a.includes("elbv2 describe-rules")) {
@@ -146,6 +298,7 @@ function statefulAws(
     failTransactions?: boolean;
     failTransactionPuts?: number;
     failPromotion?: boolean;
+    failCleanup?: boolean;
     promotionAlreadyCurrent?: boolean;
     drainRollout?: boolean;
     primaryFailedTasks?: boolean;
@@ -153,10 +306,13 @@ function statefulAws(
     transientFailedTaskPolls?: number;
     alternateStaleReadPolls?: number;
     foreignServiceTags?: boolean;
+    foreignServiceTagsAfterLease?: boolean;
     snapshotStatus?: string;
     snapshotCreatingPolls?: number;
     failSnapshotDescribes?: number;
     failSnapshotDelete?: boolean;
+    leaseLossMarker?: string;
+    staleTaskDefinition?: boolean;
   } = {},
 ): {
   log: string;
@@ -172,7 +328,7 @@ function statefulAws(
       const host = new URL(api).hostname.toLowerCase().replace(/\.$/, "");
       if (host !== new URL(configured.publicUrl).hostname.toLowerCase()) coreHosts.push(host);
     }
-    const apps = configured.env.core?.AWS_DEPLOY_APPS_DOMAIN;
+    const apps = effectiveDeployAppsDomain(configured);
     if (apps) coreHosts.push(`*.${apps.toLowerCase().replace(/\.$/, "")}`);
   }
   const targetGroups = Object.fromEntries(
@@ -197,11 +353,41 @@ function statefulAws(
       },
     ]),
   );
+  const taskReferences = new Map(Object.values(services).map((service) => [service.taskDefinition, service.workload]));
+  for (const item of Object.values(initialDynamo)) {
+    if (!item.manifest?.S) continue;
+    const manifest = JSON.parse(item.manifest.S) as { tasks?: Record<string, string> };
+    for (const [workload, task] of Object.entries(manifest.tasks ?? {})) taskReferences.set(task, workload);
+  }
+  const definitions: Record<string, unknown> = {};
+  try {
+    const arns = Object.fromEntries(
+      computedSecrets(configured).map((secret) => [secret.name, testSecretArn(secret.name)]),
+    );
+    for (const [task, workload] of taskReferences) {
+      const repository = configured.aws!.services[workload]?.ecrRepository;
+      if (!repository) continue;
+      definitions[task] = {
+        ...renderTaskDefinition(
+          configured,
+          workload,
+          `123456789012.dkr.ecr.us-west-2.amazonaws.com/${repository}@sha256:${(opts.staleTaskDefinition
+            ? "b"
+            : "a"
+          ).repeat(64)}`,
+          arns,
+        ),
+        taskDefinitionArn: task,
+      };
+    }
+  } catch {
+    for (const task of Object.keys(definitions)) delete definitions[task];
+  }
   writeFileSync(
     state,
     JSON.stringify({
       services,
-      definitions: {},
+      definitions,
       dynamo: initialDynamo,
       objects: { [EMPTY_LAYER.key]: EMPTY_LAYER_BODY },
       rdsSnapshots: [],
@@ -216,14 +402,90 @@ const statePath = ${JSON.stringify(state)};
 const s = JSON.parse(fs.readFileSync(statePath, "utf8"));
 const save = () => fs.writeFileSync(statePath, JSON.stringify(s));
 const after = (flag) => args[args.indexOf(flag) + 1];
-if (a.includes("secretsmanager get-secret-value") && !a.includes("--query")) console.log(JSON.stringify({ ARN: "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf", SecretString: a.includes("PUBLIC_API_URL") ? (process.env.AWS_FAKE_PUBLIC_API_URL || ${JSON.stringify(configured.apiUrl ?? configured.publicUrl)}) : (a.includes("CORE_SIGNING_SECRET") && process.env.AWS_FAKE_SECRET_VALUE || ${JSON.stringify(TEST_SECRET_VALUE)}) }));
-else if (a.includes("secretsmanager get-secret-value") && a.includes("--query SecretString")) console.log(a.includes("PUBLIC_API_URL") ? (process.env.AWS_FAKE_PUBLIC_API_URL || ${JSON.stringify(configured.apiUrl ?? configured.publicUrl)}) : (a.includes("CORE_SIGNING_SECRET") && process.env.AWS_FAKE_SECRET_VALUE || ${JSON.stringify(TEST_SECRET_VALUE)}));
-else if (a.includes("secretsmanager get-secret-value") && a.includes("--query ARN")) console.log("arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf");
+if (a.includes("secretsmanager describe-secret")) {
+  const secretId = after("--secret-id");
+  console.log(JSON.stringify({ ARN: process.env.AWS_FAKE_DESCRIBE_SECRET_ARN || "arn:aws:secretsmanager:us-west-2:123456789012:secret:" + secretId + "-AbCdEf" }));
+}
+else if (a.includes("secretsmanager get-secret-value") && !a.includes("--query")) {
+  const secretId = after("--secret-id");
+  const secretName = secretId.split("/").at(-1);
+  const secretOverrides = JSON.parse(process.env.AWS_FAKE_SECRET_OVERRIDES || "{}");
+  const storedSecrets = s.secretValues || {};
+  if (secretName === process.env.AWS_FAKE_MISSING_SECRET_NAME && !Object.hasOwn(storedSecrets, secretName)) {
+    console.error("ResourceNotFoundException: Secrets Manager can't find the specified secret value");
+    process.exit(1);
+  }
+  let secret = Object.hasOwn(storedSecrets, secretName)
+    ? storedSecrets[secretName]
+    : Object.hasOwn(secretOverrides, secretName)
+    ? secretOverrides[secretName]
+    : secretName === "PUBLIC_API_URL"
+    ? (process.env.AWS_FAKE_PUBLIC_API_URL || ${JSON.stringify(configured.apiUrl ?? configured.publicUrl)})
+    : secretName === "CORE_SIGNING_SECRET"
+      ? (process.env.AWS_FAKE_SECRET_VALUE || ${JSON.stringify(TEST_SECRET_VALUE)})
+      : secretName + "-" + ${JSON.stringify(TEST_SECRET_VALUE)};
+  if (a.includes("CORE_SIGNING_SECRET") && process.env.AWS_FAKE_ROTATE_SIGNING_SECRET === "1") {
+    s.coreSigningReads = (s.coreSigningReads || 0) + 1;
+    save();
+    if (s.coreSigningReads > 1) secret = ${JSON.stringify(`${TEST_SECRET_VALUE}-rotated`)};
+  }
+  if (secretName === process.env.AWS_FAKE_ROTATE_SECRET_NAME) {
+    s.rotatedSecretReads = (s.rotatedSecretReads || 0) + 1;
+    save();
+    if (s.rotatedSecretReads > 1) secret = process.env.AWS_FAKE_ROTATED_SECRET_VALUE || "replace-me";
+  }
+  if (process.env.AWS_FAKE_NUL_SECRET_NAME && a.includes(process.env.AWS_FAKE_NUL_SECRET_NAME)) {
+    secret = "remote" + String.fromCharCode(0) + "sentinel";
+  }
+  let secretArn = process.env.AWS_FAKE_SECRET_ARN || "arn:aws:secretsmanager:us-west-2:123456789012:secret:" + secretId + "-AbCdEf";
+  if (secretName === "CORE_SIGNING_SECRET" && process.env.AWS_FAKE_ROTATE_SECRET_ARN === "1") {
+    s.coreSigningArnReads = (s.coreSigningArnReads || 0) + 1;
+    save();
+    if (s.coreSigningArnReads > 1) secretArn = "arn:aws:secretsmanager:us-west-2:999999999999:secret:" + secretId + "-AbCdEf";
+  }
+  console.log(JSON.stringify({ ARN: secretArn, SecretString: secret }));
+}
+else if (a.includes("secretsmanager get-secret-value") && a.includes("--query SecretString")) {
+  const secretName = after("--secret-id").split("/").at(-1);
+  const secretOverrides = JSON.parse(process.env.AWS_FAKE_SECRET_OVERRIDES || "{}");
+  const storedSecrets = s.secretValues || {};
+  if (secretName === process.env.AWS_FAKE_MISSING_SECRET_NAME && !Object.hasOwn(storedSecrets, secretName)) {
+    console.error("ResourceNotFoundException: Secrets Manager can't find the specified secret value");
+    process.exit(1);
+  }
+  let secret = Object.hasOwn(storedSecrets, secretName)
+    ? storedSecrets[secretName]
+    : Object.hasOwn(secretOverrides, secretName)
+    ? secretOverrides[secretName]
+    : secretName === "PUBLIC_API_URL"
+    ? (process.env.AWS_FAKE_PUBLIC_API_URL || ${JSON.stringify(configured.apiUrl ?? configured.publicUrl)})
+    : secretName === "CORE_SIGNING_SECRET"
+      ? (process.env.AWS_FAKE_SECRET_VALUE || ${JSON.stringify(TEST_SECRET_VALUE)})
+      : secretName + "-" + ${JSON.stringify(TEST_SECRET_VALUE)};
+  if (process.env.AWS_FAKE_NUL_SECRET_NAME && a.includes(process.env.AWS_FAKE_NUL_SECRET_NAME)) {
+    secret = "remote" + String.fromCharCode(0) + "sentinel";
+  }
+  console.log(secret);
+}
+else if (a.includes("secretsmanager get-secret-value") && a.includes("--query ARN")) {
+  const secretId = after("--secret-id");
+  console.log(process.env.AWS_FAKE_SECRET_ARN || "arn:aws:secretsmanager:us-west-2:123456789012:secret:" + secretId + "-AbCdEf");
+}
+else if (a.includes("secretsmanager put-secret-value")) {
+  const secretName = after("--secret-id").split("/").at(-1);
+  s.lastSecretValues = s.lastSecretValues || {};
+  s.secretValues = s.secretValues || {};
+  s.lastSecretValues[secretName] = fs.readFileSync(0, "utf8");
+  s.secretValues[secretName] = s.lastSecretValues[secretName];
+  save();
+  console.log("");
+}
 else if (a.includes("ecr get-login-password")) console.log("pw");
 else if (a.includes("ecr batch-get-image")) console.log(JSON.stringify({ images: [{ imageManifest: "{}", imageManifestMediaType: "application/vnd.oci.image.index.v1+json" }] }));
 else if (a.includes("ecr put-image") && ${JSON.stringify(opts.failPromotion ?? false)}) { console.error("PutImageFailure"); process.exit(1); }
 else if (a.includes("ecr put-image") && ${JSON.stringify(opts.promotionAlreadyCurrent ?? false)}) { console.error("ImageAlreadyExistsException"); process.exit(1); }
 else if (a.includes("ecr put-image")) console.log(JSON.stringify({ image: { imageId: { imageDigest: "sha256:${"a".repeat(64)}" } } }));
+else if (a.includes("ecr batch-delete-image") && ${JSON.stringify(opts.failCleanup ?? false)}) { console.error("AccessDeniedException"); process.exit(1); }
 else if (a.includes("ecr describe-images")) console.log(JSON.stringify({ imageDetails: [{ imageDigest: "sha256:${"a".repeat(64)}" }] }));
 else if (a.includes("ecs describe-services") && ${JSON.stringify(opts.failDescribe ?? false)}) { console.error("DescribeServicesFailure"); process.exit(1); }
 else if (a.includes("ecs describe-services") && ${JSON.stringify(opts.failDescribeOnceAfterUpdate ?? false)} && s.updated && !s.describeFailedOnce) {
@@ -244,6 +506,7 @@ else if (a.includes("ecs describe-services")) {
     transientlyFailing = s.failedTaskPolls <= transientFailedTaskPolls;
   }
   const alternateStaleReadPolls = ${JSON.stringify(opts.alternateStaleReadPolls ?? 0)};
+  const foreignTags = ${JSON.stringify(opts.foreignServiceTags ?? false)} || (${JSON.stringify(opts.foreignServiceTagsAfterLease ?? false)} && s.leaseAcquired);
   let staleName = null;
   if (alternateStaleReadPolls && s.updated) {
     s.stalePolls = (s.stalePolls || 0) + 1;
@@ -254,7 +517,7 @@ else if (a.includes("ecs describe-services")) {
     const service = s.services[name];
     if (!service) return [];
     if (name === staleName && service.previousTaskDefinition) {
-      return [{ serviceName: name, status: "ACTIVE", desiredCount: service.desiredCount, runningCount: service.desiredCount, taskDefinition: service.previousTaskDefinition, deployments: [{ id: service.deploymentId, status: "PRIMARY", taskDefinition: service.previousTaskDefinition, rolloutState: "COMPLETED", runningCount: service.desiredCount, failedTasks: 0 }], tags: [{ key: "Deployment", value: ${JSON.stringify(opts.foreignServiceTags ? "other" : configured.orgId)} }, { key: "ManagedBy", value: "terraform" }] }];
+      return [{ serviceName: name, status: "ACTIVE", desiredCount: service.desiredCount, runningCount: service.desiredCount, taskDefinition: service.previousTaskDefinition, deployments: [{ id: service.deploymentId, status: "PRIMARY", taskDefinition: service.previousTaskDefinition, rolloutState: "COMPLETED", runningCount: service.desiredCount, failedTasks: 0 }], tags: [{ key: "Deployment", value: foreignTags ? "other" : ${JSON.stringify(configured.orgId)} }, { key: "ManagedBy", value: "terraform" }] }];
     }
     const deployments = ${JSON.stringify(opts.drainRollout ?? false)}
       ? [
@@ -266,7 +529,7 @@ else if (a.includes("ecs describe-services")) {
       : ${JSON.stringify(opts.primaryFailedTasks ?? false)} || transientlyFailing
         ? [{ id: service.deploymentId, status: "PRIMARY", taskDefinition: service.taskDefinition, rolloutState: "IN_PROGRESS", runningCount: 0, failedTasks: 1 }]
         : [{ id: service.deploymentId, status: "PRIMARY", taskDefinition: service.taskDefinition, rolloutState: "COMPLETED", runningCount: service.desiredCount, failedTasks: transientFailedTaskPolls && s.updated ? 1 : 0 }];
-    return [{ serviceName: name, status: "ACTIVE", desiredCount: service.desiredCount, runningCount: ${JSON.stringify(opts.drainRollout ?? false)} ? service.desiredCount + 1 : service.desiredCount, taskDefinition: service.taskDefinition, networkConfiguration: { awsvpcConfiguration: { subnets: ["subnet-test"], securityGroups: ["sg-test"], assignPublicIp: "DISABLED" } }, deployments, loadBalancers: service.workload === ${JSON.stringify(frontService)} ? [{ targetGroupArn: ${JSON.stringify(frontTargetArn)} }] : (service.workload === "core" && ${JSON.stringify(coreHosts.length > 0)} ? [{ targetGroupArn: ${JSON.stringify(coreTargetArn)} }] : []), tags: [{ key: "Deployment", value: ${JSON.stringify(opts.foreignServiceTags ? "other" : configured.orgId)} }, { key: "ManagedBy", value: "terraform" }] }];
+    return [{ serviceName: name, status: "ACTIVE", desiredCount: service.desiredCount, runningCount: ${JSON.stringify(opts.drainRollout ?? false)} ? service.desiredCount + 1 : service.desiredCount, taskDefinition: service.taskDefinition, networkConfiguration: { awsvpcConfiguration: { subnets: ["subnet-test"], securityGroups: ["sg-test"], assignPublicIp: "DISABLED" } }, deployments, loadBalancers: service.workload === ${JSON.stringify(frontService)} ? [{ targetGroupArn: ${JSON.stringify(frontTargetArn)} }] : (service.workload === "core" && ${JSON.stringify(coreHosts.length > 0)} ? [{ targetGroupArn: ${JSON.stringify(coreTargetArn)} }] : []), tags: [{ key: "Deployment", value: foreignTags ? "other" : ${JSON.stringify(configured.orgId)} }, { key: "ManagedBy", value: "terraform" }] }];
   }), failures: names.filter((name) => !s.services[name]).map((name) => ({ arn: name, reason: "MISSING" })) }));
 }
 else if (a.includes("ecs run-task")) console.log(JSON.stringify({ tasks: [{ taskArn: "arn:aws:ecs:us-west-2:123456789012:task/canary" }] }));
@@ -311,6 +574,16 @@ else if (a.includes("dynamodb get-item")) {
   const key = JSON.parse(after("--key")).lockKey.S;
   console.log(JSON.stringify(s.dynamo[key] ? { Item: s.dynamo[key] } : {}));
 }
+else if (a.includes("dynamodb update-item") && ${JSON.stringify(opts.leaseLossMarker)} && fs.existsSync(${JSON.stringify(opts.leaseLossMarker)})) {
+  console.error("An error occurred (ConditionalCheckFailedException) when calling the UpdateItem operation");
+  process.exit(1);
+}
+else if (a.includes("dynamodb update-item")) console.log("");
+else if (a.includes("dynamodb put-item") && a.includes("-deploy-locks")) {
+  s.leaseAcquired = true;
+  save();
+  console.log("");
+}
 else if (a.includes("dynamodb transact-write-items")) {
   if (${JSON.stringify(opts.failTransactions ?? false)}) { console.error("TransactionRejected"); process.exit(1); }
   const failTransactionPuts = ${JSON.stringify(opts.failTransactionPuts ?? 0)};
@@ -332,7 +605,8 @@ else if (a.includes("s3api get-object")) {
   const body = s.objects[after("--key")];
   if (body === undefined) process.exit(5);
   const output = args[args.indexOf("--key") + 2];
-  fs.writeFileSync(output, body);
+  const bytes = Buffer.from(body);
+  fs.writeFileSync(output, after("--range") === "bytes=0-1000000" ? bytes.subarray(0, 1000001) : bytes);
   console.log("");
 }
 else if (a.includes("rds describe-db-instances")) console.log(JSON.stringify({ DBInstances: [{ DBInstanceStatus: process.env.AWS_FAKE_DB_STATUS ?? "available", BackupRetentionPeriod: Number(process.env.AWS_FAKE_DB_RETENTION ?? "7") }] }));
@@ -369,22 +643,117 @@ else console.log("");`,
     frontService,
     { coreHosts, targetGroups },
   );
+  let layerState = {
+    version: 1,
+    generation: 1,
+    source: "durable" as "durable" | "none",
+    body: EMPTY_LAYER_BODY,
+    contentHash: EMPTY_LAYER.sha256 as string | null,
+    runtimeContentHash: EMPTY_LAYER.sha256 as string | null,
+    operationId: null as string | null,
+    status: "applied" as "applied" | "degraded",
+  };
   globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
     if (init?.method === "PUT") {
       const body = String(init.body ?? "");
       const contentHash = createHash("sha256").update(body).digest("hex");
-      return new Response(JSON.stringify({ version: 1, contentHash, durable: true, status: "applied" }), {
-        status: 200,
-      });
+      const operationId = url.searchParams.get("operationId");
+      const matches =
+        url.searchParams.get("generation") === String(layerState.generation) &&
+        url.searchParams.get("source") === layerState.source &&
+        url.searchParams.get("contentHash") === layerState.contentHash &&
+        url.searchParams.get("currentOperationId") === layerState.operationId;
+      if (!matches) return new Response(JSON.stringify({ error: "deployment_layer_conflict" }), { status: 409 });
+      const changed = contentHash !== layerState.contentHash;
+      if (changed) {
+        layerState = {
+          version: layerState.generation + 1,
+          generation: layerState.generation + 1,
+          source: "durable",
+          body,
+          contentHash,
+          runtimeContentHash: contentHash,
+          operationId,
+          status: "applied",
+        };
+      } else {
+        layerState.runtimeContentHash = contentHash;
+        layerState.status = "applied";
+      }
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          version: layerState.generation,
+          contentHash,
+          operationId: layerState.operationId,
+          changed,
+          durable: true,
+          status: "applied",
+        }),
+        { status: 200 },
+      );
+    }
+    if (init?.method === "DELETE") {
+      const operationId = url.searchParams.get("operationId");
+      const matches =
+        url.searchParams.get("generation") === String(layerState.generation) &&
+        url.searchParams.get("source") === layerState.source &&
+        url.searchParams.get("contentHash") === layerState.contentHash &&
+        url.searchParams.get("currentOperationId") === layerState.operationId;
+      if (!matches || layerState.contentHash === null) {
+        return new Response(JSON.stringify({ error: "deployment_layer_conflict" }), { status: 409 });
+      }
+      const replacedHash = layerState.contentHash;
+      layerState = {
+        version: 0,
+        generation: layerState.generation + 1,
+        source: "none",
+        body: EMPTY_LAYER_BODY,
+        contentHash: null,
+        runtimeContentHash: EMPTY_LAYER.sha256,
+        operationId,
+        status: "applied",
+      };
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          version: layerState.generation,
+          contentHash: replacedHash,
+          operationId,
+          changed: true,
+          durable: true,
+          status: "applied",
+        }),
+        { status: 200 },
+      );
     }
     if (!String(input).includes("/v1/deployment-layer"))
       return new Response("", { status: Number(process.env.AWS_FAKE_HTTP_STATUS ?? 200) });
+    if (layerState.version === 0) {
+      return new Response(
+        JSON.stringify({
+          contract: 1,
+          version: 0,
+          generation: layerState.generation,
+          source: layerState.source,
+          contentHash: null,
+          operationId: layerState.operationId,
+        }),
+        { status: 200 },
+      );
+    }
     return new Response(
       JSON.stringify({
-        bundle: JSON.parse(EMPTY_LAYER_BODY),
-        contentHash: EMPTY_LAYER.sha256,
-        runtimeContentHash: EMPTY_LAYER.sha256,
-        status: "applied",
+        contract: 1,
+        version: layerState.version,
+        generation: layerState.generation,
+        source: "durable",
+        bundle: JSON.parse(layerState.body),
+        contentHash: layerState.contentHash,
+        runtimeContentHash: layerState.runtimeContentHash,
+        operationId: layerState.operationId,
+        status: layerState.status,
       }),
       { status: 200 },
     );
@@ -403,9 +772,7 @@ const config: QmConfig = {
   imageOverrides: {},
   sandbox: {
     backend: "sprites",
-    app: "acme-sandboxes",
-    image: `registry.fly.io/acme-sandboxes@sha256:${"b".repeat(64)}`,
-    secretEnv: ["ACME_API_KEY"],
+    namePrefix: "acme-sandboxes",
   },
   env: {
     core: { HARNESS: "pi", AWS_DEPLOY_IMAGE: "acme-qm-sandbox", AWS_DEPLOY_IMAGE_VERSION: "1" },
@@ -434,23 +801,102 @@ const config: QmConfig = {
   },
 };
 
+function aliasedTrustConfig(kind: "portal" | "auth"): { config: QmConfig; storeName: string } {
+  if (kind === "portal") {
+    return {
+      config: {
+        ...config,
+        secretEnv: { portal: { OIDC_ALLOWED_EMAILS: "PORTAL_ALLOWLIST_STORE" } },
+      },
+      storeName: "PORTAL_ALLOWLIST_STORE",
+    };
+  }
+  return {
+    config: {
+      ...config,
+      services: [...config.services, "auth"],
+      env: { ...config.env, portal: {}, auth: { AUTH_EMAIL_TRANSPORT: "smtp" } },
+      aws: {
+        ...config.aws!,
+        services: {
+          ...config.aws!.services,
+          auth: { ecrRepository: "qm-auth", ecsService: "acme-auth", cpu: 512, memory: 1024 },
+        },
+      },
+    },
+    storeName: "AUTH_ALLOWED_EMAILS",
+  };
+}
+
+function requiredOperatorSecretValues(
+  configured: QmConfig,
+  overrides: Readonly<Record<string, string>> = {},
+): Map<string, string> {
+  return new Map(
+    computedSecrets(configured)
+      .filter((secret) => secret.managedBy === "operator" && secret.required)
+      .map((secret) => [secret.name, overrides[secret.name] ?? selectedTestSecretValue(secret.name)]),
+  );
+}
+
+const awsProviderSecretDestinations = [
+  "AWS_DEPLOY_DATA_BUCKET",
+  "AWS_DEPLOY_DATA_PREFIX",
+  "AWS_DEPLOY_DATA_ROLE_ARN",
+  "AWS_DEPLOY_EGRESS_CONNECTORS",
+  "AWS_DEPLOY_INGRESS_CONNECTORS",
+  "AWS_DEPLOY_PROFILE",
+  "AWS_ENDPOINT_URL",
+  "AWS_ENDPOINT_URL_S3",
+  "AWS_SANDBOX_EGRESS_CONNECTORS",
+  "AWS_SANDBOX_INGRESS_CONNECTORS",
+  "AWS_SANDBOX_PROFILE",
+  "AWS_SANDBOX_S3_PREFIX",
+  "S3_PREFIX",
+  "SECRETS_BACKEND",
+  "SECRETS_PREFIX",
+] as const;
+
 test("AWS environment derives identity, public URLs, private wiring, and MicroVM coordinates", () => {
   assert.deepEqual(serviceEnvironment(config, "web-ui"), {
     CORE_API_URL: "http://core.acme.internal:8080",
     CORE_ORG_ID: "acme",
+    NODE_ENV: "production",
     PORT: "8080",
-    REQUIRE_SIGNED_PORTAL_IDENTITY: "1",
     WEB_UI_PUBLIC_URL: "https://agent.acme.example",
   });
-  assert.equal(serviceEnvironment(config, "admin").QM_VERSION, cliVersion());
+  assert.equal(serviceEnvironment(config, "admin").QM_VERSION, undefined);
   const core = serviceEnvironment(config, "core");
   assert.equal(core.ORG_ID, "acme");
   assert.equal(core.PUBLIC_WEB_URL, "https://agent.acme.example");
   assert.equal(core.WEB_UI_PUBLIC_URL, "https://agent.acme.example");
+  assert.equal(core.REQUIRE_SIGNED_PORTAL_IDENTITY, "1");
   assert.equal(core.SANDBOX_BACKEND, "sprites");
-  assert.equal(core.FLY_SANDBOX_APP_NAME, "acme-sandboxes");
-  assert.equal(core.FLY_BASE_IMAGE, config.sandbox!.image);
+  assert.equal(core.SPRITES_NAME_PREFIX, "acme-sandboxes");
   assert.equal(core.AWS_SANDBOX_IMAGE, undefined);
+  assert.equal(core.AWS_DEPLOY_IMAGE, "acme-qm-sandbox");
+  assert.equal(core.AWS_DEPLOY_IMAGE_VERSION, "1");
+  assert.equal(core.DATA_DIR, "/data");
+  const endpoints = serviceEnvironment(
+    {
+      ...config,
+      env: {
+        ...config.env,
+        core: {
+          ...config.env.core,
+          AGENT_API_URL: "https://attacker.example",
+          AWS_ENDPOINT_URL: "https://attacker.example",
+          AWS_ENDPOINT_URL_S3: "https://attacker.example",
+        },
+        slack: { ...config.env.slack, SLACK_API_URL: "https://attacker.example" },
+      },
+    },
+    "core",
+  );
+  assert.equal(endpoints.AGENT_API_URL, undefined);
+  assert.equal(endpoints.AWS_ENDPOINT_URL, undefined);
+  assert.equal(endpoints.AWS_ENDPOINT_URL_S3, undefined);
+  assert.equal(endpoints.SLACK_API_URL, undefined);
   const { sandbox: _sandbox, ...rest } = config;
   const microvm = serviceEnvironment(rest as QmConfig, "core");
   assert.equal(microvm.SANDBOX_BACKEND, "aws");
@@ -459,8 +905,21 @@ test("AWS environment derives identity, public URLs, private wiring, and MicroVM
   assert.equal(microvm.AWS_SANDBOX_IMAGE_VERSION, "1");
   assert.equal(microvm.AWS_SANDBOX_EXEC_ROLE_ARN, "arn:aws:iam::123456789012:role/acme-qm-microvm-exec");
   assert.equal(microvm.AWS_SANDBOX_S3_BUCKET, awsObjectStoreBucket(config));
-  assert.equal(microvm.FLY_BASE_IMAGE, undefined);
-  assert.equal(microvm.FLY_SANDBOX_APP_NAME, undefined);
+  assert.equal(microvm.SPRITES_NAME_PREFIX, undefined);
+  for (const backend of ["porter", "smolmachines"] as const) {
+    const external = serviceEnvironment(
+      {
+        ...rest,
+        env: { ...rest.env, core: { ...rest.env.core, SANDBOX_BACKEND: backend } },
+      } as QmConfig,
+      "core",
+    );
+    assert.equal(external.SANDBOX_BACKEND, backend);
+    assert.equal(external.AWS_SANDBOX_IMAGE, undefined);
+    assert.equal(external.AWS_DEPLOY_IMAGE, "acme-qm-sandbox");
+    assert.equal(external.AWS_DEPLOY_IMAGE_VERSION, "1");
+    assert.equal(external.SPRITES_NAME_PREFIX, undefined);
+  }
   assert.equal(core.SESSION_STORE, "postgres");
   assert.equal(core.RUN_STORE, "postgres");
   assert.equal(core.SNAPSHOT_STORE, "s3");
@@ -469,6 +928,207 @@ test("AWS environment derives identity, public URLs, private wiring, and MicroVM
   assert.equal(core.DEPLOY_PROVIDER, "aws");
   assert.equal(core.AWS_DEPLOY_REGION, "us-west-2");
   assert.equal(core.PORT, "8080");
+  for (const service of ["core", "web-ui", "admin", "portal", "auth"] as const) {
+    const environment = serviceEnvironment(
+      {
+        ...config,
+        env: {
+          ...config.env,
+          [service]: {
+            ...config.env[service],
+            DATA_DIR: "/tmp/lost",
+            NODE_ENV: "development",
+            REQUIRE_SIGNED_PORTAL_IDENTITY: "0",
+            AWS_ENDPOINT_URL: "https://attacker.example",
+            AWS_ENDPOINT_URL_S3: "https://attacker.example",
+          },
+        },
+      },
+      service,
+    );
+    assert.equal(environment.NODE_ENV, "production");
+    assert.equal(environment.REQUIRE_SIGNED_PORTAL_IDENTITY, service === "core" ? "1" : undefined);
+    assert.equal(environment.DATA_DIR, service === "core" ? "/data" : "/tmp/lost");
+    assert.equal(environment.AWS_ENDPOINT_URL, undefined);
+    assert.equal(environment.AWS_ENDPOINT_URL_S3, undefined);
+  }
+});
+
+test("AWS rejects secret destinations that overlap provider-owned environment before provider access", async (t) => {
+  const cases = [
+    ["core", "DATA_DIR"],
+    ["core", "AGENT_API_URL"],
+    ["core", "AWS_CONTAINER_AUTHORIZATION_TOKEN"],
+    ["core", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"],
+    ["core", "AWS_DEPLOY_REGION"],
+    ["core", "AWS_SECRET_ACCESS_KEY"],
+    ["core", "S3_BUCKET"],
+    ["core", "S3_REGION"],
+    ["core", "SNAPSHOT_STORE"],
+    ["core", "SLACK_API_URL"],
+    ["core", "TRANSFER_STORE"],
+    ["portal", "PORTAL_XFF_TRUSTED_HOPS"],
+    ...awsProviderSecretDestinations.map((name) => ["core", name] as const),
+  ] as const;
+  for (const [service, destination] of cases) {
+    await t.test(`${service}.${destination}`, async () => {
+      const configured: QmConfig = {
+        ...config,
+        secretEnv: { [service]: { [destination]: `LEGACY_${destination}_STORE` } },
+      };
+      const repository = configured.aws!.services[service]!.ecrRepository;
+      const image = `123456789012.dkr.ecr.us-west-2.amazonaws.com/${repository}@sha256:${"a".repeat(64)}`;
+      const expected = new RegExp(`provider-owned environment for ${service}: ${destination}`);
+      assert.throws(() => renderTaskDefinition(configured, service, image), expected);
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-owned-secret-destination-"));
+      const fake = statefulAws(dir, configured);
+      try {
+        await assert.rejects(awsSecretsPush(configured, dir, new Map()), expected);
+        await assert.rejects(awsUp(configured, dir, { yes: true }), expected);
+        await assert.rejects(awsRollback(configured), expected);
+        assert.equal(readFileSync(fake.log, "utf8"), "");
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS topology never treats an inherited service-map property as a configured workload", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-inherited-service-"));
+  const base = oneServiceConfig();
+  const configured: QmConfig = {
+    ...base,
+    plugins: [{ name: "constructor", image: "ghcr.io/acme/constructor:1" }],
+    aws: { ...base.aws!, services: { ...base.aws!.services } },
+  };
+  try {
+    assert.throws(() => awsStatus(configured, dir), /missing enabled workloads: constructor/);
+    assert.throws(
+      () =>
+        renderTaskDefinition(
+          configured,
+          "constructor",
+          `123456789012.dkr.ecr.us-west-2.amazonaws.com/constructor@sha256:${"a".repeat(64)}`,
+        ),
+      /aws\.services\.constructor is missing/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS portal receives the core-selected deployment apps domain", () => {
+  const cases: Array<{ core: Record<string, string>; expected?: string }> = [
+    {
+      core: {
+        DEPLOY_APPS_DOMAIN: "Apps.Common.Example.COM.",
+        AWS_DEPLOY_APPS_DOMAIN: "apps.aws.example.com",
+      },
+      expected: "apps.common.example.com",
+    },
+    { core: { AWS_DEPLOY_APPS_DOMAIN: "apps.aws.example.com" }, expected: "apps.aws.example.com" },
+    { core: { PORTER_DEPLOY_APPS_DOMAIN: "apps.porter.example.com" } },
+    { core: {} },
+  ];
+  for (const selected of cases) {
+    const configured: QmConfig = {
+      ...config,
+      env: { ...config.env, core: { ...config.env.core, ...selected.core } },
+    };
+    const portal = serviceEnvironment(configured, "portal");
+    assert.equal(portal.DEPLOY_APPS_DOMAIN, selected.expected);
+    assert.equal(portal.AWS_DEPLOY_APPS_DOMAIN, undefined);
+    assert.equal(portal.PORTER_DEPLOY_APPS_DOMAIN, undefined);
+    assert.equal(portal.DEPLOY_APPS_DOMAIN, effectiveDeployAppsDomain(configured));
+    const image = `123456789012.dkr.ecr.us-west-2.amazonaws.com/qm-portal@sha256:${"a".repeat(64)}`;
+    const rendered = renderTaskDefinition(configured, "portal", image).containerDefinitions[0]!.environment as Array<{
+      name: string;
+      value: string;
+    }>;
+    assert.equal(
+      Object.fromEntries(rendered.map(({ name, value }) => [name, value])).DEPLOY_APPS_DOMAIN,
+      selected.expected,
+    );
+  }
+});
+
+test("AWS gated portal apps share one session-secret store value with core", () => {
+  const sessionArn = testSecretArn("PORTAL_SESSION_SECRET");
+  const secretMap = (configured: QmConfig, service: "core" | "portal"): Record<string, string> => {
+    const repository = configured.aws!.services[service]!.ecrRepository;
+    const image = `123456789012.dkr.ecr.us-west-2.amazonaws.com/${repository}@sha256:${"a".repeat(64)}`;
+    return Object.fromEntries(
+      (
+        renderTaskDefinition(configured, service, image, { PORTAL_SESSION_SECRET: sessionArn }).containerDefinitions[0]!
+          .secrets as Array<{ name: string; valueFrom: string }>
+      ).map(({ name, valueFrom }) => [name, valueFrom]),
+    );
+  };
+  for (const domainName of ["DEPLOY_APPS_DOMAIN", "AWS_DEPLOY_APPS_DOMAIN"] as const) {
+    const configured: QmConfig = {
+      ...config,
+      env: {
+        ...config.env,
+        core: { ...config.env.core, [domainName]: "apps.agent.acme.example" },
+      },
+    };
+    const core = secretMap(configured, "core");
+    const portal = secretMap(configured, "portal");
+    assert.equal(core.DEPLOY_APPS_SESSION_SECRET, sessionArn);
+    assert.equal(core.PORTAL_SESSION_SECRET, undefined);
+    assert.equal(portal.PORTAL_SESSION_SECRET, sessionArn);
+    assert.equal(portal.DEPLOY_APPS_SESSION_SECRET, undefined);
+    assert.equal(serviceEnvironment(configured, "core").PUBLIC_WEB_URL, config.publicUrl);
+    assert.equal(serviceEnvironment(configured, "portal").DEPLOY_APPS_DOMAIN, "apps.agent.acme.example");
+  }
+  const porterOnly: QmConfig = {
+    ...config,
+    env: {
+      ...config.env,
+      core: { ...config.env.core, PORTER_DEPLOY_APPS_DOMAIN: "apps.porter.example.com" },
+    },
+  };
+  assert.equal(secretMap(porterOnly, "core").DEPLOY_APPS_SESSION_SECRET, undefined);
+  assert.equal(serviceEnvironment(porterOnly, "portal").DEPLOY_APPS_DOMAIN, undefined);
+});
+
+test("AWS built-in auth uses the effective portal origin with and without gated apps", () => {
+  const builtIn = aliasedTrustConfig("auth").config;
+  for (const gated of [false, true]) {
+    const portalOrigin = builtIn.publicUrl;
+    const configured: QmConfig = {
+      ...builtIn,
+      env: {
+        ...builtIn.env,
+        core: {
+          ...builtIn.env.core,
+          ...(gated ? { DEPLOY_APPS_DOMAIN: "apps.agent.acme.example" } : {}),
+        },
+        portal: { ...builtIn.env.portal, PORTAL_PUBLIC_URL: portalOrigin },
+      },
+    };
+    const portal = serviceEnvironment(configured, "portal");
+    const auth = serviceEnvironment(configured, "auth");
+    assert.equal(portal.OIDC_ISSUER, `${portalOrigin}/idp`);
+    assert.equal(auth.AUTH_ISSUER, `${portalOrigin}/idp`);
+    assert.equal(auth.AUTH_REDIRECT_URI, `${portalOrigin}/auth/callback`);
+    assert.equal(portal.DEPLOY_APPS_DOMAIN, gated ? "apps.agent.acme.example" : undefined);
+    for (const service of ["portal", "auth"] as const) {
+      const repository = configured.aws!.services[service]!.ecrRepository;
+      const image = `123456789012.dkr.ecr.us-west-2.amazonaws.com/${repository}@sha256:${"a".repeat(64)}`;
+      const rendered = Object.fromEntries(
+        (
+          renderTaskDefinition(configured, service, image).containerDefinitions[0]!.environment as Array<{
+            name: string;
+            value: string;
+          }>
+        ).map(({ name, value }) => [name, value]),
+      );
+      assert.equal(rendered[service === "portal" ? "OIDC_ISSUER" : "AUTH_ISSUER"], `${portalOrigin}/idp`);
+    }
+  }
 });
 
 test("a configured bot identity lands in the AWS core task env and only there", () => {
@@ -565,7 +1225,7 @@ test("AWS required runtime settings cannot be overridden by config env", () => {
         ...config.env.core,
         SESSION_STORE: "memory",
         RUN_STORE: "memory",
-        FLY_BASE_IMAGE: "repo:latest",
+        SANDBOX_BACKEND: "aws",
       },
     },
   };
@@ -573,12 +1233,10 @@ test("AWS required runtime settings cannot be overridden by config env", () => {
   assert.equal(core.SESSION_STORE, "postgres");
   assert.equal(core.RUN_STORE, "postgres");
   assert.equal(core.SANDBOX_BACKEND, "sprites");
-  assert.equal(core.FLY_BASE_IMAGE, config.sandbox!.image);
   const { sandbox: _sandbox, ...rest } = overridden;
   const microvm = serviceEnvironment(rest as QmConfig, "core");
   assert.equal(microvm.SESSION_STORE, "postgres");
   assert.equal(microvm.SANDBOX_BACKEND, "aws");
-  assert.equal(microvm.FLY_BASE_IMAGE, undefined);
 });
 
 test("AWS deploy-role trust permits only the exact repository branch", () => {
@@ -714,16 +1372,27 @@ test("AWS deploy-role trust accepts a subject list that contains the expected su
 
 test("githubTrustSubject pins the deploy branch, never the working checkout's branch", () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-trust-subject-"));
+  const wrongDir = mkdtempSync(join(tmpdir(), "qm-aws-trust-subject-wrong-"));
   const git = (...args: string[]): void => {
     const result = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
   };
+  const wrongGit = (...args: string[]): void => {
+    const result = spawnSync("git", ["-C", wrongDir, ...args], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  };
   git("init", "-b", "feature-checkout");
   git("remote", "add", "origin", "git@github.com:acme/qm.git");
+  wrongGit("init", "-b", "main");
+  wrongGit("remote", "add", "origin", "git@github.com:evil/substitute.git");
   const priorRepo = process.env.GITHUB_REPOSITORY;
   const priorRef = process.env.GITHUB_REF;
+  const priorGitDir = process.env.GIT_DIR;
+  const priorGitWorkTree = process.env.GIT_WORK_TREE;
   delete process.env.GITHUB_REPOSITORY;
   delete process.env.GITHUB_REF;
+  process.env.GIT_DIR = join(wrongDir, ".git");
+  process.env.GIT_WORK_TREE = wrongDir;
   try {
     assert.equal(
       githubTrustSubject(dir),
@@ -772,7 +1441,176 @@ test("githubTrustSubject pins the deploy branch, never the working checkout's br
     else process.env.GITHUB_REPOSITORY = priorRepo;
     if (priorRef === undefined) delete process.env.GITHUB_REF;
     else process.env.GITHUB_REF = priorRef;
+    if (priorGitDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = priorGitDir;
+    if (priorGitWorkTree === undefined) delete process.env.GIT_WORK_TREE;
+    else process.env.GIT_WORK_TREE = priorGitWorkTree;
     rmSync(dir, { recursive: true, force: true });
+    rmSync(wrongDir, { recursive: true, force: true });
+  }
+});
+
+test("githubTrustSubject never accepts a global Git origin without a local deployment origin", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-trust-subject-local-"));
+  const hostileHome = mkdtempSync(join(tmpdir(), "qm-aws-trust-subject-home-"));
+  const result = spawnSync("git", ["-C", dir, "init", "-b", "main"], { encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  writeFileSync(join(hostileHome, ".gitconfig"), '[remote "origin"]\n\turl = git@github.com:evil/substitute.git\n');
+  const priorRepo = process.env.GITHUB_REPOSITORY;
+  const priorHome = process.env.HOME;
+  const priorGitConfig = process.env.GIT_CONFIG_GLOBAL;
+  delete process.env.GITHUB_REPOSITORY;
+  process.env.HOME = hostileHome;
+  process.env.GIT_CONFIG_GLOBAL = join(hostileHome, ".gitconfig");
+  try {
+    assert.throws(() => githubTrustSubject(dir), /cannot derive the GitHub repository from this deployment checkout/);
+  } finally {
+    if (priorRepo === undefined) delete process.env.GITHUB_REPOSITORY;
+    else process.env.GITHUB_REPOSITORY = priorRepo;
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+    if (priorGitConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
+    else process.env.GIT_CONFIG_GLOBAL = priorGitConfig;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(hostileHome, { recursive: true, force: true });
+  }
+});
+
+test("githubTrustSubject accepts only exact GitHub remote origins", () => {
+  const priorRepo = process.env.GITHUB_REPOSITORY;
+  delete process.env.GITHUB_REPOSITORY;
+  try {
+    for (const selected of [
+      { remote: "https://github.com/acme/qm.enterprise.git", expected: "repo:acme/qm.enterprise:ref:refs/heads/main" },
+      { remote: "git@github.com:acme/qm.enterprise.git", expected: "repo:acme/qm.enterprise:ref:refs/heads/main" },
+      {
+        remote: "ssh://git@github.com/acme/qm.enterprise.git",
+        expected: "repo:acme/qm.enterprise:ref:refs/heads/main",
+      },
+      { remote: "https://evilgithub.com/acme/qm.git" },
+      { remote: "https://user@github.com/acme/qm.git" },
+      { remote: "ssh://github.com/acme/qm.git" },
+      { remote: "https://github.com:443/acme/qm.git" },
+      { remote: "https://github.com/acme/qm.git?ref=main" },
+      { remote: "https://github.com/acme/qm.git#main" },
+      { remote: "https://github.com/acme/qm/extra" },
+    ]) {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-trust-subject-remote-"));
+      try {
+        const init = spawnSync("git", ["-C", dir, "init", "-b", "main"], { encoding: "utf8" });
+        assert.equal(init.status, 0, init.stderr);
+        const remote = spawnSync("git", ["-C", dir, "remote", "add", "origin", selected.remote], {
+          encoding: "utf8",
+        });
+        assert.equal(remote.status, 0, remote.stderr);
+        if (selected.expected) assert.equal(githubTrustSubject(dir), selected.expected);
+        else {
+          assert.throws(
+            () => githubTrustSubject(dir),
+            /cannot derive the GitHub repository from this deployment checkout/,
+          );
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    if (priorRepo === undefined) delete process.env.GITHUB_REPOSITORY;
+    else process.env.GITHUB_REPOSITORY = priorRepo;
+  }
+});
+
+test("githubTrustSubject reads vendored Terraform coordinates through a bounded stable descriptor", async (t) => {
+  const priorRepo = process.env.GITHUB_REPOSITORY;
+  process.env.GITHUB_REPOSITORY = "acme/actions";
+  try {
+    await t.test("final symlink", () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-trust-tfvars-symlink-"));
+      const outside = join(dir, "outside.tfvars");
+      mkdirSync(join(dir, "infra"));
+      writeFileSync(outside, 'github_repository = "evil/substitute"\n');
+      symlinkSync(outside, join(dir, "infra", "terraform.tfvars"));
+      try {
+        assert.throws(() => githubTrustSubject(dir), /terraform\.tfvars is not a safe rendered output file/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+    await t.test("oversized", () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-trust-tfvars-oversized-"));
+      mkdirSync(join(dir, "infra"));
+      writeFileSync(join(dir, "infra", "terraform.tfvars"), "x".repeat(1_048_577));
+      try {
+        assert.throws(() => githubTrustSubject(dir), /1048576-byte rendered file limit/);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+    await t.test("path replacement", () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-trust-tfvars-swap-"));
+      const infra = join(dir, "infra");
+      const tfvars = join(infra, "terraform.tfvars");
+      const displaced = join(infra, "displaced.tfvars");
+      mkdirSync(infra);
+      writeFileSync(tfvars, 'github_repository = "acme/original"\n');
+      const originalReadSync = fs.readSync;
+      let replaced = false;
+      fs.readSync = ((...args: Parameters<typeof fs.readSync>): ReturnType<typeof fs.readSync> => {
+        const count = originalReadSync(...args);
+        if (!replaced) {
+          replaced = true;
+          fs.renameSync(tfvars, displaced);
+          writeFileSync(tfvars, 'github_repository = "evil/replacement"\n');
+        }
+        return count;
+      }) as typeof fs.readSync;
+      syncBuiltinESMExports();
+      try {
+        assert.throws(
+          () => githubTrustSubject(dir),
+          /terraform\.tfvars (?:changed while it was being rendered|is not a safe rendered output file)/,
+        );
+      } finally {
+        fs.readSync = originalReadSync;
+        syncBuiltinESMExports();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  } finally {
+    if (priorRepo === undefined) delete process.env.GITHUB_REPOSITORY;
+    else process.env.GITHUB_REPOSITORY = priorRepo;
+  }
+});
+
+test("AWS doctor rejects unsafe vendored Terraform inputs before provider access", async (t) => {
+  for (const selected of ["oversized tfvars", "symlinked variables"] as const) {
+    await t.test(selected, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-doctor-terraform-input-"));
+      const infra = join(dir, "infra");
+      mkdirSync(infra);
+      if (selected === "oversized tfvars") {
+        writeFileSync(join(infra, "terraform.tfvars"), "x".repeat(1_048_577));
+      } else {
+        const outside = join(dir, "outside.tf");
+        writeFileSync(join(infra, "terraform.tfvars"), 'github_repository = "acme/qm"\n');
+        writeFileSync(outside, 'variable "org_id" {}\n');
+        symlinkSync(outside, join(infra, "variables.tf"));
+      }
+      const configured = oneServiceConfig();
+      const fake = statefulAws(dir, configured);
+      try {
+        await assert.rejects(
+          awsDoctor(configured, dir),
+          selected === "oversized tfvars"
+            ? /1048576-byte rendered file limit/
+            : /variables\.tf is not a safe rendered output file/,
+        );
+        assert.equal(readFileSync(fake.log, "utf8"), "");
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   }
 });
 
@@ -832,6 +1670,90 @@ test("AWS deploy requires the live ALB listener to match the HTTPS public URL", 
   }
 });
 
+test("AWS TLS preflight accepts a gated apps wildcard on a paginated SNI certificate", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-apps-certificate-pages-"));
+  const configured: QmConfig = {
+    ...config,
+    env: { ...config.env, core: { ...config.env.core, DEPLOY_APPS_DOMAIN: "apps.agent.acme.example" } },
+  };
+  const fake = statefulAws(dir, configured);
+  const prior = process.env.AWS_FAKE_LISTENER_CERTIFICATE_RESPONSE;
+  process.env.AWS_FAKE_LISTENER_CERTIFICATE_RESPONSE = "paginated";
+  try {
+    await awsPreflightUp(configured, dir, { dryRun: true });
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /elbv2 describe-listener-certificates .* --no-paginate/);
+    assert.match(calls, /elbv2 describe-listener-certificates .* --no-paginate --marker page-2/);
+    assert.match(calls, /acm describe-certificate --certificate-arn .*\/portal/);
+    assert.match(calls, /acm describe-certificate --certificate-arn .*\/apps/);
+  } finally {
+    if (prior === undefined) delete process.env.AWS_FAKE_LISTENER_CERTIFICATE_RESPONSE;
+    else process.env.AWS_FAKE_LISTENER_CERTIFICATE_RESPONSE = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS TLS preflight fails closed on incomplete gated-apps certificate evidence", async (t) => {
+  const cases: Array<{
+    name: string;
+    list?: string;
+    acm?: string;
+    expected: RegExp;
+  }> = [
+    { name: "portal-only SAN", acm: "portal-only", expected: /do not cover \*\.apps\.agent\.acme\.example/ },
+    { name: "malformed list", list: "malformed", expected: /invalid public-listener certificate list/ },
+    { name: "missing list", list: "missing", expected: /certificate list is missing/ },
+    { name: "missing ARN", list: "missing-arn", expected: /certificate entry is missing its ARN/ },
+    { name: "repeated marker", list: "repeated-marker", expected: /invalid pagination marker/ },
+    { name: "malformed ACM response", acm: "malformed", expected: /invalid ACM certificate response/ },
+    { name: "missing ACM certificate", acm: "missing", expected: /ACM certificate .* is missing/ },
+    { name: "missing ACM SANs", acm: "missing-sans", expected: /invalid identity or subject-alternative names/ },
+    { name: "mismatched ACM identity", acm: "mismatch", expected: /invalid identity or subject-alternative names/ },
+  ];
+  for (const item of cases) {
+    await t.test(item.name, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-apps-certificate-invalid-"));
+      const configured: QmConfig = {
+        ...config,
+        env: { ...config.env, core: { ...config.env.core, DEPLOY_APPS_DOMAIN: "apps.agent.acme.example" } },
+      };
+      const fake = statefulAws(dir, configured);
+      const priorList = process.env.AWS_FAKE_LISTENER_CERTIFICATE_RESPONSE;
+      const priorAcm = process.env.AWS_FAKE_ACM_RESPONSE;
+      if (item.list) process.env.AWS_FAKE_LISTENER_CERTIFICATE_RESPONSE = item.list;
+      if (item.acm) process.env.AWS_FAKE_ACM_RESPONSE = item.acm;
+      try {
+        await assert.rejects(awsPreflightUp(configured, dir, { dryRun: true }), item.expected);
+        assert.doesNotMatch(
+          readFileSync(fake.log, "utf8"),
+          /dynamodb put-item|ecr get-login-password|ecs update-service/,
+        );
+      } finally {
+        if (priorList === undefined) delete process.env.AWS_FAKE_LISTENER_CERTIFICATE_RESPONSE;
+        else process.env.AWS_FAKE_LISTENER_CERTIFICATE_RESPONSE = priorList;
+        if (priorAcm === undefined) delete process.env.AWS_FAKE_ACM_RESPONSE;
+        else process.env.AWS_FAKE_ACM_RESPONSE = priorAcm;
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS TLS preflight skips certificate enumeration when no apps domain is configured", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-no-apps-certificate-"));
+  const configured = oneServiceConfig();
+  const fake = statefulAws(dir, configured);
+  try {
+    await awsPreflightUp(configured, dir, { dryRun: true });
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /describe-listener-certificates|acm describe-certificate/);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("AWS deploy binds its public origin DNS to this stack's ALB", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-dns-binding-"));
   const fake = statefulAws(dir, oneServiceConfig());
@@ -851,13 +1773,30 @@ test("AWS deploy binds its public origin DNS to this stack's ALB", async () => {
   }
 });
 
+test("AWS deploy binds a split public API origin to this stack's ALB", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-api-dns-binding-"));
+  const configured = { ...oneServiceConfig(), apiUrl: "https://api.invalid" };
+  const fake = statefulAws(dir, configured);
+  try {
+    await assert.rejects(
+      () => awsUp(configured, dir, { yes: true }),
+      /AWS public API origin api\.invalid does not resolve to this stack's ALB agent\.acme\.example/,
+    );
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /dynamodb put-item|ecr get-login-password|ecs update-service/);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("AWS deploy requires the exact active successful MicroVM image version", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-image-version-"));
-  const fake = statefulAws(dir, oneServiceConfig());
+  const configured = microvmConfig(oneServiceConfig());
+  const fake = statefulAws(dir, configured);
   const prior = process.env.AWS_FAKE_IMAGE_STATE;
   process.env.AWS_FAKE_IMAGE_STATE = "FAILED";
   try {
-    await assert.rejects(() => awsUp(oneServiceConfig(), dir, { yes: true }), /version 1 is not SUCCESSFUL and ACTIVE/);
+    await assert.rejects(() => awsUp(configured, dir, { yes: true }), /requires a rebuild before service deployment/);
     const calls = readFileSync(fake.log, "utf8");
     assert.match(
       calls,
@@ -871,6 +1810,66 @@ test("AWS deploy requires the exact active successful MicroVM image version", as
   } finally {
     if (prior === undefined) delete process.env.AWS_FAKE_IMAGE_STATE;
     else process.env.AWS_FAKE_IMAGE_STATE = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS deploy fails closed on empty or malformed MicroVM status responses", async (t) => {
+  for (const response of [
+    "empty",
+    "malformed",
+    "null",
+    "empty-versions",
+    "malformed-versions",
+    "malformed-version-type",
+    "unknown-version-state",
+    "unknown-version-status",
+  ] as const) {
+    await t.test(response, async () => {
+      const dir = mkdtempSync(join(tmpdir(), `qm-aws-image-response-${response}-`));
+      const configured = microvmConfig(oneServiceConfig());
+      const fake = statefulAws(dir, configured);
+      const prior = process.env.AWS_FAKE_IMAGE_RESPONSE;
+      process.env.AWS_FAKE_IMAGE_RESPONSE = response;
+      try {
+        await assert.rejects(
+          awsUp(configured, dir, { yes: true }),
+          /invalid response without an ARN|invalid versions response/,
+        );
+        assert.doesNotMatch(
+          readFileSync(fake.log, "utf8"),
+          /dynamodb put-item|ecr get-login-password|ecs update-service/,
+        );
+      } finally {
+        if (prior === undefined) delete process.env.AWS_FAKE_IMAGE_RESPONSE;
+        else process.env.AWS_FAKE_IMAGE_RESPONSE = prior;
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS deploy never classifies ResourceNotFoundException from command arguments or secondary error prose", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-image-argv-classification-"));
+  const base = microvmConfig(oneServiceConfig());
+  const configured: QmConfig = {
+    ...base,
+    env: {
+      ...base.env,
+      core: { ...base.env.core, AWS_DEPLOY_IMAGE: "acme-ResourceNotFoundException" },
+    },
+  };
+  const fake = statefulAws(dir, configured);
+  const prior = process.env.AWS_FAKE_IMAGE_DENIED;
+  process.env.AWS_FAKE_IMAGE_DENIED = "secondary";
+  try {
+    await assert.rejects(awsUp(configured, dir, { yes: true }), /AccessDeniedException/);
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /dynamodb put-item|ecr get-login-password|ecs update-service/);
+  } finally {
+    if (prior === undefined) delete process.env.AWS_FAKE_IMAGE_DENIED;
+    else process.env.AWS_FAKE_IMAGE_DENIED = prior;
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -933,12 +1932,16 @@ test("AWS portal ALB adopts pinned target groups and requires exactly the env-de
   chmodSync(dockerBin, 0o755);
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
-  const hostSplitConfig = (hosts: { apiUrl?: string; appsDomain?: string }): QmConfig => ({
+  const hostSplitConfig = (hosts: { apiUrl?: string; appsDomain?: string; commonAppsDomain?: string }): QmConfig => ({
     ...config,
     ...(hosts.apiUrl ? { apiUrl: hosts.apiUrl } : {}),
     env: {
       ...config.env,
-      core: { ...config.env.core, ...(hosts.appsDomain ? { AWS_DEPLOY_APPS_DOMAIN: hosts.appsDomain } : {}) },
+      core: {
+        ...config.env.core,
+        ...(hosts.appsDomain ? { AWS_DEPLOY_APPS_DOMAIN: hosts.appsDomain } : {}),
+        ...(hosts.commonAppsDomain ? { DEPLOY_APPS_DOMAIN: hosts.commonAppsDomain } : {}),
+      },
     },
     aws: {
       ...config.aws!,
@@ -979,9 +1982,21 @@ test("AWS portal ALB adopts pinned target groups and requires exactly the env-de
   };
   try {
     await run(hostSplitConfig(bothHosts));
+    await run(
+      hostSplitConfig({
+        appsDomain: "apps.aws.agent.acme.example",
+        commonAppsDomain: "apps.common.agent.acme.example",
+      }),
+    );
     await run(hostSplitConfig({ apiUrl: bothHosts.apiUrl }));
     await run(hostSplitConfig({ appsDomain: bothHosts.appsDomain }));
-    await run(hostSplitConfig({ apiUrl: "https://API.agent.acme.example", appsDomain: "APPS.agent.acme.example." }));
+    await run(hostSplitConfig({ apiUrl: "https://api.agent.acme.example", appsDomain: "APPS.agent.acme.example." }));
+    await run(hostSplitConfig({ appsDomain: `${"a".repeat(62)}.${"b".repeat(63)}` }));
+    await run(
+      hostSplitConfig({ appsDomain: `${"a".repeat(63)}.${"b".repeat(63)}` }),
+      undefined,
+      /does not derive a valid ALB host-header hostname/,
+    );
     await run(hostSplitConfig({ apiUrl: config.publicUrl }));
     await run(
       hostSplitConfig(bothHosts),
@@ -1000,12 +2015,7 @@ test("AWS portal ALB adopts pinned target groups and requires exactly the env-de
       undefined,
       /env\.core\.DEPLOY_APPS_DOMAIN or AWS_DEPLOY_APPS_DOMAIN.* does not derive a valid ALB host-header hostname/,
     );
-    await run(
-      hostSplitConfig(bothHosts),
-      "AWS_FAKE_PUBLIC_API_URL",
-      /PUBLIC_API_URL must equal the configured HTTPS apiUrl/,
-      config.publicUrl,
-    );
+    await run(hostSplitConfig(bothHosts), "AWS_FAKE_PUBLIC_API_URL", undefined, config.publicUrl);
   } finally {
     process.env.PATH = priorPath;
     rmSync(dir, { recursive: true, force: true });
@@ -1315,7 +2325,7 @@ test("a snapshot prune failure warns without failing the deploy", async () => {
   writeFileSync(dockerBin, `#!/usr/bin/env node\nconsole.log("Digest: sha256:${"a".repeat(64)}");\n`);
   chmodSync(dockerBin, 0o755);
   const single = oneServiceConfig();
-  const fake = statefulAws(dir, single, {}, { failSnapshotDelete: true });
+  const fake = statefulAws(dir, single, {}, { failSnapshotDelete: true, staleTaskDefinition: true });
   const state = JSON.parse(readFileSync(fake.state, "utf8"));
   state.rdsSnapshots = [
     {
@@ -1355,7 +2365,7 @@ test("the snapshot wait tolerates transient describe failures and fails after th
   const transientDocker = join(transientDir, "docker");
   writeFileSync(transientDocker, `#!/usr/bin/env node\nconsole.log("Digest: sha256:${"a".repeat(64)}");\n`);
   chmodSync(transientDocker, 0o755);
-  const transient = statefulAws(transientDir, single, {}, { failSnapshotDescribes: 1 });
+  const transient = statefulAws(transientDir, single, {}, { failSnapshotDescribes: 1, staleTaskDefinition: true });
   const priorPath = process.env.PATH;
   process.env.PATH = `${transientDir}:${priorPath}`;
   try {
@@ -1377,10 +2387,15 @@ test("the snapshot wait tolerates transient describe failures and fails after th
   }
 });
 
-test("a no-op re-deploy deletes its unreferenced pre-deploy snapshot and records no manifest", async () => {
+test("a no-op re-deploy isolates its staging tag and deletes its unreferenced pre-deploy snapshot", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-db-noop-"));
+  const dockerLog = join(dir, "docker.log");
+  writeFileSync(dockerLog, "");
   const dockerBin = join(dir, "docker");
-  writeFileSync(dockerBin, `#!/usr/bin/env node\nconsole.log("Digest: sha256:${"a".repeat(64)}");\n`);
+  writeFileSync(
+    dockerBin,
+    `#!/usr/bin/env node\nrequire("node:fs").appendFileSync(${JSON.stringify(dockerLog)}, process.argv.slice(2).join(" ") + "\\n");\nconsole.log("Digest: sha256:${"a".repeat(64)}");\n`,
+  );
   chmodSync(dockerBin, 0o755);
   const single = oneServiceConfig();
   const fake = statefulAws(dir, single);
@@ -1398,6 +2413,17 @@ test("a no-op re-deploy deletes its unreferenced pre-deploy snapshot and records
       [`acme-qm-core-predeploy-${firstManifestId}`],
       "the no-op run's snapshot protects nothing and is deleted",
     );
+    const staged = [...readFileSync(dockerLog, "utf8").matchAll(/--tag \S+:(qm-staging-[0-9a-f-]{36})(?:\s|$)/g)].map(
+      (match) => match[1]!,
+    );
+    assert.equal(staged.length, 2);
+    assert.notEqual(staged[0], staged[1]);
+    const cleanups = [
+      ...readFileSync(fake.log, "utf8").matchAll(
+        /ecr batch-delete-image[^\n]*--image-ids imageTag=(qm-staging-[0-9a-f-]{36})(?:\s|$)/g,
+      ),
+    ].map((match) => match[1]!);
+    assert.deepEqual(cleanups, staged);
   } finally {
     process.env.PATH = priorPath;
     fake.restore();
@@ -1436,7 +2462,206 @@ test("AWS up renews the deploy lease with a holder-conditioned update while it r
   }
 });
 
-test("a lease renewal that loses the holder condition warns loudly and stops renewing", async () => {
+test("an independent AWS lease renewer runs while the main event loop is synchronously blocked past its TTL", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-blocked-loop-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb update-item") && process.env.AWS_TEST_CREDENTIAL !== "present") { console.error("AccessDeniedException"); process.exit(1); }
+console.log("");`,
+  );
+  const priorRenew = process.env.QM_AWS_LEASE_RENEW_MS;
+  const priorSeconds = process.env.QM_AWS_LEASE_SECONDS;
+  const priorCredential = process.env.AWS_TEST_CREDENTIAL;
+  process.env.QM_AWS_LEASE_RENEW_MS = "20";
+  process.env.QM_AWS_LEASE_SECONDS = "1";
+  process.env.AWS_TEST_CREDENTIAL = "present";
+  try {
+    await withAwsLease(config.aws!, async () => {
+      spawnSync(process.execPath, ["-e", "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1250)"]);
+    });
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /dynamodb update-item/);
+    assert.ok(calls.indexOf("dynamodb update-item") < calls.indexOf("dynamodb delete-item"));
+  } finally {
+    if (priorRenew === undefined) delete process.env.QM_AWS_LEASE_RENEW_MS;
+    else process.env.QM_AWS_LEASE_RENEW_MS = priorRenew;
+    if (priorSeconds === undefined) delete process.env.QM_AWS_LEASE_SECONDS;
+    else process.env.QM_AWS_LEASE_SECONDS = priorSeconds;
+    if (priorCredential === undefined) delete process.env.AWS_TEST_CREDENTIAL;
+    else process.env.AWS_TEST_CREDENTIAL = priorCredential;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("non-conditional AWS lease renewal failures abort once the held TTL expires", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-renewal-failure-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb update-item")) { console.error("An error occurred (AccessDeniedException) when calling the UpdateItem operation"); process.exit(1); }
+console.log("");`,
+  );
+  const priorRenew = process.env.QM_AWS_LEASE_RENEW_MS;
+  const priorSeconds = process.env.QM_AWS_LEASE_SECONDS;
+  process.env.QM_AWS_LEASE_RENEW_MS = "50";
+  process.env.QM_AWS_LEASE_SECONDS = "1";
+  const warnLog = console.warn;
+  console.warn = () => {};
+  try {
+    await assert.rejects(
+      withAwsLease(config.aws!, async () => {
+        await new Promise((resolve) => setTimeout(resolve, 2_200));
+      }),
+      /AWS deployment lease crossed its safe renewal deadline/,
+    );
+    assert.match(readFileSync(fake.log, "utf8"), /dynamodb update-item/);
+  } finally {
+    console.warn = warnLog;
+    if (priorRenew === undefined) delete process.env.QM_AWS_LEASE_RENEW_MS;
+    else process.env.QM_AWS_LEASE_RENEW_MS = priorRenew;
+    if (priorSeconds === undefined) delete process.env.QM_AWS_LEASE_SECONDS;
+    else process.env.QM_AWS_LEASE_SECONDS = priorSeconds;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an immediate AWS lease renewal loss cleans up the acquired lease and signal handlers", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-immediate-loss-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb update-item")) {
+  console.error("An error occurred (ConditionalCheckFailedException) when calling the UpdateItem operation");
+  process.exit(1);
+}
+console.log("");`,
+  );
+  const sigint = process.listenerCount("SIGINT");
+  const sigterm = process.listenerCount("SIGTERM");
+  const blockTurn = setTimeout(() => {
+    spawnSync(process.execPath, ["-e", "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300)"]);
+  }, 0);
+  try {
+    await assert.rejects(
+      withAwsLease(config.aws!, async () => assert.fail("operation started after its lease was lost")),
+      /AWS deployment lease was lost to another operation/,
+    );
+    assert.equal(process.listenerCount("SIGINT"), sigint);
+    assert.equal(process.listenerCount("SIGTERM"), sigterm);
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /dynamodb update-item/);
+    assert.match(calls, /dynamodb delete-item .*--condition-expression holder = :holder/);
+  } finally {
+    clearTimeout(blockTurn);
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a stalled AWS lease renewal crosses the shared safety deadline closed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-stalled-renewal-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb update-item")) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+console.log("");`,
+  );
+  const priorRenew = process.env.QM_AWS_LEASE_RENEW_MS;
+  const priorSeconds = process.env.QM_AWS_LEASE_SECONDS;
+  process.env.QM_AWS_LEASE_RENEW_MS = "5";
+  process.env.QM_AWS_LEASE_SECONDS = "1";
+  try {
+    await assert.rejects(
+      withAwsLease(config.aws!, async () => {
+        await new Promise((resolve) => setTimeout(resolve, 2_200));
+        awsText(config.aws!, ["sts", "get-caller-identity"]);
+      }),
+      /AWS deployment lease crossed its safe renewal deadline/,
+    );
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /dynamodb update-item/);
+    assert.doesNotMatch(calls, /sts get-caller-identity/);
+  } finally {
+    if (priorRenew === undefined) delete process.env.QM_AWS_LEASE_RENEW_MS;
+    else process.env.QM_AWS_LEASE_RENEW_MS = priorRenew;
+    if (priorSeconds === undefined) delete process.env.QM_AWS_LEASE_SECONDS;
+    else process.env.QM_AWS_LEASE_SECONDS = priorSeconds;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS lease release joins its renewer and removes signal handlers", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-renewer-stop-"));
+  const fake = fakeAws(dir, `console.log("");`);
+  const priorRenew = process.env.QM_AWS_LEASE_RENEW_MS;
+  process.env.QM_AWS_LEASE_RENEW_MS = "5";
+  const sigint = process.listenerCount("SIGINT");
+  const sigterm = process.listenerCount("SIGTERM");
+  try {
+    await withAwsLease(config.aws!, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    });
+    const stoppedCalls = readFileSync(fake.log, "utf8");
+    const renewals = stoppedCalls.match(/dynamodb update-item/g)?.length ?? 0;
+    assert.ok(renewals > 0);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(readFileSync(fake.log, "utf8").match(/dynamodb update-item/g)?.length ?? 0, renewals);
+    assert.equal(process.listenerCount("SIGINT"), sigint);
+    assert.equal(process.listenerCount("SIGTERM"), sigterm);
+  } finally {
+    if (priorRenew === undefined) delete process.env.QM_AWS_LEASE_RENEW_MS;
+    else process.env.QM_AWS_LEASE_RENEW_MS = priorRenew;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS lease release terminates a stalled renewer before conditioned cleanup", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-renewer-timeout-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb update-item")) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+console.log("");`,
+  );
+  const priorRenew = process.env.QM_AWS_LEASE_RENEW_MS;
+  const priorStop = process.env.QM_AWS_LEASE_RENEW_STOP_TIMEOUT_MS;
+  process.env.QM_AWS_LEASE_RENEW_MS = "5";
+  process.env.QM_AWS_LEASE_RENEW_STOP_TIMEOUT_MS = "20";
+  try {
+    await assert.rejects(
+      withAwsLease(config.aws!, async () => {
+        for (
+          let attempt = 0;
+          attempt < 500 && !readFileSync(fake.log, "utf8").includes("dynamodb update-item");
+          attempt++
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }),
+      /could not stop the AWS deployment lease renewer cleanly/,
+    );
+    const calls = readFileSync(fake.log, "utf8");
+    const renewals = calls.match(/dynamodb update-item/g)?.length ?? 0;
+    assert.ok(renewals > 0);
+    assert.match(calls, /dynamodb delete-item .*--condition-expression holder = :holder/);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(readFileSync(fake.log, "utf8").match(/dynamodb update-item/g)?.length ?? 0, renewals);
+  } finally {
+    if (priorRenew === undefined) delete process.env.QM_AWS_LEASE_RENEW_MS;
+    else process.env.QM_AWS_LEASE_RENEW_MS = priorRenew;
+    if (priorStop === undefined) delete process.env.QM_AWS_LEASE_RENEW_STOP_TIMEOUT_MS;
+    else process.env.QM_AWS_LEASE_RENEW_STOP_TIMEOUT_MS = priorStop;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a lost AWS lease blocks the next provider command and cannot report operation success", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-lost-"));
   const fake = fakeAws(
     dir,
@@ -1446,21 +2671,73 @@ console.log("");`,
   );
   const priorRenew = process.env.QM_AWS_LEASE_RENEW_MS;
   process.env.QM_AWS_LEASE_RENEW_MS = "5";
-  const warnings: string[] = [];
-  const warnLog = console.warn;
-  console.warn = (...parts: unknown[]): void => void warnings.push(parts.join(" "));
+  const waitForLoss = async (state: Int32Array): Promise<void> => {
+    for (let attempt = 0; attempt < 500 && Atomics.load(state, 0) === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.notEqual(Atomics.load(state, 0), 0);
+  };
   try {
-    await withAwsLease(config.aws!, async () => {
-      await new Promise((resolve) => setTimeout(resolve, 40));
+    await t.test("command boundary", async () => {
+      await assert.rejects(
+        withAwsLease(config.aws!, async (lease) => {
+          await waitForLoss(lease.state);
+          awsText(config.aws!, ["sts", "get-caller-identity"]);
+        }),
+        /AWS deployment lease was lost to another operation/,
+      );
+      assert.doesNotMatch(readFileSync(fake.log, "utf8"), /sts get-caller-identity/);
     });
-    assert.match(warnings.join("\n"), /"deploy" lease in acme-qm-deploy-locks was taken over by another QM operation/);
-    assert.equal(
-      readFileSync(fake.log, "utf8").match(/dynamodb update-item/g)?.length,
-      1,
-      "renewal stops once the lease is lost",
-    );
+    writeFileSync(fake.log, "");
+    await t.test("inherited-process boundary", async () => {
+      const marker = join(dir, "process-boundary-ran");
+      await assert.rejects(
+        withAwsLease(config.aws!, async (lease) => {
+          await waitForLoss(lease.state);
+          awsRunInherit(process.execPath, ["-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`]);
+        }),
+        /AWS deployment lease was lost to another operation/,
+      );
+      assert.equal(existsSync(marker), false);
+    });
+    writeFileSync(fake.log, "");
+    await t.test("HTTP boundary", async () => {
+      const priorFetch = globalThis.fetch;
+      let fetches = 0;
+      globalThis.fetch = (async () => {
+        fetches += 1;
+        return new Response("");
+      }) as typeof fetch;
+      try {
+        await assert.rejects(
+          withAwsLease(config.aws!, async (lease) => {
+            await waitForLoss(lease.state);
+            await awsDeploymentLayerTransport({
+              config,
+              configIdentity: TEST_CONFIG_IDENTITY,
+              configDir: dir,
+              method: "GET",
+              body: "",
+            });
+          }),
+          /AWS deployment lease was lost to another operation/,
+        );
+        assert.equal(fetches, 0);
+      } finally {
+        globalThis.fetch = priorFetch;
+      }
+    });
+    writeFileSync(fake.log, "");
+    await t.test("final success boundary", async () => {
+      await assert.rejects(
+        withAwsLease(config.aws!, async (lease) => {
+          await waitForLoss(lease.state);
+          return "completed";
+        }),
+        /AWS deployment lease was lost to another operation/,
+      );
+    });
   } finally {
-    console.warn = warnLog;
     if (priorRenew === undefined) delete process.env.QM_AWS_LEASE_RENEW_MS;
     else process.env.QM_AWS_LEASE_RENEW_MS = priorRenew;
     fake.restore();
@@ -1468,22 +2745,50 @@ console.log("");`,
   }
 });
 
-test("AWS deploy requires PUBLIC_API_URL to equal the declared HTTPS public URL", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-aws-public-api-url-"));
-  const fake = statefulAws(dir, oneServiceConfig());
-  const prior = process.env.AWS_FAKE_PUBLIC_API_URL;
-  process.env.AWS_FAKE_PUBLIC_API_URL = "http://agent.acme.example";
+test("AWS preflight stops after lease loss during its public network request", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-network-loss-"));
+  const lossMarker = join(dir, "lose-lease");
+  const single = oneServiceConfig();
+  const fake = statefulAws(dir, single, {}, { leaseLossMarker: lossMarker });
+  const providerFetch = globalThis.fetch;
+  globalThis.fetch = async (...args) => {
+    if (!String(args[0]).includes("/v1/deployment-layer")) {
+      writeFileSync(lossMarker, "lose");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    return providerFetch(...args);
+  };
+  const priorRenew = process.env.QM_AWS_LEASE_RENEW_MS;
+  process.env.QM_AWS_LEASE_RENEW_MS = "5";
   try {
     await assert.rejects(
-      () => awsUp(oneServiceConfig(), dir, { yes: true }),
-      /PUBLIC_API_URL must be a valid HTTPS URL equal to the configured publicUrl/,
+      withAwsLease(single.aws!, () => awsPreflightUp(single, dir, { yes: true })),
+      /AWS deployment lease was lost to another operation/,
     );
     const calls = readFileSync(fake.log, "utf8");
-    assert.match(calls, /get-secret-value .*PUBLIC_API_URL .*--query SecretString/);
+    assert.match(calls, /dynamodb update-item/);
+    assert.doesNotMatch(calls, /secretsmanager get-secret-value|lambda-microvms get-microvm-image/);
+  } finally {
+    if (priorRenew === undefined) delete process.env.QM_AWS_LEASE_RENEW_MS;
+    else process.env.QM_AWS_LEASE_RENEW_MS = priorRenew;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS deploy rejects a NUL-bearing PUBLIC_API_URL before attempting its derived repair", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-public-api-url-"));
+  const fake = statefulAws(dir, oneServiceConfig());
+  const prior = process.env.AWS_FAKE_NUL_SECRET_NAME;
+  process.env.AWS_FAKE_NUL_SECRET_NAME = "PUBLIC_API_URL";
+  try {
+    await assert.rejects(() => awsUp(oneServiceConfig(), dir, { yes: true }), /PUBLIC_API_URL contains a NUL byte/);
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /get-secret-value .*PUBLIC_API_URL/);
     assert.doesNotMatch(calls, /dynamodb put-item|ecr get-login-password|ecs update-service/);
   } finally {
-    if (prior === undefined) delete process.env.AWS_FAKE_PUBLIC_API_URL;
-    else process.env.AWS_FAKE_PUBLIC_API_URL = prior;
+    if (prior === undefined) delete process.env.AWS_FAKE_NUL_SECRET_NAME;
+    else process.env.AWS_FAKE_NUL_SECRET_NAME = prior;
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1492,6 +2797,14 @@ test("AWS deploy requires PUBLIC_API_URL to equal the declared HTTPS public URL"
 test("every AWS mutation rejects the wrong caller account before side effects", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-account-guard-"));
   const fake = fakeAws(dir, `console.log("");`);
+  const envFile = join(dir, "deployment.env");
+  writeFileSync(
+    envFile,
+    `${computedSecrets(oneServiceConfig())
+      .filter((secret) => secret.managedBy === "operator")
+      .map((secret) => `${secret.name}=${selectedTestSecretValue(secret.name)}`)
+      .join("\n")}\n`,
+  );
   const prior = process.env.AWS_FAKE_ACCOUNT;
   process.env.AWS_FAKE_ACCOUNT = "999999999999";
   const mismatch = /authenticated to AWS account 999999999999, expected 123456789012/;
@@ -1500,7 +2813,7 @@ test("every AWS mutation rejects the wrong caller account before side effects", 
     await assert.rejects(() => awsUp(oneServiceConfig(), dir, { dryRun: true }), mismatch);
     await assert.rejects(() => awsDown(oneServiceConfig()), mismatch);
     await assert.rejects(() => awsRollback(oneServiceConfig()), mismatch);
-    await assert.rejects(() => awsSecretsPush(oneServiceConfig(), dir), mismatch);
+    await assert.rejects(() => awsSecretsPush(oneServiceConfig(), dir, testSecretValues(dir, envFile)), mismatch);
     const calls = readFileSync(fake.log, "utf8");
     assert.equal(calls.match(/sts get-caller-identity/g)?.length, 5);
     assert.doesNotMatch(calls, /dynamodb|ecr |ecs update-service|secretsmanager/);
@@ -1519,7 +2832,19 @@ test("AWS deploy rejects required secret containers without an AWSCURRENT value 
   const fake = fakeAws(
     dir,
     `
-if (a.includes("ecs describe-services")) console.log(JSON.stringify({ services: ${JSON.stringify(Object.entries(config.aws!.services).map(([name, spec]) => ({ serviceName: spec.ecsService, loadBalancers: name === "portal" ? [{ targetGroupArn: targetArn }] : [] })))} }));
+if (a.includes("ecs describe-services")) console.log(JSON.stringify({ services: ${JSON.stringify(
+      Object.entries(config.aws!.services).map(([name, spec]) => ({
+        serviceName: spec.ecsService,
+        status: "ACTIVE",
+        desiredCount: 1,
+        taskDefinition: `arn:aws:ecs:us-west-2:123456789012:task-definition/${spec.ecsService}:1`,
+        loadBalancers: name === "portal" ? [{ targetGroupArn: targetArn }] : [],
+        tags: [
+          { key: "Deployment", value: config.orgId },
+          { key: "ManagedBy", value: "terraform" },
+        ],
+      })),
+    )} }));
 else if (a.includes("secretsmanager get-secret-value")) {
   console.error("ResourceNotFoundException: Secrets Manager can't find the specified secret value");
   process.exit(1);
@@ -1551,6 +2876,719 @@ test("AWS deploy rejects weak signing keys before mutation", async () => {
   } finally {
     if (prior === undefined) delete process.env.AWS_FAKE_SECRET_VALUE;
     else process.env.AWS_FAKE_SECRET_VALUE = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS deploy rejects individually valid duplicate authoritative runtime secrets before mutation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-duplicate-remote-secret-"));
+  const configured = oneServiceConfig();
+  const fake = statefulAws(dir, configured);
+  const prior = process.env.AWS_FAKE_SECRET_VALUE;
+  process.env.AWS_FAKE_SECRET_VALUE = `CAPABILITY_SECRET-${TEST_SECRET_VALUE}`;
+  try {
+    await assert.rejects(
+      () => awsUp(configured, dir, { yes: true }),
+      /AWS secrets failed runtime validation: CAPABILITY_SECRET, CORE_SIGNING_SECRET/,
+    );
+    assert.doesNotMatch(
+      readFileSync(fake.log, "utf8"),
+      /dynamodb put-item|rds create-db-snapshot|ecr get-login-password|ecs update-service/,
+    );
+  } finally {
+    if (prior === undefined) delete process.env.AWS_FAKE_SECRET_VALUE;
+    else process.env.AWS_FAKE_SECRET_VALUE = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS deploy rejects a local signing secret that differs from Secrets Manager before mutation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-signing-secret-mismatch-"));
+  const configured = oneServiceConfig();
+  const configPath = join(dir, "qm.config.jsonc");
+  const envFile = join(dir, "deployment.env");
+  const raw = JSON.stringify(configured);
+  writeFileSync(configPath, raw);
+  writeFileSync(envFile, `CORE_SIGNING_SECRET=${"different-signing-secret".repeat(3)}\n`);
+  const fake = statefulAws(dir, configured);
+  try {
+    const ctx: DeployContext = {
+      config: configured,
+      configPath,
+      configIdentity: configIdentity(configPath),
+      configDir: dir,
+      sandboxDir: join(dir, "sandbox"),
+      envFile,
+      target: "aws",
+    };
+    const provider = hostingProvider("aws");
+    const options = provider.upOptions(ctx, { yes: true }, false);
+    await assert.rejects(async () => {
+      const preflighted = await provider.preflightUp(ctx, options);
+      const prepared = await prepareUpSubstrate(preflighted, options);
+      await provider.createBackend(prepared).up(options);
+    }, /CORE_SIGNING_SECRET .*does not match.*AWS Secrets Manager/);
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /secretsmanager get-secret-value .*CORE_SIGNING_SECRET/);
+    assert.doesNotMatch(
+      calls,
+      /s3api (?:put-object|delete-object)|lambda-microvms (?:create|update|delete|terminate)|dynamodb (?:put-item|update-item|delete-item|transact-write-items)|rds (?:create|delete)-db-snapshot|ecr (?:put-image|batch-delete-image)|ecs (?:run-task|register-task-definition|deregister-task-definition|update-service)|secretsmanager (?:create-secret|put-secret-value|update-secret|delete-secret)/,
+    );
+    assert.equal(readFileSync(configPath, "utf8"), raw);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS preflight reads the default deployment env file for signing-secret consistency", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-default-signing-secret-mismatch-"));
+  const configured = oneServiceConfig();
+  const configPath = join(dir, "qm.config.jsonc");
+  writeFileSync(configPath, JSON.stringify(configured));
+  writeFileSync(join(dir, ".env"), `CORE_SIGNING_SECRET=${"different-default-signing-secret".repeat(2)}\n`);
+  const fake = statefulAws(dir, configured);
+  try {
+    const ctx: DeployContext = {
+      config: configured,
+      configPath,
+      configIdentity: configIdentity(configPath),
+      configDir: dir,
+      sandboxDir: join(dir, "sandbox"),
+      target: "aws",
+    };
+    const provider = hostingProvider("aws");
+    const options = provider.upOptions(ctx, { yes: true }, false);
+    await assert.rejects(provider.preflightUp(ctx, options), /CORE_SIGNING_SECRET .*does not match/);
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /lambda-microvms (?:create|update|delete)|dynamodb put-item/);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS deploy rechecks the authoritative signing secret under its lease before stack mutation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-rotated-signing-secret-"));
+  const configured = oneServiceConfig();
+  const configPath = join(dir, "qm.config.jsonc");
+  const envFile = join(dir, "deployment.env");
+  writeFileSync(configPath, JSON.stringify(configured));
+  writeFileSync(envFile, `CORE_SIGNING_SECRET=${TEST_SECRET_VALUE}\n`);
+  const fake = statefulAws(dir, configured);
+  const prior = process.env.AWS_FAKE_ROTATE_SIGNING_SECRET;
+  process.env.AWS_FAKE_ROTATE_SIGNING_SECRET = "1";
+  try {
+    const ctx: DeployContext = {
+      config: configured,
+      configPath,
+      configIdentity: configIdentity(configPath),
+      configDir: dir,
+      sandboxDir: join(dir, "sandbox"),
+      envFile,
+      target: "aws",
+    };
+    const provider = hostingProvider("aws");
+    const options = provider.upOptions(ctx, { yes: true }, false);
+    const preflighted = await provider.preflightUp(ctx, options);
+    await assert.rejects(
+      awsUp(configured, dir, { yes: true, envFile, preflight: preflighted.awsPreflight }),
+      /CORE_SIGNING_SECRET .*does not match.*AWS Secrets Manager/,
+    );
+    const calls = readFileSync(fake.log, "utf8");
+    assert.ok(calls.indexOf("dynamodb put-item") < calls.lastIndexOf("CORE_SIGNING_SECRET"));
+    assert.match(calls, /dynamodb delete-item/);
+    assert.doesNotMatch(
+      calls,
+      /s3api put-object|rds create-db-snapshot|ecr get-login-password|ecs register-task-definition|ecs update-service/,
+    );
+  } finally {
+    if (prior === undefined) delete process.env.AWS_FAKE_ROTATE_SIGNING_SECRET;
+    else process.env.AWS_FAKE_ROTATE_SIGNING_SECRET = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS deploy rechecks authoritative secret ARN ownership under its lease before stack mutation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-rotated-secret-arn-"));
+  const configured = oneServiceConfig();
+  const configPath = join(dir, "qm.config.jsonc");
+  writeFileSync(configPath, JSON.stringify(configured));
+  const fake = statefulAws(dir, configured);
+  const prior = process.env.AWS_FAKE_ROTATE_SECRET_ARN;
+  process.env.AWS_FAKE_ROTATE_SECRET_ARN = "1";
+  try {
+    const ctx: DeployContext = {
+      config: configured,
+      configPath,
+      configIdentity: configIdentity(configPath),
+      configDir: dir,
+      sandboxDir: join(dir, "sandbox"),
+      target: "aws",
+    };
+    const provider = hostingProvider("aws");
+    const options = provider.upOptions(ctx, { yes: true }, false);
+    const preflighted = await provider.preflightUp(ctx, options);
+    await assert.rejects(
+      awsUp(configured, dir, { yes: true, preflight: preflighted.awsPreflight }),
+      /AWS secret CORE_SIGNING_SECRET returned an ARN outside the configured account and secret path/,
+    );
+    const calls = readFileSync(fake.log, "utf8");
+    assert.ok(calls.indexOf("dynamodb put-item") < calls.lastIndexOf("CORE_SIGNING_SECRET"));
+    assert.match(calls, /dynamodb delete-item/);
+    assert.doesNotMatch(
+      calls,
+      /s3api put-object|rds create-db-snapshot|ecr get-login-password|ecs register-task-definition|ecs update-service/,
+    );
+  } finally {
+    if (prior === undefined) delete process.env.AWS_FAKE_ROTATE_SECRET_ARN;
+    else process.env.AWS_FAKE_ROTATE_SECRET_ARN = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS deploy revalidates aliased portal trust from its authoritative store under the lease", async (t) => {
+  for (const kind of ["portal", "auth"] as const) {
+    await t.test(kind, async () => {
+      const dir = mkdtempSync(join(tmpdir(), `qm-aws-${kind}-alias-up-`));
+      const selected = aliasedTrustConfig(kind);
+      const dockerLog = join(dir, "docker.log");
+      const dockerBin = join(dir, "docker");
+      writeFileSync(dockerLog, "");
+      writeFileSync(dockerBin, `#!/bin/sh\nprintf ran >> ${JSON.stringify(dockerLog)}\n`);
+      chmodSync(dockerBin, 0o755);
+      const configPath = join(dir, "qm.config.jsonc");
+      writeFileSync(configPath, JSON.stringify(selected.config));
+      const fake = statefulAws(dir, selected.config);
+      const priorPath = process.env.PATH;
+      const priorCore = process.env.CORE_SIGNING_SECRET;
+      const priorOverrides = process.env.AWS_FAKE_SECRET_OVERRIDES;
+      const priorRotateName = process.env.AWS_FAKE_ROTATE_SECRET_NAME;
+      const priorRotatedValue = process.env.AWS_FAKE_ROTATED_SECRET_VALUE;
+      process.env.PATH = `${dir}:${priorPath}`;
+      process.env.CORE_SIGNING_SECRET = TEST_SECRET_VALUE;
+      process.env.AWS_FAKE_SECRET_OVERRIDES = JSON.stringify({
+        AUTH_EMAIL_FROM: selectedTestSecretValue("AUTH_EMAIL_FROM"),
+        AUTH_SIGNING_JWK: selectedTestSecretValue("AUTH_SIGNING_JWK"),
+        [selected.storeName]: "admin@example.com",
+      });
+      process.env.AWS_FAKE_ROTATE_SECRET_NAME = selected.storeName;
+      process.env.AWS_FAKE_ROTATED_SECRET_VALUE = "not-an-email";
+      try {
+        const preflight = await awsPreflightUp(selected.config, dir, { yes: true });
+        await assert.rejects(
+          awsUp(selected.config, dir, { yes: true, preflight }),
+          kind === "portal"
+            ? /OIDC_ALLOWED_EMAILS must contain valid, non-placeholder email addresses/
+            : /required AWS secret AUTH_ALLOWED_EMAILS has no usable runtime value/,
+        );
+        const calls = readFileSync(fake.log, "utf8");
+        assert.ok(calls.indexOf("dynamodb put-item") < calls.lastIndexOf(selected.storeName));
+        assert.match(calls, /dynamodb delete-item/);
+        assert.doesNotMatch(
+          calls,
+          /s3api put-object|rds create-db-snapshot|ecr get-login-password|ecs register-task-definition|ecs update-service/,
+        );
+        assert.equal(readFileSync(dockerLog, "utf8"), "");
+      } finally {
+        process.env.PATH = priorPath;
+        if (priorCore === undefined) delete process.env.CORE_SIGNING_SECRET;
+        else process.env.CORE_SIGNING_SECRET = priorCore;
+        if (priorOverrides === undefined) delete process.env.AWS_FAKE_SECRET_OVERRIDES;
+        else process.env.AWS_FAKE_SECRET_OVERRIDES = priorOverrides;
+        if (priorRotateName === undefined) delete process.env.AWS_FAKE_ROTATE_SECRET_NAME;
+        else process.env.AWS_FAKE_ROTATE_SECRET_NAME = priorRotateName;
+        if (priorRotatedValue === undefined) delete process.env.AWS_FAKE_ROTATED_SECRET_VALUE;
+        else process.env.AWS_FAKE_ROTATED_SECRET_VALUE = priorRotatedValue;
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS preflight treats an exactly empty env-file signing secret as absent", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-blank-signing-secret-"));
+  const configured = oneServiceConfig();
+  const configPath = join(dir, "qm.config.jsonc");
+  const envFile = join(dir, "deployment.env");
+  writeFileSync(configPath, JSON.stringify(configured));
+  writeFileSync(envFile, 'CORE_SIGNING_SECRET=""\n');
+  const fake = statefulAws(dir, configured);
+  const prior = process.env.CORE_SIGNING_SECRET;
+  const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  process.env.CORE_SIGNING_SECRET = TEST_SECRET_VALUE;
+  delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  try {
+    const ctx: DeployContext = {
+      config: configured,
+      configPath,
+      configIdentity: configIdentity(configPath),
+      configDir: dir,
+      sandboxDir: join(dir, "sandbox"),
+      envFile,
+      target: "aws",
+    };
+    const provider = hostingProvider("aws");
+    const options = provider.upOptions(ctx, { yes: true }, false);
+    await assert.doesNotReject(provider.preflightUp(ctx, options));
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /lambda-microvms (?:create|update|delete)|dynamodb put-item/);
+  } finally {
+    if (prior === undefined) delete process.env.CORE_SIGNING_SECRET;
+    else process.env.CORE_SIGNING_SECRET = prior;
+    if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS preflight requires a named env file at backend admission", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-missing-env-file-"));
+  const configured = oneServiceConfig();
+  const fake = statefulAws(dir, configured);
+  try {
+    await assert.rejects(
+      awsPreflightUp(configured, dir, { envFile: join(dir, "removed.env") }),
+      /--env-file not found/,
+    );
+    assert.equal(readFileSync(fake.log, "utf8"), "");
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS preflight treats whitespace signing-secret bytes as a selected value", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-whitespace-signing-secret-"));
+  const configured = oneServiceConfig();
+  const configPath = join(dir, "qm.config.jsonc");
+  const envFile = join(dir, "deployment.env");
+  writeFileSync(configPath, JSON.stringify(configured));
+  writeFileSync(envFile, 'CORE_SIGNING_SECRET="                                "\n');
+  const fake = statefulAws(dir, configured);
+  const prior = process.env.CORE_SIGNING_SECRET;
+  process.env.CORE_SIGNING_SECRET = TEST_SECRET_VALUE;
+  try {
+    const ctx: DeployContext = {
+      config: configured,
+      configPath,
+      configIdentity: configIdentity(configPath),
+      configDir: dir,
+      sandboxDir: join(dir, "sandbox"),
+      envFile,
+      target: "aws",
+    };
+    const provider = hostingProvider("aws");
+    const options = provider.upOptions(ctx, { yes: true }, false);
+    await assert.rejects(provider.preflightUp(ctx, options), /CORE_SIGNING_SECRET .*does not match/);
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /dynamodb put-item|ecr get-login-password|ecs update-service/);
+  } finally {
+    if (prior === undefined) delete process.env.CORE_SIGNING_SECRET;
+    else process.env.CORE_SIGNING_SECRET = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS rejects NUL in selected deployment secrets before any provider call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-nul-preflight-"));
+  const configured = oneServiceConfig();
+  const configPath = join(dir, "qm.config.jsonc");
+  const envFile = join(dir, "deployment.env");
+  writeFileSync(configPath, JSON.stringify(configured));
+  writeFileSync(envFile, `DATABASE_URL=postgres://database.example/qm\0ignored\n`);
+  const fake = statefulAws(dir, configured);
+  try {
+    const ctx: DeployContext = {
+      config: configured,
+      configPath,
+      configIdentity: configIdentity(configPath),
+      configDir: dir,
+      sandboxDir: join(dir, "sandbox"),
+      envFile,
+      target: "aws",
+    };
+    const provider = hostingProvider("aws");
+    const options = provider.upOptions(ctx, { yes: true }, false);
+    await assert.rejects(provider.preflightUp(ctx, options), /DATABASE_URL contains a NUL byte/);
+    assert.equal(readFileSync(fake.log, "utf8"), "");
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS rejects NUL entered at a secret prompt before any provider call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-prompt-nul-"));
+  const configured: QmConfig = { ...oneServiceConfig(), env: {} };
+  const fake = statefulAws(dir, configured);
+  const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+  try {
+    await withFakeStdin(async (emit) => {
+      const pending = awsSecretsPush(configured, dir, new Map());
+      emit(Buffer.from([0, 13]));
+      await assert.rejects(
+        pending,
+        (error: unknown) =>
+          error instanceof Error && /contains a NUL byte/.test(error.message) && !error.message.includes("\0"),
+      );
+    });
+    assert.equal(readFileSync(fake.log, "utf8"), "");
+  } finally {
+    if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret push never treats ambient custom store names as deployment values", async (t) => {
+  for (const storeName of ["GITHUB_TOKEN", "AWS_SESSION_TOKEN"] as const) {
+    await t.test(storeName, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-custom-secret-ambient-"));
+      const configured: QmConfig = {
+        ...oneServiceConfig(),
+        env: {},
+        secretEnv: { core: { CUSTOM_RUNTIME_TOKEN: storeName } },
+      };
+      const fake = statefulAws(dir, configured);
+      const prior = process.env[storeName];
+      process.env[storeName] = `ambient-${storeName.toLowerCase()}-${TEST_SECRET_VALUE}`;
+      try {
+        await withFakeStdin(async (emit) => {
+          const pending = awsSecretsPush(configured, dir, requiredOperatorSecretValues(oneServiceConfig()));
+          emit(Buffer.from([0, 13]));
+          await assert.rejects(pending, /contains a NUL byte/);
+        });
+        assert.equal(readFileSync(fake.log, "utf8"), "");
+      } finally {
+        if (prior === undefined) delete process.env[storeName];
+        else process.env[storeName] = prior;
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS secret push accepts an explicit custom store value without ambient fallback", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-custom-secret-file-"));
+  const configured: QmConfig = {
+    ...oneServiceConfig(),
+    env: {},
+    secretEnv: { core: { CUSTOM_GITHUB_TOKEN: "GITHUB_TOKEN" } },
+  };
+  const fake = statefulAws(dir, configured);
+  const state = JSON.parse(readFileSync(fake.state, "utf8"));
+  state.services["acme-core"].desiredCount = 0;
+  writeFileSync(fake.state, JSON.stringify(state));
+  const explicit = `explicit-github-token-${TEST_SECRET_VALUE}`;
+  const prior = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = `ambient-github-token-${TEST_SECRET_VALUE}`;
+  try {
+    await awsSecretsPush(configured, dir, requiredOperatorSecretValues(configured, { GITHUB_TOKEN: explicit }));
+    const after = JSON.parse(readFileSync(fake.state, "utf8"));
+    assert.equal(after.lastSecretValues.GITHUB_TOKEN, explicit);
+  } finally {
+    if (prior === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret push uses one ambient snapshot across prompted secret resolution", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-ambient-snapshot-"));
+  const configured: QmConfig = {
+    ...oneServiceConfig(),
+    env: {},
+    secretEnv: { core: { CUSTOM_RUNTIME_TOKEN: "AAA_CUSTOM_STORE" } },
+  };
+  const fake = statefulAws(dir, configured);
+  const state = JSON.parse(readFileSync(fake.state, "utf8"));
+  state.services["acme-core"].desiredCount = 0;
+  writeFileSync(fake.state, JSON.stringify(state));
+  const prior = process.env.OPENAI_API_KEY;
+  delete process.env.OPENAI_API_KEY;
+  const selected = requiredOperatorSecretValues(configured);
+  selected.delete("AAA_CUSTOM_STORE");
+  try {
+    await withFakeStdin(async (emit) => {
+      const pending = awsSecretsPush(configured, dir, selected);
+      process.env.OPENAI_API_KEY = `late-openai-${TEST_SECRET_VALUE}`;
+      emit(Buffer.from(`custom-${TEST_SECRET_VALUE}\r`));
+      await pending;
+    });
+    const after = JSON.parse(readFileSync(fake.state, "utf8"));
+    assert.equal(after.lastSecretValues.AAA_CUSTOM_STORE, `custom-${TEST_SECRET_VALUE}`);
+    assert.equal(after.lastSecretValues.OPENAI_API_KEY, undefined);
+  } finally {
+    if (prior === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret push derives PUBLIC_API_URL from the current configured API coordinate", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-public-api-url-"));
+  const configured: QmConfig = { ...oneServiceConfig(), apiUrl: "https://api.new.example" };
+  const fake = statefulAws(dir, configured);
+  const state = JSON.parse(readFileSync(fake.state, "utf8"));
+  state.services["acme-core"].desiredCount = 0;
+  writeFileSync(fake.state, JSON.stringify(state));
+  const selected = requiredOperatorSecretValues(configured, {
+    PUBLIC_API_URL: "https://api.stale.example",
+  });
+  try {
+    await awsSecretsPush(configured, dir, selected);
+    const after = JSON.parse(readFileSync(fake.state, "utf8"));
+    assert.equal(after.lastSecretValues.PUBLIC_API_URL, "https://api.new.example");
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret upload rejects individually valid duplicate auth secrets before any provider call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-duplicate-selected-secret-"));
+  const configured: QmConfig = {
+    ...oneServiceConfig(),
+    services: ["core", "auth"],
+    aws: {
+      ...oneServiceConfig().aws!,
+      services: {
+        core: oneServiceConfig().aws!.services.core!,
+        auth: { ecrRepository: "qm-auth", ecsService: "acme-auth", cpu: 512, memory: 1024 },
+      },
+    },
+    secretEnv: {
+      auth: {
+        AUTH_CLIENT_SECRET: "AUTH_CLIENT_SECRET",
+        AUTH_TOKEN_SECRET: "AUTH_TOKEN_SECRET",
+      },
+    },
+  };
+  const duplicate = "individually-valid-duplicate-auth-secret".repeat(2);
+  const operator = computedSecrets(configured).filter((secret) => secret.managedBy === "operator" && secret.required);
+  writeFileSync(
+    join(dir, ".env"),
+    operator
+      .map(
+        (secret) =>
+          `${secret.name}=${["AUTH_CLIENT_SECRET", "AUTH_TOKEN_SECRET"].includes(secret.name) ? duplicate : selectedTestSecretValue(secret.name)}`,
+      )
+      .join("\n"),
+  );
+  const fake = statefulAws(dir, configured);
+  try {
+    await assert.rejects(
+      awsSecretsPush(configured, dir, testSecretValues(dir)),
+      /selected AWS secrets failed runtime validation: AUTH_CLIENT_SECRET, AUTH_TOKEN_SECRET/,
+    );
+    assert.equal(readFileSync(fake.log, "utf8"), "");
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret upload validates the gated portal session value before any provider call", async (t) => {
+  const configured: QmConfig = {
+    ...config,
+    env: {
+      ...config.env,
+      core: { ...config.env.core, DEPLOY_APPS_DOMAIN: "apps.agent.acme.example" },
+    },
+  };
+  const cases: Array<{ name: string; value: string; expected: RegExp }> = [
+    { name: "placeholder", value: "replace-me", expected: /PORTAL_SESSION_SECRET/ },
+    { name: "short", value: "short", expected: /PORTAL_SESSION_SECRET/ },
+    {
+      name: "signing-key collision",
+      value: TEST_SECRET_VALUE,
+      expected: /CORE_SIGNING_SECRET, PORTAL_SESSION_SECRET/,
+    },
+  ];
+  const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+  try {
+    for (const selected of cases) {
+      await t.test(selected.name, async () => {
+        const dir = mkdtempSync(join(tmpdir(), "qm-aws-gated-session-invalid-"));
+        const fake = statefulAws(dir, configured);
+        try {
+          await assert.rejects(
+            awsSecretsPush(
+              configured,
+              dir,
+              requiredOperatorSecretValues(configured, { PORTAL_SESSION_SECRET: selected.value }),
+            ),
+            selected.expected,
+          );
+          assert.equal(readFileSync(fake.log, "utf8"), "");
+        } finally {
+          fake.restore();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
+  } finally {
+    if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+  }
+});
+
+test("AWS secret upload validates aliased portal trust before any external call", async (t) => {
+  const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+  try {
+    for (const kind of ["portal", "auth"] as const) {
+      await t.test(kind, async () => {
+        const dir = mkdtempSync(join(tmpdir(), `qm-aws-${kind}-alias-push-`));
+        const dockerLog = join(dir, "docker.log");
+        const dockerBin = join(dir, "docker");
+        writeFileSync(dockerLog, "");
+        writeFileSync(dockerBin, `#!/bin/sh\nprintf ran >> ${JSON.stringify(dockerLog)}\n`);
+        chmodSync(dockerBin, 0o755);
+        const priorPath = process.env.PATH;
+        process.env.PATH = `${dir}:${priorPath}`;
+        const selected = aliasedTrustConfig(kind);
+        const fake = statefulAws(dir, selected.config);
+        try {
+          await assert.rejects(
+            awsSecretsPush(
+              selected.config,
+              dir,
+              requiredOperatorSecretValues(selected.config, { [selected.storeName]: "not-an-email" }),
+            ),
+            kind === "portal"
+              ? /OIDC_ALLOWED_EMAILS must contain valid, non-placeholder email addresses/
+              : /AUTH_ALLOWED_EMAILS must have a non-empty, non-placeholder runtime value/,
+          );
+          assert.equal(readFileSync(fake.log, "utf8"), "");
+          assert.equal(readFileSync(dockerLog, "utf8"), "");
+        } finally {
+          process.env.PATH = priorPath;
+          fake.restore();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
+  } finally {
+    if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+  }
+});
+
+test("AWS rejects NUL in optional remote secrets before deployment mutation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-remote-nul-preflight-"));
+  const configured = oneServiceConfig();
+  const fake = statefulAws(dir, configured);
+  const prior = process.env.AWS_FAKE_NUL_SECRET_NAME;
+  process.env.AWS_FAKE_NUL_SECRET_NAME = "DATABASE_CA_CERT";
+  try {
+    await assert.rejects(
+      awsUp(configured, dir, { yes: true }),
+      (error: unknown) =>
+        error instanceof Error &&
+        /DATABASE_CA_CERT contains a NUL byte/.test(error.message) &&
+        !error.message.includes("sentinel"),
+    );
+    assert.doesNotMatch(
+      readFileSync(fake.log, "utf8"),
+      /dynamodb put-item|s3api put-object|rds create-db-snapshot|ecr get-login-password|ecs update-service/,
+    );
+  } finally {
+    if (prior === undefined) delete process.env.AWS_FAKE_NUL_SECRET_NAME;
+    else process.env.AWS_FAKE_NUL_SECRET_NAME = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS rejects deployment environment aliases of its mutable config before any provider call", async (t) => {
+  for (const kind of ["lexical", "hardlink"] as const) {
+    await t.test(kind, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-env-config-alias-"));
+      const configured = oneServiceConfig();
+      const configPath = join(dir, "qm.config.jsonc");
+      const envFile = kind === "lexical" ? configPath : join(dir, "deployment.env");
+      writeFileSync(configPath, JSON.stringify(configured));
+      if (kind === "hardlink") linkSync(configPath, envFile);
+      const fake = statefulAws(dir, configured);
+      try {
+        const ctx: DeployContext = {
+          config: configured,
+          configPath,
+          configIdentity: configIdentity(configPath),
+          configDir: dir,
+          sandboxDir: join(dir, "sandbox"),
+          envFile,
+          target: "aws",
+        };
+        const provider = hostingProvider("aws");
+        const options = provider.upOptions(ctx, { yes: true }, false);
+        await assert.rejects(provider.preflightUp(ctx, options), /environment file must be physically disjoint/);
+        assert.equal(readFileSync(fake.log, "utf8"), "");
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS provider env reads reject a path swapped to the loaded config identity", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-env-config-swap-"));
+  const configured = oneServiceConfig();
+  const configPath = join(dir, "qm.config.jsonc");
+  const envFile = join(dir, "deployment.env");
+  writeFileSync(configPath, JSON.stringify(configured));
+  writeFileSync(envFile, `CORE_SIGNING_SECRET=${TEST_SECRET_VALUE}\n`);
+  const identity = configIdentity(configPath);
+  rmSync(envFile);
+  symlinkSync(configPath, envFile);
+  const fake = statefulAws(dir, configured);
+  try {
+    await t.test("source-build admission", async () => {
+      await assert.rejects(
+        awsPreflightUpWithIdentity(configured, dir, { yes: true, envFile, configIdentity: identity }),
+        /environment file must be separate from the deployment config/,
+      );
+      assert.equal(readFileSync(fake.log, "utf8"), "");
+    });
+    await t.test("deployment-layer transport", async () => {
+      const priorFetch = globalThis.fetch;
+      let fetches = 0;
+      globalThis.fetch = (async () => {
+        fetches += 1;
+        return new Response("");
+      }) as typeof fetch;
+      try {
+        await assert.rejects(
+          awsDeploymentLayerTransport({
+            config: configured,
+            configIdentity: identity,
+            configDir: dir,
+            envFile,
+            method: "GET",
+            body: "",
+          }),
+          /environment file must be separate from the deployment config/,
+        );
+        assert.equal(fetches, 0);
+        assert.equal(readFileSync(fake.log, "utf8"), "");
+      } finally {
+        globalThis.fetch = priorFetch;
+      }
+    });
+  } finally {
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1617,7 +3655,6 @@ test("AWS task definitions are digest-pinned and route only computed secrets", (
     "CONNECTOR_SECRET_KEY",
     "CORE_SIGNING_SECRET",
     "DATABASE_URL",
-    "FLY_RESIDENT_ENV_ACME_API_KEY",
     "PORTAL_IDENTITY_SECRET",
     "PUBLIC_API_URL",
     "SKILL_SIGNING_SECRET",
@@ -1678,7 +3715,6 @@ test("AWS task parity catches a correctly named secret routed to the wrong ARN",
 
 test("AWS image transfer preserves the source manifest instead of pulling the host architecture", () => {
   assert.deepEqual(imageTransferArgs("ghcr.io/acme/core:1", "123.dkr.ecr.us-west-2.amazonaws.com/core:sha"), [
-    "buildx",
     "imagetools",
     "create",
     "--prefer-index=false",
@@ -1688,7 +3724,7 @@ test("AWS image transfer preserves the source manifest instead of pulling the ho
   ]);
 });
 
-test("AWS source builds honor the configured web-ui base build-arg and record git provenance", async () => {
+test("AWS source builds honor a standalone Buildx override without self-attested git provenance", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-web-ui-build-"));
   const sourceDir = join(dir, "source");
   const dockerLog = join(dir, "docker.log");
@@ -1715,10 +3751,12 @@ test("AWS source builds honor the configured web-ui base build-arg and record gi
   git("init");
   git("add", "-A");
   git("commit", "-m", "initial");
-  const head = git("rev-parse", "HEAD");
+  git("rev-parse", "HEAD");
   writeFileSync(join(sourceDir, "uncommitted.txt"), "dirty\n");
   const priorPath = process.env.PATH;
+  const priorBuildx = process.env.DOCKER_BUILDX_BIN;
   process.env.PATH = `${dir}:${priorPath}`;
+  process.env.DOCKER_BUILDX_BIN = dockerBin;
   const webUiConfig: QmConfig = {
     ...config,
     services: ["core", "web-ui", "portal"],
@@ -1736,7 +3774,7 @@ test("AWS source builds honor the configured web-ui base build-arg and record gi
     await awsUp(webUiConfig, dir, { yes: true, buildFrom: true, buildFromPath: sourceDir });
     const build = readFileSync(dockerLog, "utf8")
       .split("\n")
-      .find((line) => line.includes("buildx build") && line.includes("qm-web-ui"));
+      .find((line) => line.startsWith("build ") && line.includes("qm-web-ui"));
     assert.match(build ?? "", /--platform linux\/amd64/);
     assert.match(build ?? "", /--provenance=false/);
     assert.match(build ?? "", /--build-arg WEB_UI_BASE=\/custom\//);
@@ -1747,8 +3785,6 @@ test("AWS source builds honor the configured web-ui base build-arg and record gi
       assert.deepEqual(manifest.imageProvenance[service], {
         kind: "source-build",
         source: "checkout",
-        gitCommit: head,
-        dirty: true,
       });
     }
     await assert.doesNotReject(() => awsCheckLive(webUiConfig, { report: false, configDir: dir }));
@@ -1770,12 +3806,199 @@ test("AWS source builds honor the configured web-ui base build-arg and record gi
     assert.doesNotMatch(readFileSync(dockerLog, "utf8"), /imagetools inspect/);
   } finally {
     process.env.PATH = priorPath;
+    if (priorBuildx === undefined) delete process.env.DOCKER_BUILDX_BIN;
+    else process.env.DOCKER_BUILDX_BIN = priorBuildx;
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test("AWS source builds honor a per-service dockerfile override and stamp GIT_SHA, suffixed -dirty on a dirty checkout", async () => {
+test("AWS Docker children use one frozen neutral environment for Buildx override and fallback", async (t) => {
+  for (const override of [true, false]) {
+    await t.test(override ? "override" : "fallback", async () => {
+      const dir = mkdtempSync(join(tmpdir(), `qm-aws-build-env-${override ? "override" : "fallback"}-`));
+      const dockerLog = join(dir, "docker-env.jsonl");
+      const buildxLog = join(dir, "buildx-env.jsonl");
+      const lateLog = join(dir, "late-buildx.jsonl");
+      const dockerBin = join(dir, "docker");
+      const buildxBin = join(dir, "buildx-override");
+      const lateBuildxBin = join(dir, "late-buildx");
+      const envLogger = (path: string): string =>
+        `#!/usr/bin/env node\nrequire("node:fs").appendFileSync(${JSON.stringify(path)}, JSON.stringify({ args: process.argv.slice(2), env: process.env }) + "\\n");\n`;
+      writeFileSync(dockerLog, "");
+      writeFileSync(buildxLog, "");
+      writeFileSync(lateLog, "");
+      writeFileSync(dockerBin, envLogger(dockerLog));
+      writeFileSync(buildxBin, envLogger(buildxLog));
+      writeFileSync(lateBuildxBin, envLogger(lateLog));
+      chmodSync(dockerBin, 0o755);
+      chmodSync(buildxBin, 0o755);
+      chmodSync(lateBuildxBin, 0o755);
+      const single = oneServiceConfig();
+      const configured: QmConfig = {
+        ...single,
+        secretEnv: {
+          ...single.secretEnv,
+          core: {
+            ...single.secretEnv?.core,
+            FUTURE_DESTINATION: "FUTURE_SECRET_STORE",
+          },
+        },
+      };
+      const fileSecret = "file-only-future-secret-value";
+      writeFileSync(join(dir, ".env"), `CORE_SIGNING_SECRET=${TEST_SECRET_VALUE}\nFUTURE_SECRET_STORE=${fileSecret}\n`);
+      const fake = statefulAws(dir, configured);
+      const names = [
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "CORE_SIGNING_SECRET",
+        "DOCKER_BUILDX_BIN",
+        "DOCKER_CONFIG",
+        "FUTURE_DESTINATION",
+        "FUTURE_SECRET_STORE",
+        "GIT_CONFIG_COUNT",
+        "LD_PRELOAD",
+        "NODE_OPTIONS",
+        "QM_DEPLOY_ENV_FILE_ONLY",
+        "QM_UPDATE_TOKEN",
+      ];
+      const prior = new Map(names.map((name) => [name, process.env[name]]));
+      const priorPath = process.env.PATH;
+      const safeDockerConfig = join(dir, "docker-control");
+      const credential = "ambient-aws-credential-value";
+      const ambientCore = "ambient-core-secret-value";
+      const updateToken = "automatic-update-secret-value";
+      process.env.PATH = `${dir}:${priorPath}`;
+      process.env.AWS_ACCESS_KEY_ID = credential;
+      process.env.AWS_SECRET_ACCESS_KEY = `${credential}-secret`;
+      process.env.AWS_SESSION_TOKEN = `${credential}-session`;
+      process.env.CORE_SIGNING_SECRET = ambientCore;
+      process.env.DOCKER_CONFIG = safeDockerConfig;
+      process.env.FUTURE_DESTINATION = "ambient-future-alias-value";
+      process.env.FUTURE_SECRET_STORE = "ambient-future-store-value";
+      process.env.GIT_CONFIG_COUNT = "0";
+      process.env.LD_PRELOAD = "";
+      process.env.NODE_OPTIONS = "--no-warnings";
+      process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+      process.env.QM_UPDATE_TOKEN = updateToken;
+      if (override) process.env.DOCKER_BUILDX_BIN = buildxBin;
+      else delete process.env.DOCKER_BUILDX_BIN;
+      const providerFetch = globalThis.fetch;
+      globalThis.fetch = async (...args) => {
+        process.env.DOCKER_BUILDX_BIN = lateBuildxBin;
+        process.env.DOCKER_CONFIG = join(dir, "late-docker-control");
+        return providerFetch(...args);
+      };
+      try {
+        await awsUp(configured, dir, { yes: true });
+        const parse = (path: string): Array<{ args: string[]; env: Record<string, string> }> =>
+          readFileSync(path, "utf8")
+            .trim()
+            .split("\n")
+            .filter(Boolean)
+            .map((line) => JSON.parse(line));
+        const dockerCalls = parse(dockerLog);
+        const buildxCalls = parse(buildxLog);
+        const buildCalls = override ? buildxCalls : dockerCalls.filter((call) => call.args[0] === "buildx");
+        assert.ok(dockerCalls.some((call) => call.args[0] === "login"));
+        assert.ok(buildCalls.some((call) => call.args.includes("imagetools") && call.args.includes("create")));
+        assert.equal(readFileSync(lateLog, "utf8"), "");
+        for (const call of [...dockerCalls, ...buildxCalls]) {
+          assert.equal(call.env.DOCKER_CONFIG, safeDockerConfig);
+          assert.equal(call.env.BUILDX_GIT_INFO, "false");
+          assert.equal(call.env.BUILDX_GIT_LABELS, "false");
+          for (const name of [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "CORE_SIGNING_SECRET",
+            "FUTURE_DESTINATION",
+            "FUTURE_SECRET_STORE",
+            "GIT_CONFIG_COUNT",
+            "LD_PRELOAD",
+            "NODE_OPTIONS",
+            "QM_DEPLOY_ENV_FILE_ONLY",
+            "QM_UPDATE_TOKEN",
+          ]) {
+            assert.equal(call.env[name], undefined, `${name} leaked into ${call.args.join(" ")}`);
+          }
+          for (const value of [
+            credential,
+            `${credential}-secret`,
+            `${credential}-session`,
+            ambientCore,
+            fileSecret,
+            updateToken,
+          ]) {
+            assert.equal(
+              Object.values(call.env).includes(value),
+              false,
+              `a sensitive value leaked into ${call.args.join(" ")}`,
+            );
+          }
+        }
+      } finally {
+        process.env.PATH = priorPath;
+        for (const [name, value] of prior) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS rejects source-build control secret collisions before Docker or deployment mutation", async (t) => {
+  for (const canonical of [false, true]) {
+    await t.test(canonical ? "canonical source name" : "selected secret value", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-build-env-collision-"));
+      const dockerLog = join(dir, "docker.log");
+      const dockerBin = join(dir, "docker");
+      writeFileSync(dockerLog, "");
+      writeFileSync(
+        dockerBin,
+        `#!/usr/bin/env node\nrequire("node:fs").appendFileSync(${JSON.stringify(dockerLog)}, "ran\\n");\n`,
+      );
+      chmodSync(dockerBin, 0o755);
+      const single = oneServiceConfig();
+      const configured: QmConfig = canonical
+        ? {
+            ...single,
+            secretEnv: { ...single.secretEnv, core: { ...single.secretEnv?.core, DOCKER_CONFIG: "DOCKER_CONFIG" } },
+          }
+        : single;
+      writeFileSync(
+        join(dir, ".env"),
+        `CORE_SIGNING_SECRET=${TEST_SECRET_VALUE}${canonical ? `\nDOCKER_CONFIG=${"canonical-docker-secret".repeat(2)}` : ""}\n`,
+      );
+      const fake = statefulAws(dir, configured);
+      const priorPath = process.env.PATH;
+      const priorDockerConfig = process.env.DOCKER_CONFIG;
+      process.env.PATH = `${dir}:${priorPath}`;
+      process.env.DOCKER_CONFIG = canonical ? join(dir, "safe-docker-control") : TEST_SECRET_VALUE;
+      try {
+        await assert.rejects(
+          () => awsUp(configured, dir, { yes: true }),
+          /source-build provider control DOCKER_CONFIG conflicts with a deployment secret/,
+        );
+        const calls = readFileSync(fake.log, "utf8");
+        assert.doesNotMatch(calls, /rds create-db-snapshot|ecr get-login-password|s3api put-object|ecs update-service/);
+        assert.equal(readFileSync(dockerLog, "utf8"), "");
+      } finally {
+        process.env.PATH = priorPath;
+        if (priorDockerConfig === undefined) delete process.env.DOCKER_CONFIG;
+        else process.env.DOCKER_CONFIG = priorDockerConfig;
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS source builds never stamp mutable checkout identity", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-dockerfile-override-"));
   const sourceDir = join(dir, "source");
   const dockerLog = join(dir, "docker.log");
@@ -1786,10 +4009,12 @@ test("AWS source builds honor a per-service dockerfile override and stamp GIT_SH
     `#!/usr/bin/env node\nrequire("node:fs").appendFileSync(${JSON.stringify(dockerLog)}, process.argv.slice(2).join(" ") + "\\n");\n`,
   );
   chmodSync(dockerBin, 0o755);
-  for (const service of ["core", "web-ui", "portal"]) {
+  for (const service of ["core", "web-ui", "admin", "portal"]) {
     mkdirSync(join(sourceDir, "deploy", service), { recursive: true });
     writeFileSync(join(sourceDir, "deploy", service, "Dockerfile"), `FROM scratch\nLABEL service=${service}\n`);
   }
+  mkdirSync(join(sourceDir, "cli"), { recursive: true });
+  writeFileSync(join(sourceDir, "cli", "package.json"), JSON.stringify({ version: "1.2.3-test" }));
   mkdirSync(join(sourceDir, "layered"), { recursive: true });
   writeFileSync(join(sourceDir, "layered", "core.Dockerfile"), "FROM scratch\nLABEL layered=core\n");
   const git = (...args: string[]): string => {
@@ -1804,15 +4029,16 @@ test("AWS source builds honor a per-service dockerfile override and stamp GIT_SH
   git("init");
   git("add", "-A");
   git("commit", "-m", "initial");
-  const head = git("rev-parse", "HEAD");
+  git("rev-parse", "HEAD");
   const layeredConfig: QmConfig = {
     ...config,
-    services: ["core", "web-ui", "portal"],
+    services: ["core", "web-ui", "admin", "portal"],
     aws: {
       ...config.aws!,
       services: {
         core: { ...config.aws!.services.core!, dockerfile: "layered/core.Dockerfile" },
         "web-ui": config.aws!.services["web-ui"]!,
+        admin: config.aws!.services.admin!,
         portal: config.aws!.services.portal!,
       },
     },
@@ -1830,17 +4056,20 @@ test("AWS source builds honor a per-service dockerfile override and stamp GIT_SH
       coreBuild?.includes(`-f ${join(sourceDir, "layered", "core.Dockerfile")}`),
       `core build uses the override: ${coreBuild}`,
     );
-    assert.ok(coreBuild?.includes(`--build-arg GIT_SHA=${head}`), `core build stamps GIT_SHA: ${coreBuild}`);
+    assert.doesNotMatch(coreBuild ?? "", /--build-arg GIT_SHA=/);
+    assert.doesNotMatch(builds.join("\n"), /QM_VERSION/);
     const webUiBuild = builds.find((line) => line.includes("qm-web-ui"));
     assert.ok(
       webUiBuild?.includes(`-f ${join(sourceDir, "deploy", "web-ui", "Dockerfile")}`),
       `web-ui build keeps the default: ${webUiBuild}`,
     );
     const dirtySource = join(dir, "dirty-source");
-    for (const service of ["core", "web-ui", "portal"]) {
+    for (const service of ["core", "web-ui", "admin", "portal"]) {
       mkdirSync(join(dirtySource, "deploy", service), { recursive: true });
       writeFileSync(join(dirtySource, "deploy", service, "Dockerfile"), `FROM scratch\nLABEL service=${service}\n`);
     }
+    mkdirSync(join(dirtySource, "cli"), { recursive: true });
+    writeFileSync(join(dirtySource, "cli", "package.json"), JSON.stringify({ version: "1.2.3-dirty" }));
     mkdirSync(join(dirtySource, "layered"), { recursive: true });
     writeFileSync(join(dirtySource, "layered", "core.Dockerfile"), "FROM scratch\nLABEL layered=core\n");
     const dirtyGit = (...args: string[]): string => {
@@ -1855,16 +4084,14 @@ test("AWS source builds honor a per-service dockerfile override and stamp GIT_SH
     dirtyGit("init");
     dirtyGit("add", "-A");
     dirtyGit("commit", "-m", "initial");
-    const dirtyHead = dirtyGit("rev-parse", "HEAD");
+    dirtyGit("rev-parse", "HEAD");
     writeFileSync(join(dirtySource, "deploy", "core", "Dockerfile"), "FROM scratch\nLABEL service=core-modified\n");
     await awsUp(layeredConfig, dir, { yes: true, buildFrom: true, buildFromPath: dirtySource });
     const dirtyCoreBuild = readFileSync(dockerLog, "utf8")
       .split("\n")
       .find((line) => line.includes("buildx build") && line.includes("qm-core") && line.includes(dirtySource));
-    assert.ok(
-      dirtyCoreBuild?.includes(`--build-arg GIT_SHA=${dirtyHead}-dirty`),
-      `a dirty checkout stamps a distinct build sha so lame-duck supersession can tell it from the clean build: ${dirtyCoreBuild}`,
-    );
+    assert.doesNotMatch(dirtyCoreBuild ?? "", /--build-arg GIT_SHA=/);
+    assert.doesNotMatch(readFileSync(dockerLog, "utf8"), /QM_VERSION/);
     const missingConfig: QmConfig = {
       ...layeredConfig,
       aws: {
@@ -1991,6 +4218,7 @@ test("AWS renders third-party plugins as private ECS workloads with scoped secre
       CORE_API_URL: "http://core.acme.internal:8080",
       CORE_ORG_ID: "acme",
       LINEAR_REGION: "us",
+      NODE_ENV: "production",
       PORT: "8080",
     },
   );
@@ -2000,10 +4228,111 @@ test("AWS renders third-party plugins as private ECS workloads with scoped secre
   ]);
 });
 
+test("AWS historical-task validation preserves signing for discovered source plugins", async (t) => {
+  const configured = (): QmConfig => {
+    const base = oneServiceConfig();
+    return {
+      ...base,
+      aws: {
+        ...base.aws!,
+        services: {
+          ...base.aws!.services,
+          srcplug: {
+            ecrRepository: "qm-srcplug",
+            ecsService: "acme-srcplug",
+            cpu: 256,
+            memory: 512,
+          },
+        },
+      },
+    };
+  };
+  await t.test("rollback", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "qm-aws-source-plugin-rollback-"));
+    mkdirSync(join(dir, "plugins", "srcplug"), { recursive: true });
+    writeFileSync(join(dir, "plugins", "srcplug", "Dockerfile"), "FROM scratch\n");
+    const sourceConfig = configured();
+    const tasks = (revision: number): Record<string, string> => ({
+      core: `arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:${revision}`,
+      srcplug: `arn:aws:ecs:us-west-2:123456789012:task-definition/acme-srcplug:${revision}`,
+    });
+    const fake = statefulAws(
+      dir,
+      sourceConfig,
+      manifestItems(
+        [
+          { id: "old", tasks: tasks(7) },
+          { id: "current", previous: "old", tasks: tasks(9) },
+        ],
+        "current",
+      ),
+    );
+    try {
+      const state = JSON.parse(readFileSync(fake.state, "utf8"));
+      const sourceTask = tasks(7).srcplug;
+      assert.ok(sourceTask);
+      const environment = Object.fromEntries(
+        state.definitions[sourceTask].containerDefinitions[0].environment.map(
+          ({ name, value }: { name: string; value: string }) => [name, value],
+        ),
+      );
+      assert.equal(environment.NODE_ENV, "production");
+      await assert.doesNotReject(
+        awsRollback(sourceConfig, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY }),
+      );
+      assert.match(
+        readFileSync(fake.log, "utf8"),
+        /ecs update-service .*--service acme-srcplug .*--task-definition .*acme-srcplug:7/,
+      );
+    } finally {
+      fake.restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  await t.test("secret rotation", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "qm-aws-source-plugin-secrets-"));
+    mkdirSync(join(dir, "plugins", "srcplug"), { recursive: true });
+    writeFileSync(join(dir, "plugins", "srcplug", "Dockerfile"), "FROM scratch\n");
+    const sourceConfig = configured();
+    const fake = statefulAws(dir, sourceConfig);
+    const state = JSON.parse(readFileSync(fake.state, "utf8"));
+    const tasks = {
+      core: state.services["acme-core"].taskDefinition,
+      srcplug: state.services["acme-srcplug"].taskDefinition,
+    };
+    state.dynamo = manifestItems([{ id: "current", imageLabel: "release", tasks }], "current");
+    writeFileSync(fake.state, JSON.stringify(state));
+    const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+    try {
+      await assert.doesNotReject(awsSecretsPush(sourceConfig, dir, requiredOperatorSecretValues(sourceConfig)));
+      assert.match(
+        readFileSync(fake.log, "utf8"),
+        /ecs update-service .*--service acme-srcplug --force-new-deployment/,
+      );
+    } finally {
+      if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+      else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+      fake.restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 test("AWS fixes third-party plugin PORT to its ECS port mapping", () => {
   const pluginConfig: QmConfig = {
     ...config,
-    plugins: [{ name: "linear", image: "ghcr.io/acme/linear:1", env: { PORT: "9000" } }],
+    plugins: [
+      {
+        name: "linear",
+        image: "ghcr.io/acme/linear:1",
+        env: {
+          PORT: "9000",
+          AWS_ENDPOINT_URL: "https://attacker.example",
+          AWS_ENDPOINT_URL_S3: "https://attacker.example",
+        },
+      },
+    ],
     aws: {
       ...config.aws!,
       services: {
@@ -2021,6 +4350,9 @@ test("AWS fixes third-party plugin PORT to its ECS port mapping", () => {
     ]),
   );
   assert.equal(environment.PORT, "8080");
+  assert.equal(environment.NODE_ENV, "production");
+  assert.equal(environment.AWS_ENDPOINT_URL, undefined);
+  assert.equal(environment.AWS_ENDPOINT_URL_S3, undefined);
 });
 
 test("AWS routes optional plugin secrets only when the secret exists", () => {
@@ -2089,17 +4421,33 @@ test("AWS retains built-in health enforcement when an image is overridden", () =
   assert.match((container.healthCheck as { command: string[] }).command[3]!, /\/healthz/);
 });
 
-test("AWS secret upload reads the deployment .env and removes every plaintext staging file", async () => {
+test("AWS secret upload uses parsed deployment values over stdin without staging plaintext", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-secrets-"));
   const bin = join(dir, "aws-fake");
   const log = join(dir, "paths.log");
   const operatorSecrets = computedSecrets(config).filter((secret) => secret.managedBy === "operator");
-  writeFileSync(join(dir, ".env"), operatorSecrets.map((secret) => `${secret.name}=${TEST_SECRET_VALUE}`).join("\n"));
+  writeFileSync(
+    join(dir, ".env"),
+    operatorSecrets.map((secret) => `${secret.name}=${selectedTestSecretValue(secret.name)}`).join("\n"),
+  );
+  const sourceValues = testSecretValues(dir);
+  rmSync(join(dir, ".env"));
   writeFileSync(
     bin,
     `#!/bin/sh
 if [ "$1 $2" = "sts get-caller-identity" ]; then
   printf '%s\\n' 123456789012
+  exit 0
+fi
+if [ "$1 $2" = "secretsmanager describe-secret" ]; then
+  printf '{"ARN":"arn:aws:secretsmanager:us-west-2:123456789012:secret:%s-AbCdEf"}\\n' "$4"
+  exit 0
+fi
+if [ "$1 $2" = "secretsmanager get-secret-value" ]; then
+  case " $* " in
+    *" acme/qm/DATABASE_URL "*) printf '%s\\n' '{"ARN":"arn:aws:secretsmanager:us-west-2:123456789012:secret:acme/qm/DATABASE_URL-AbCdEf","SecretString":"postgres://database.example/qm"}' ;;
+    *) printf '%s\\n' '{}' ;;
+  esac
   exit 0
 fi
 if [ "$1 $2" = "dynamodb get-item" ]; then
@@ -2110,11 +4458,12 @@ if [ "$1 $2" = "ecs describe-services" ]; then
   printf '%s\\n' '{"services":[{"serviceName":"acme-core","desiredCount":0,"runningCount":0,"tags":[{"key":"Deployment","value":"acme"},{"key":"ManagedBy","value":"terraform"}]},{"serviceName":"acme-web-ui","desiredCount":0,"runningCount":0,"tags":[{"key":"Deployment","value":"acme"},{"key":"ManagedBy","value":"terraform"}]},{"serviceName":"acme-admin","desiredCount":0,"runningCount":0,"tags":[{"key":"Deployment","value":"acme"},{"key":"ManagedBy","value":"terraform"}]},{"serviceName":"acme-portal","desiredCount":0,"runningCount":0,"tags":[{"key":"Deployment","value":"acme"},{"key":"ManagedBy","value":"terraform"}]}],"failures":[]}'
   exit 0
 fi
-for arg in "$@"; do
-  case "$arg" in
-    file://*) path="\${arg#file://}"; test -f "$path" || exit 9; printf '%s\\n' "$path" >> "$AWS_SECRET_PATH_LOG" ;;
-  esac
-done
+if [ "$1 $2" = "secretsmanager put-secret-value" ]; then
+  payload=$(cat)
+  test -n "$payload" || exit 9
+  printf '%s\\n' "$*" >> "$AWS_SECRET_PATH_LOG"
+  exit 0
+fi
 `,
   );
   chmodSync(bin, 0o755);
@@ -2123,18 +4472,204 @@ done
   process.env.AWS_BIN = bin;
   process.env.AWS_SECRET_PATH_LOG = log;
   try {
-    await awsSecretsPush(config, dir);
-    const paths = readFileSync(log, "utf8").trim().split("\n");
-    assert.equal(paths.length, operatorSecrets.length);
-    for (const path of paths) {
-      assert.equal(existsSync(path), false);
-      assert.equal(existsSync(dirname(path)), false);
-    }
+    await awsSecretsPush(config, dir, sourceValues);
+    const calls = readFileSync(log, "utf8").trim().split("\n");
+    assert.equal(calls.length, operatorSecrets.length);
+    assert.ok(calls.every((call) => call.includes("--secret-string file:///dev/stdin")));
+    assert.ok(calls.every((call) => !call.includes("qm-secret-") && !call.includes(TEST_SECRET_VALUE)));
   } finally {
     if (priorBin === undefined) delete process.env.AWS_BIN;
     else process.env.AWS_BIN = priorBin;
     if (priorLog === undefined) delete process.env.AWS_SECRET_PATH_LOG;
     else process.env.AWS_SECRET_PATH_LOG = priorLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret upload accepts 65536 UTF-8 bytes and rejects 65537 before any provider call", async (t) => {
+  for (const size of [65_536, 65_537] as const) {
+    await t.test(String(size), async () => {
+      const dir = mkdtempSync(join(tmpdir(), `qm-aws-secret-size-${size}-`));
+      const secretsConfig: QmConfig = { ...oneServiceConfig(), env: {} };
+      const operator = computedSecrets(secretsConfig).filter(
+        (secret) => secret.managedBy === "operator" && secret.required,
+      );
+      writeFileSync(
+        join(dir, ".env"),
+        operator
+          .map(
+            (secret) =>
+              `${secret.name}=${secret.name === "CAPABILITY_SECRET" ? "x".repeat(size) : selectedTestSecretValue(secret.name)}`,
+          )
+          .join("\n"),
+      );
+      const fake = statefulAws(dir, secretsConfig);
+      const state = JSON.parse(readFileSync(fake.state, "utf8"));
+      state.services["acme-core"].desiredCount = 0;
+      writeFileSync(fake.state, JSON.stringify(state));
+      try {
+        if (size === 65_536) {
+          await assert.doesNotReject(awsSecretsPush(secretsConfig, dir, testSecretValues(dir)));
+          assert.match(readFileSync(fake.log, "utf8"), /secretsmanager put-secret-value/);
+        } else {
+          await assert.rejects(
+            awsSecretsPush(secretsConfig, dir, testSecretValues(dir)),
+            /CAPABILITY_SECRET exceeds the 65536-byte/,
+          );
+          assert.equal(readFileSync(fake.log, "utf8"), "");
+        }
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS secret upload rejects an unstaged remote NUL before uploads or lease acquisition", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-remote-nul-"));
+  const secretsConfig: QmConfig = { ...oneServiceConfig(), env: {} };
+  const operator = computedSecrets(secretsConfig).filter(
+    (secret) => secret.managedBy === "operator" && secret.required,
+  );
+  writeFileSync(
+    join(dir, ".env"),
+    operator.map((secret) => `${secret.name}=${selectedTestSecretValue(secret.name)}`).join("\n"),
+  );
+  const fake = statefulAws(dir, secretsConfig);
+  const priorTarget = process.env.AWS_FAKE_NUL_SECRET_NAME;
+  const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  process.env.AWS_FAKE_NUL_SECRET_NAME = "DATABASE_CA_CERT";
+  process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+  try {
+    await assert.rejects(
+      awsSecretsPush(secretsConfig, dir, testSecretValues(dir)),
+      (error: unknown) =>
+        error instanceof Error &&
+        /DATABASE_CA_CERT contains a NUL byte/.test(error.message) &&
+        !error.message.includes("sentinel"),
+    );
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /dynamodb put-item|secretsmanager put-secret-value/);
+  } finally {
+    if (priorTarget === undefined) delete process.env.AWS_FAKE_NUL_SECRET_NAME;
+    else process.env.AWS_FAKE_NUL_SECRET_NAME = priorTarget;
+    if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret upload validates untouched remote values before the first upload", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-remote-invalid-"));
+  const secretsConfig: QmConfig = { ...oneServiceConfig(), env: {} };
+  const fake = statefulAws(dir, secretsConfig);
+  const priorOverrides = process.env.AWS_FAKE_SECRET_OVERRIDES;
+  const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  process.env.AWS_FAKE_SECRET_OVERRIDES = JSON.stringify({ DATABASE_CA_CERT: "replace-me" });
+  process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+  try {
+    await assert.rejects(
+      awsSecretsPush(secretsConfig, dir, requiredOperatorSecretValues(secretsConfig)),
+      /DATABASE_CA_CERT/,
+    );
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /secretsmanager get-secret-value/);
+    assert.doesNotMatch(calls, /dynamodb put-item|secretsmanager put-secret-value/);
+  } finally {
+    if (priorOverrides === undefined) delete process.env.AWS_FAKE_SECRET_OVERRIDES;
+    else process.env.AWS_FAKE_SECRET_OVERRIDES = priorOverrides;
+    if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret upload rejects an untouched remote ARN before lease acquisition", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-remote-arn-"));
+  const secretsConfig: QmConfig = { ...oneServiceConfig(), env: {} };
+  const fake = statefulAws(dir, secretsConfig);
+  const priorArn = process.env.AWS_FAKE_SECRET_ARN;
+  const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  process.env.AWS_FAKE_SECRET_ARN =
+    "arn:aws:secretsmanager:us-west-2:999999999999:secret:acme/qm/ANTHROPIC_API_KEY-AbCdEf";
+  process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+  try {
+    await assert.rejects(
+      awsSecretsPush(secretsConfig, dir, requiredOperatorSecretValues(secretsConfig)),
+      /returned an ARN outside the configured account and secret path/,
+    );
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /dynamodb put-item|secretsmanager put-secret-value/);
+  } finally {
+    if (priorArn === undefined) delete process.env.AWS_FAKE_SECRET_ARN;
+    else process.env.AWS_FAKE_SECRET_ARN = priorArn;
+    if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret upload revalidates untouched remote values under the lease", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-remote-rotated-"));
+  const secretsConfig: QmConfig = { ...oneServiceConfig(), env: {} };
+  const fake = statefulAws(dir, secretsConfig);
+  const priorOverrides = process.env.AWS_FAKE_SECRET_OVERRIDES;
+  const priorRotateName = process.env.AWS_FAKE_ROTATE_SECRET_NAME;
+  const priorRotatedValue = process.env.AWS_FAKE_ROTATED_SECRET_VALUE;
+  const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  process.env.AWS_FAKE_SECRET_OVERRIDES = JSON.stringify({ DATABASE_CA_CERT: "valid-ca-certificate" });
+  process.env.AWS_FAKE_ROTATE_SECRET_NAME = "DATABASE_CA_CERT";
+  process.env.AWS_FAKE_ROTATED_SECRET_VALUE = "replace-me";
+  process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+  try {
+    await assert.rejects(
+      awsSecretsPush(secretsConfig, dir, requiredOperatorSecretValues(secretsConfig)),
+      /DATABASE_CA_CERT/,
+    );
+    const calls = readFileSync(fake.log, "utf8");
+    assert.ok(calls.indexOf("dynamodb put-item") < calls.lastIndexOf("DATABASE_CA_CERT"));
+    assert.match(calls, /dynamodb delete-item/);
+    assert.doesNotMatch(calls, /secretsmanager put-secret-value|ecs register-task-definition|ecs update-service/);
+  } finally {
+    if (priorOverrides === undefined) delete process.env.AWS_FAKE_SECRET_OVERRIDES;
+    else process.env.AWS_FAKE_SECRET_OVERRIDES = priorOverrides;
+    if (priorRotateName === undefined) delete process.env.AWS_FAKE_ROTATE_SECRET_NAME;
+    else process.env.AWS_FAKE_ROTATE_SECRET_NAME = priorRotateName;
+    if (priorRotatedValue === undefined) delete process.env.AWS_FAKE_ROTATED_SECRET_VALUE;
+    else process.env.AWS_FAKE_ROTATED_SECRET_VALUE = priorRotatedValue;
+    if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret upload proves every selected container ARN before the first upload", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-container-arn-"));
+  const secretsConfig: QmConfig = { ...oneServiceConfig(), env: {} };
+  const fake = statefulAws(dir, secretsConfig);
+  const priorArn = process.env.AWS_FAKE_DESCRIBE_SECRET_ARN;
+  const priorMode = process.env.QM_DEPLOY_ENV_FILE_ONLY;
+  process.env.AWS_FAKE_DESCRIBE_SECRET_ARN =
+    "arn:aws:secretsmanager:us-west-2:999999999999:secret:acme/qm/ANTHROPIC_API_KEY-AbCdEf";
+  process.env.QM_DEPLOY_ENV_FILE_ONLY = "1";
+  try {
+    await assert.rejects(
+      awsSecretsPush(secretsConfig, dir, requiredOperatorSecretValues(secretsConfig)),
+      /returned an ARN outside the configured account and secret path/,
+    );
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /dynamodb put-item.*\n[\s\S]*secretsmanager describe-secret/);
+    assert.match(calls, /dynamodb delete-item/);
+    assert.doesNotMatch(calls, /secretsmanager put-secret-value|ecs register-task-definition|ecs update-service/);
+  } finally {
+    if (priorArn === undefined) delete process.env.AWS_FAKE_DESCRIBE_SECRET_ARN;
+    else process.env.AWS_FAKE_DESCRIBE_SECRET_ARN = priorArn;
+    if (priorMode === undefined) delete process.env.QM_DEPLOY_ENV_FILE_ONLY;
+    else process.env.QM_DEPLOY_ENV_FILE_ONLY = priorMode;
+    fake.restore();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -2145,11 +4680,14 @@ test("AWS secret upload rejects active services when no deployment manifest exis
   const operator = computedSecrets(secretsConfig).filter(
     (secret) => secret.managedBy === "operator" && secret.required,
   );
-  writeFileSync(join(dir, ".env"), operator.map((secret) => `${secret.name}=${TEST_SECRET_VALUE}`).join("\n"));
+  writeFileSync(
+    join(dir, ".env"),
+    operator.map((secret) => `${secret.name}=${selectedTestSecretValue(secret.name)}`).join("\n"),
+  );
   const fake = statefulAws(dir, secretsConfig);
   try {
     await assert.rejects(
-      () => awsSecretsPush(secretsConfig, dir),
+      () => awsSecretsPush(secretsConfig, dir, testSecretValues(dir)),
       /cannot defer secret activation without a current deployment manifest while workloads are active: core/,
     );
     const calls = readFileSync(fake.log, "utf8");
@@ -2167,22 +4705,27 @@ test("AWS secret rotation holds the deploy lease across the complete write set",
   const operator = computedSecrets(secretsConfig).filter(
     (secret) => secret.managedBy === "operator" && secret.required,
   );
-  writeFileSync(join(dir, ".env"), operator.map((secret) => `${secret.name}=${TEST_SECRET_VALUE}`).join("\n"));
+  const optionalNames = computedSecrets(secretsConfig)
+    .filter((secret) => secret.managedBy === "operator" && !secret.required)
+    .map((secret) => secret.name);
+  const optionalValues = new Map(optionalNames.map((name) => [name, process.env[name]]));
+  writeFileSync(
+    join(dir, ".env"),
+    operator.map((secret) => `${secret.name}=${selectedTestSecretValue(secret.name)}`).join("\n"),
+  );
   const fake = statefulAws(dir, secretsConfig);
   const state = JSON.parse(readFileSync(fake.state, "utf8"));
   const taskArn = state.services["acme-core"].taskDefinition;
   const image = `123456789012.dkr.ecr.us-west-2.amazonaws.com/qm-core@sha256:${"a".repeat(64)}`;
   const arns = Object.fromEntries(
-    computedSecrets(secretsConfig).map((secret) => [
-      secret.name,
-      "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf",
-    ]),
+    computedSecrets(secretsConfig).map((secret) => [secret.name, testSecretArn(secret.name)]),
   );
   state.definitions[taskArn] = renderTaskDefinition(secretsConfig, "core", image, arns);
   state.dynamo = manifestItems([{ id: "current", imageLabel: "release", tasks: { core: taskArn } }], "current");
   writeFileSync(fake.state, JSON.stringify(state));
+  for (const name of optionalNames) delete process.env[name];
   try {
-    await awsSecretsPush(secretsConfig, dir);
+    await awsSecretsPush(secretsConfig, dir, testSecretValues(dir));
     const calls = readFileSync(fake.log, "utf8");
     const acquire = calls.indexOf("dynamodb put-item");
     const firstWrite = calls.indexOf("secretsmanager put-secret-value");
@@ -2195,8 +4738,123 @@ test("AWS secret rotation holds the deploy lease across the complete write set",
     assert.match(calls, /ecs update-service --cluster acme-qm --service acme-core --force-new-deployment/);
     assert.equal(calls.match(/secretsmanager put-secret-value/g)?.length, operator.length);
   } finally {
+    for (const [name, value] of optionalValues) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret rotation rejects a historical sidecar secret before any upload or restart", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-sidecar-"));
+  const configured: QmConfig = { ...oneServiceConfig(), env: {} };
+  const fake = statefulAws(dir, configured);
+  const state = JSON.parse(readFileSync(fake.state, "utf8"));
+  const task = state.services["acme-core"].taskDefinition;
+  state.dynamo = manifestItems([{ id: "current", imageLabel: "release", tasks: { core: task } }], "current");
+  state.definitions[task].containerDefinitions.push({
+    name: "sidecar",
+    image: "attacker.example/sidecar:latest",
+    environment: [],
+    secrets: [{ name: "CORE_SIGNING_SECRET", valueFrom: testSecretArn("CORE_SIGNING_SECRET") }],
+  });
+  writeFileSync(fake.state, JSON.stringify(state));
+  try {
+    await assert.rejects(
+      awsSecretsPush(configured, dir, requiredOperatorSecretValues(configured)),
+      /lacks a trusted digest-pinned task definition/,
+    );
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /secretsmanager put-secret-value|ecs update-service/);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS secret rotation rejects historical fallback endpoint injection before any upload", async (t) => {
+  for (const endpoint of ["AGENT_API_URL", "AWS_ENDPOINT_URL_S3", "SLACK_API_URL"] as const) {
+    for (const source of ["plaintext", "secret"] as const) {
+      await t.test(`${endpoint} ${source}`, async () => {
+        const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-slack-endpoint-"));
+        const configured: QmConfig = { ...oneServiceConfig(), env: {} };
+        const fake = statefulAws(dir, configured);
+        const state = JSON.parse(readFileSync(fake.state, "utf8"));
+        const task = state.services["acme-core"].taskDefinition;
+        state.dynamo = manifestItems([{ id: "current", imageLabel: "release", tasks: { core: task } }], "current");
+        const container = state.definitions[task].containerDefinitions[0];
+        if (source === "plaintext") {
+          container.environment.push({ name: endpoint, value: "https://attacker.example" });
+        } else {
+          container.secrets.push({ name: endpoint, valueFrom: testSecretArn("CORE_SIGNING_SECRET") });
+        }
+        writeFileSync(fake.state, JSON.stringify(state));
+        try {
+          await assert.rejects(
+            awsSecretsPush(configured, dir, requiredOperatorSecretValues(configured)),
+            /stale or unowned (?:environment|secret) entries/,
+          );
+          assert.doesNotMatch(readFileSync(fake.log, "utf8"), /secretsmanager put-secret-value|ecs update-service/);
+        } finally {
+          fake.restore();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("AWS secret rotation rejects historical provider-owned secret destinations before any upload", async (t) => {
+  for (const destination of awsProviderSecretDestinations) {
+    await t.test(destination, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-provider-destination-"));
+      const configured: QmConfig = { ...oneServiceConfig(), env: {} };
+      const fake = statefulAws(dir, configured);
+      const state = JSON.parse(readFileSync(fake.state, "utf8"));
+      const task = state.services["acme-core"].taskDefinition;
+      state.dynamo = manifestItems([{ id: "current", imageLabel: "release", tasks: { core: task } }], "current");
+      state.definitions[task].containerDefinitions[0].secrets.push({
+        name: destination,
+        valueFrom: testSecretArn("CORE_SIGNING_SECRET"),
+      });
+      writeFileSync(fake.state, JSON.stringify(state));
+      try {
+        await assert.rejects(
+          awsSecretsPush(configured, dir, requiredOperatorSecretValues(configured)),
+          /stale or unowned secret entries/,
+        );
+        assert.doesNotMatch(readFileSync(fake.log, "utf8"), /secretsmanager put-secret-value|ecs update-service/);
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS secret rotation rejects every unexpected historical task-definition channel", async (t) => {
+  for (const channel of ["secretOptions", "repositoryCredentials", "command", "taskRoleArn"] as const) {
+    await t.test(channel, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-secret-task-channel-"));
+      const configured: QmConfig = { ...oneServiceConfig(), env: {} };
+      const fake = statefulAws(dir, configured);
+      const state = JSON.parse(readFileSync(fake.state, "utf8"));
+      const task = state.services["acme-core"].taskDefinition;
+      state.dynamo = manifestItems([{ id: "current", imageLabel: "release", tasks: { core: task } }], "current");
+      addHistoricalTaskChannel(state.definitions[task], channel);
+      writeFileSync(fake.state, JSON.stringify(state));
+      try {
+        await assert.rejects(
+          awsSecretsPush(configured, dir, requiredOperatorSecretValues(configured)),
+          /stale or unowned task-definition fields/,
+        );
+        assert.doesNotMatch(readFileSync(fake.log, "utf8"), /secretsmanager put-secret-value|ecs update-service/);
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   }
 });
 
@@ -2206,22 +4864,25 @@ test("AWS secret rotation refuses foreign exact-name services before uploading o
   const operator = computedSecrets(secretsConfig).filter(
     (secret) => secret.managedBy === "operator" && secret.required,
   );
-  writeFileSync(join(dir, ".env"), operator.map((secret) => `${secret.name}=${TEST_SECRET_VALUE}`).join("\n"));
+  writeFileSync(
+    join(dir, ".env"),
+    operator.map((secret) => `${secret.name}=${selectedTestSecretValue(secret.name)}`).join("\n"),
+  );
   const fake = statefulAws(dir, secretsConfig, {}, { foreignServiceTags: true });
   const state = JSON.parse(readFileSync(fake.state, "utf8"));
   const taskArn = state.services["acme-core"].taskDefinition;
   const image = `123456789012.dkr.ecr.us-west-2.amazonaws.com/qm-core@sha256:${"a".repeat(64)}`;
   const arns = Object.fromEntries(
-    computedSecrets(secretsConfig).map((secret) => [
-      secret.name,
-      "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf",
-    ]),
+    computedSecrets(secretsConfig).map((secret) => [secret.name, testSecretArn(secret.name)]),
   );
   state.definitions[taskArn] = renderTaskDefinition(secretsConfig, "core", image, arns);
   state.dynamo = manifestItems([{ id: "current", imageLabel: "release", tasks: { core: taskArn } }], "current");
   writeFileSync(fake.state, JSON.stringify(state));
   try {
-    await assert.rejects(() => awsSecretsPush(secretsConfig, dir), /ownership tags do not match deployment acme/);
+    await assert.rejects(
+      () => awsSecretsPush(secretsConfig, dir, testSecretValues(dir)),
+      /ownership tags do not match deployment acme/,
+    );
     assert.doesNotMatch(readFileSync(fake.log, "utf8"), /secretsmanager put-secret-value|ecs update-service/);
   } finally {
     fake.restore();
@@ -2237,20 +4898,25 @@ test("AWS secret upload registers and records a task revision for a newly suppli
   );
   writeFileSync(
     join(dir, ".env"),
-    [...required.map((secret) => `${secret.name}=${TEST_SECRET_VALUE}`), "ACME_API_KEY=optional-value"].join("\n"),
+    [
+      ...required.map((secret) => `${secret.name}=${selectedTestSecretValue(secret.name)}`),
+      "DATABASE_CA_CERT=optional-value",
+    ].join("\n"),
   );
   const fake = statefulAws(dir, secretsConfig);
   const state = JSON.parse(readFileSync(fake.state, "utf8"));
   const oldTask = state.services["acme-core"].taskDefinition;
   const image = `123456789012.dkr.ecr.us-west-2.amazonaws.com/qm-core@sha256:${"a".repeat(64)}`;
   const arns = Object.fromEntries(
-    required.map((secret) => [secret.name, "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf"]),
+    computedSecrets(secretsConfig)
+      .filter((secret) => secret.required)
+      .map((secret) => [secret.name, testSecretArn(secret.name)]),
   );
   state.definitions[oldTask] = renderTaskDefinition(secretsConfig, "core", image, arns);
   state.dynamo = manifestItems([{ id: "current", imageLabel: "release", tasks: { core: oldTask } }], "current");
   writeFileSync(fake.state, JSON.stringify(state));
   try {
-    await awsSecretsPush(secretsConfig, dir);
+    await awsSecretsPush(secretsConfig, dir, testSecretValues(dir));
     const calls = readFileSync(fake.log, "utf8");
     assert.match(calls, /ecs register-task-definition/);
     assert.match(calls, /ecs update-service .*--task-definition/);
@@ -2263,7 +4929,7 @@ test("AWS secret upload registers and records a task revision for a newly suppli
     const names = after.definitions[manifest.tasks.core].containerDefinitions[0].secrets.map(
       (secret: { name: string }) => secret.name,
     );
-    assert.ok(names.includes("FLY_RESIDENT_ENV_ACME_API_KEY"));
+    assert.ok(names.includes("DATABASE_CA_CERT"));
   } finally {
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
@@ -2278,7 +4944,10 @@ test("AWS optional-secret activation restores prior tasks when a later service r
   );
   writeFileSync(
     join(dir, ".env"),
-    [...required.map((secret) => `${secret.name}=${TEST_SECRET_VALUE}`), "ACME_API_KEY=optional-value"].join("\n"),
+    [
+      ...required.map((secret) => `${secret.name}=${selectedTestSecretValue(secret.name)}`),
+      "DATABASE_CA_CERT=optional-value",
+    ].join("\n"),
   );
   const fake = statefulAws(dir, secretsConfig, {}, { failForcedDeploymentResponse: true });
   const state = JSON.parse(readFileSync(fake.state, "utf8"));
@@ -2287,7 +4956,9 @@ test("AWS optional-secret activation restores prior tasks when a later service r
     "web-ui": state.services["acme-web-ui"].taskDefinition,
   };
   const arns = Object.fromEntries(
-    required.map((secret) => [secret.name, "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf"]),
+    computedSecrets(secretsConfig)
+      .filter((secret) => secret.required)
+      .map((secret) => [secret.name, testSecretArn(secret.name)]),
   );
   for (const workload of ["core", "web-ui"] as const) {
     const repository = secretsConfig.aws!.services[workload]!.ecrRepository;
@@ -2298,7 +4969,7 @@ test("AWS optional-secret activation restores prior tasks when a later service r
   writeFileSync(fake.state, JSON.stringify(state));
   try {
     await assert.rejects(
-      () => awsSecretsPush(secretsConfig, dir),
+      () => awsSecretsPush(secretsConfig, dir, testSecretValues(dir)),
       /did not identify the replacement deployment for web-ui/,
     );
     const after = JSON.parse(readFileSync(fake.state, "utf8"));
@@ -2318,32 +4989,16 @@ test("AWS optional-secret activation restores prior tasks when a later service r
   }
 });
 
-test("a dual-role secret (core service + sandbox.secretEnv) is delivered under BOTH names on core", () => {
-  const dual: QmConfig = {
-    ...config,
-    sandbox: { ...config.sandbox!, secretEnv: ["ACME_API_KEY", "ANTHROPIC_API_KEY"] },
-  };
-  const image = `123456789012.dkr.ecr.us-west-2.amazonaws.com/qm-core@sha256:${"a".repeat(64)}`;
-  const task = renderTaskDefinition(dual, "core", image);
-  const secrets = task.containerDefinitions[0]!.secrets as Array<{ name: string; valueFrom: string }>;
-  const names = secrets.map((secret) => secret.name);
-  assert.ok(names.includes("ANTHROPIC_API_KEY"), "plain name for the core process");
-  assert.ok(names.includes("FLY_RESIDENT_ENV_ANTHROPIC_API_KEY"), "renamed variant forwarded into sandboxes");
-  assert.ok(names.includes("FLY_RESIDENT_ENV_ACME_API_KEY"));
-  assert.ok(!names.includes("ACME_API_KEY"), "a sandbox-only secret is not delivered plain");
-  const dualEntries = secrets.filter((secret) => secret.name.endsWith("ANTHROPIC_API_KEY"));
-  assert.equal(
-    new Set(dualEntries.map((secret) => secret.valueFrom)).size,
-    1,
-    "both names read the same stored secret",
-  );
-});
-
 const oneServiceConfig = (name = "core"): QmConfig => ({
   ...config,
   services: ["core"],
   aws: { ...config.aws!, services: { [name]: config.aws!.services[name] ?? config.aws!.services.core! } },
 });
+
+const microvmConfig = (configured: QmConfig): QmConfig => {
+  const { sandbox: _sandbox, ...rest } = configured;
+  return rest;
+};
 
 const twoServiceConfig = (): QmConfig => ({
   ...config,
@@ -2351,12 +5006,213 @@ const twoServiceConfig = (): QmConfig => ({
   aws: { ...config.aws!, services: { core: config.aws!.services.core!, "web-ui": config.aws!.services["web-ui"]! } },
 });
 
+test("AWS plan reports stale and missing MicroVM rebuilds without mutating", async () => {
+  const lines: string[] = [];
+  const log = console.log;
+  console.log = (...parts: unknown[]): void => void lines.push(parts.join(" "));
+  try {
+    for (const scenario of ["stale", "missing"] as const) {
+      const dir = mkdtempSync(join(tmpdir(), `qm-aws-plan-microvm-${scenario}-`));
+      const configPath = join(dir, "qm.config.jsonc");
+      const { sandbox: _sandbox, ...base } = oneServiceConfig();
+      const core = { ...base.env.core };
+      if (scenario === "stale") core.AWS_DEPLOY_IMAGE_SOURCE_SHA256 = "stale";
+      else delete core.AWS_DEPLOY_IMAGE_VERSION;
+      const configured: QmConfig = { ...base, env: { ...base.env, core } };
+      const raw = JSON.stringify(configured);
+      writeFileSync(configPath, raw);
+      const fake = statefulAws(dir, configured);
+      try {
+        const ctx: DeployContext = {
+          config: configured,
+          configPath,
+          configIdentity: configIdentity(configPath),
+          configDir: dir,
+          sandboxDir: join(dir, "sandbox"),
+          target: "aws",
+        };
+        const prepared = await prepareUpSubstrate(ctx, { dryRun: true });
+        assert.equal(prepared.awsMicrovmBuildPlanned, true);
+        await hostingProvider("aws").createBackend(prepared).up({ dryRun: true });
+        const output = lines.join("\n");
+        assert.match(output, /MicroVM image: rebuild required before the core deployment/);
+        assert.match(output, /Plan only\. Re-run `qm up --yes` to deploy\./);
+        const calls = readFileSync(fake.log, "utf8");
+        assert.doesNotMatch(
+          calls,
+          /s3api put-object|lambda-microvms (?:create|update|delete)|dynamodb put-item|ecs register-task-definition|ecs update-service/,
+        );
+        assert.equal(readFileSync(configPath, "utf8"), raw);
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+      lines.length = 0;
+    }
+  } finally {
+    console.log = log;
+  }
+});
+
+test("AWS non-core only plans skip every deployment-image check", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-only-no-microvm-"));
+  const configPath = join(dir, "qm.config.jsonc");
+  const dockerBin = join(dir, "docker");
+  writeFileSync(dockerBin, `#!/bin/sh\necho 'Digest: sha256:${"a".repeat(64)}'\n`);
+  chmodSync(dockerBin, 0o755);
+  const base = twoServiceConfig();
+  const core = { ...base.env.core };
+  delete core.AWS_DEPLOY_IMAGE;
+  delete core.AWS_DEPLOY_IMAGE_VERSION;
+  const configured: QmConfig = { ...base, env: { ...base.env, core } };
+  writeFileSync(configPath, JSON.stringify(configured));
+  const tasks = Object.fromEntries(
+    Object.entries(configured.aws!.services).map(([name, service]) => [
+      name,
+      `arn:aws:ecs:us-west-2:123456789012:task-definition/${service.ecsService}:1`,
+    ]),
+  );
+  const fake = statefulAws(
+    dir,
+    configured,
+    manifestItems([{ id: "current", imageLabel: "release", tasks }], "current"),
+  );
+  const state = JSON.parse(readFileSync(fake.state, "utf8"));
+  const arns = Object.fromEntries(
+    computedSecrets(configured).map((secret) => [secret.name, testSecretArn(secret.name)]),
+  );
+  state.definitions[tasks.core!] = renderTaskDefinition(
+    configured,
+    "core",
+    `123456789012.dkr.ecr.us-west-2.amazonaws.com/qm-core@sha256:${"a".repeat(64)}`,
+    arns,
+  );
+  writeFileSync(fake.state, JSON.stringify(state));
+  const priorPath = process.env.PATH;
+  const priorUnsupported = process.env.AWS_FAKE_LAMBDA_UNSUPPORTED;
+  process.env.PATH = `${dir}:${priorPath}`;
+  process.env.AWS_FAKE_LAMBDA_UNSUPPORTED = "1";
+  try {
+    const ctx: DeployContext = {
+      config: configured,
+      configPath,
+      configIdentity: configIdentity(configPath),
+      configDir: dir,
+      sandboxDir: join(dir, "sandbox"),
+      target: "aws",
+    };
+    const provider = hostingProvider("aws");
+    const options = provider.upOptions(ctx, { only: "web-ui" }, true);
+    const preflighted = await provider.preflightUp(ctx, options);
+    const prepared = await prepareUpSubstrate(preflighted, options);
+    await provider.createBackend(prepared).up(options);
+    assert.equal(prepared.awsMicrovmBuildPlanned, undefined);
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /lambda-microvms/);
+  } finally {
+    process.env.PATH = priorPath;
+    if (priorUnsupported === undefined) delete process.env.AWS_FAKE_LAMBDA_UNSUPPORTED;
+    else process.env.AWS_FAKE_LAMBDA_UNSUPPORTED = priorUnsupported;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS plan reports missing and inactive remote MicroVM versions without mutation", async () => {
+  for (const scenario of ["missing", "inactive"] as const) {
+    const dir = mkdtempSync(join(tmpdir(), `qm-aws-plan-remote-${scenario}-`));
+    const configPath = join(dir, "qm.config.jsonc");
+    const { sandbox: _sandbox, ...base } = oneServiceConfig();
+    const configured: QmConfig = {
+      ...base,
+      env: {
+        ...base.env,
+        core: {
+          ...base.env.core,
+          AWS_DEPLOY_IMAGE_VERSION: "1",
+          AWS_DEPLOY_IMAGE_SOURCE_SHA256: microvmBuildArchiveSha256(),
+        },
+      },
+    };
+    const raw = JSON.stringify(configured);
+    writeFileSync(configPath, raw);
+    const fake = statefulAws(dir, configured);
+    const priorMissing = process.env.AWS_FAKE_IMAGE_MISSING;
+    const priorStatus = process.env.AWS_FAKE_IMAGE_STATUS;
+    if (scenario === "missing") process.env.AWS_FAKE_IMAGE_MISSING = "1";
+    else process.env.AWS_FAKE_IMAGE_STATUS = "INACTIVE";
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (...parts: unknown[]): void => void lines.push(parts.join(" "));
+    try {
+      const ctx: DeployContext = {
+        config: configured,
+        configPath,
+        configIdentity: configIdentity(configPath),
+        configDir: dir,
+        sandboxDir: join(dir, "sandbox"),
+        target: "aws",
+      };
+      const provider = hostingProvider("aws");
+      const options = provider.upOptions(ctx, {}, true);
+      const preflighted = await provider.preflightUp(ctx, options);
+      assert.equal(preflighted.awsPreflight?.microvmRebuildRequired, true);
+      const prepared = await prepareUpSubstrate(preflighted, options);
+      await provider.createBackend(prepared).up(options);
+      assert.match(lines.join("\n"), /MicroVM image: rebuild required before the core deployment/);
+      assert.doesNotMatch(
+        readFileSync(fake.log, "utf8"),
+        /s3api put-object|lambda-microvms (?:create|update|delete)|dynamodb put-item|ecs register-task-definition|ecs update-service/,
+      );
+      assert.equal(readFileSync(configPath, "utf8"), raw);
+    } finally {
+      console.log = log;
+      if (priorMissing === undefined) delete process.env.AWS_FAKE_IMAGE_MISSING;
+      else process.env.AWS_FAKE_IMAGE_MISSING = priorMissing;
+      if (priorStatus === undefined) delete process.env.AWS_FAKE_IMAGE_STATUS;
+      else process.env.AWS_FAKE_IMAGE_STATUS = priorStatus;
+      fake.restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("AWS MicroVM preflight fails clearly when the CLI lacks lambda-microvms", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-plan-no-microvms-"));
+  const { sandbox: _sandbox, ...configured } = oneServiceConfig();
+  const fake = statefulAws(dir, configured as QmConfig);
+  const prior = process.env.AWS_FAKE_LAMBDA_UNSUPPORTED;
+  process.env.AWS_FAKE_LAMBDA_UNSUPPORTED = "1";
+  try {
+    const ctx: DeployContext = {
+      config: configured as QmConfig,
+      configPath: join(dir, "qm.config.jsonc"),
+      configIdentity: TEST_CONFIG_IDENTITY,
+      configDir: dir,
+      sandboxDir: join(dir, "sandbox"),
+      target: "aws",
+    };
+    const options = hostingProvider("aws").upOptions(ctx, {}, true);
+    await assert.rejects(
+      () => hostingProvider("aws").preflightUp(ctx, options),
+      /AWS CLI lacks the `lambda-microvms` commands/,
+    );
+    assert.doesNotMatch(
+      readFileSync(fake.log, "utf8"),
+      /s3api put-object|dynamodb put-item|ecs register-task-definition|ecs update-service/,
+    );
+  } finally {
+    if (prior === undefined) delete process.env.AWS_FAKE_LAMBDA_UNSUPPORTED;
+    else process.env.AWS_FAKE_LAMBDA_UNSUPPORTED = prior;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 function manifestItems(
   manifests: Array<{
     id: string;
     previous?: string;
     imageLabel?: string;
-    sandboxImage?: string;
     dbSnapshot?: string;
     tasks: Record<string, string>;
     imageProvenance?: Record<
@@ -2418,6 +5274,369 @@ test("rollback uses a coherent durable manifest across independent service histo
   } finally {
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+type HistoricalTaskChannel = "secretOptions" | "repositoryCredentials" | "command" | "taskRoleArn";
+
+function addHistoricalTaskChannel(definition: Record<string, unknown>, channel: HistoricalTaskChannel): void {
+  const container = (definition.containerDefinitions as Array<Record<string, unknown>>)[0]!;
+  if (channel === "secretOptions") {
+    (container.logConfiguration as Record<string, unknown>).secretOptions = [
+      { name: "splunk-token", valueFrom: testSecretArn("CAPABILITY_SECRET") },
+    ];
+  } else if (channel === "repositoryCredentials") {
+    container.repositoryCredentials = { credentialsParameter: testSecretArn("CAPABILITY_SECRET") };
+  } else if (channel === "command") {
+    container.command = ["node", "exfiltrate.js"];
+  } else {
+    definition.taskRoleArn = "arn:aws:iam::123456789012:role/attacker";
+  }
+}
+
+test("AWS rollback rejects every unexpected historical task-definition channel", async (t) => {
+  for (const channel of ["secretOptions", "repositoryCredentials", "command", "taskRoleArn"] as const) {
+    await t.test(channel, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-task-channel-"));
+      const configured = oneServiceConfig();
+      const old = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:7";
+      const current = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:9";
+      const fake = statefulAws(
+        dir,
+        configured,
+        manifestItems(
+          [
+            { id: "old", tasks: { core: old } },
+            { id: "current", previous: "old", tasks: { core: current } },
+          ],
+          "current",
+        ),
+      );
+      const state = JSON.parse(readFileSync(fake.state, "utf8"));
+      addHistoricalTaskChannel(state.definitions[old], channel);
+      writeFileSync(fake.state, JSON.stringify(state));
+      try {
+        await assert.rejects(awsRollback(configured), /stale or unowned task-definition fields/);
+        assert.doesNotMatch(readFileSync(fake.log, "utf8"), /ecs update-service|dynamodb transact-write-items/);
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS rollback rejects historical provider-owned secret destinations before mutation", async (t) => {
+  for (const destination of awsProviderSecretDestinations) {
+    await t.test(destination, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-provider-destination-"));
+      const configured = oneServiceConfig();
+      const old = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:7";
+      const current = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:9";
+      const fake = statefulAws(
+        dir,
+        configured,
+        manifestItems(
+          [
+            { id: "old", tasks: { core: old } },
+            { id: "current", previous: "old", tasks: { core: current } },
+          ],
+          "current",
+        ),
+      );
+      const state = JSON.parse(readFileSync(fake.state, "utf8"));
+      state.definitions[old].containerDefinitions[0].secrets.push({
+        name: destination,
+        valueFrom: testSecretArn("CORE_SIGNING_SECRET"),
+      });
+      writeFileSync(fake.state, JSON.stringify(state));
+      try {
+        await assert.rejects(awsRollback(configured), /stale or unowned secret entries/);
+        assert.doesNotMatch(readFileSync(fake.log, "utf8"), /ecs update-service|dynamodb transact-write-items/);
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS rollback enforces the current portal auth-broker wiring", async (t) => {
+  for (const mode of ["built-in removed", "external injected"] as const) {
+    await t.test(mode, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-portal-broker-"));
+      const configured = mode === "built-in removed" ? aliasedTrustConfig("auth").config : config;
+      const tasks = (revision: number): Record<string, string> =>
+        Object.fromEntries(
+          Object.entries(configured.aws!.services).map(([workload, service]) => [
+            workload,
+            `arn:aws:ecs:us-west-2:123456789012:task-definition/${service.ecsService}:${revision}`,
+          ]),
+        );
+      const old = tasks(7);
+      const current = tasks(9);
+      const fake = statefulAws(
+        dir,
+        configured,
+        manifestItems(
+          [
+            { id: "old", tasks: old },
+            { id: "current", previous: "old", tasks: current },
+          ],
+          "current",
+        ),
+      );
+      const state = JSON.parse(readFileSync(fake.state, "utf8"));
+      const portalTask = old.portal;
+      assert.ok(portalTask);
+      const environment = state.definitions[portalTask].containerDefinitions[0].environment;
+      if (mode === "built-in removed") {
+        state.definitions[portalTask].containerDefinitions[0].environment = environment.filter(
+          (entry: { name: string }) => entry.name !== "AUTH_BROKER_UPSTREAM",
+        );
+      } else {
+        environment.push({ name: "AUTH_BROKER_UPSTREAM", value: "http://auth.acme.internal:8080" });
+      }
+      writeFileSync(fake.state, JSON.stringify(state));
+      try {
+        await assert.rejects(awsRollback(configured), /stale or unowned environment entries/);
+        assert.doesNotMatch(readFileSync(fake.log, "utf8"), /ecs update-service|dynamodb transact-write-items/);
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS rollback validates the authoritative runtime secret set under its lease", async (t) => {
+  for (const selected of [{ name: "weak", value: "x" }, { name: "empty", value: "" }, { name: "missing" }] as const) {
+    await t.test(selected.name, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-runtime-secret-"));
+      const configured = oneServiceConfig();
+      const old = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:7";
+      const current = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:9";
+      const fake = statefulAws(
+        dir,
+        configured,
+        manifestItems(
+          [
+            { id: "old", tasks: { core: old } },
+            { id: "current", previous: "old", tasks: { core: current } },
+          ],
+          "current",
+        ),
+      );
+      const priorOverrides = process.env.AWS_FAKE_SECRET_OVERRIDES;
+      const priorMissing = process.env.AWS_FAKE_MISSING_SECRET_NAME;
+      if (selected.name === "missing") {
+        delete process.env.AWS_FAKE_SECRET_OVERRIDES;
+        process.env.AWS_FAKE_MISSING_SECRET_NAME = "CORE_SIGNING_SECRET";
+      } else {
+        process.env.AWS_FAKE_SECRET_OVERRIDES = JSON.stringify({ CORE_SIGNING_SECRET: selected.value });
+        delete process.env.AWS_FAKE_MISSING_SECRET_NAME;
+      }
+      try {
+        await assert.rejects(
+          awsRollback(configured),
+          selected.name === "missing"
+            ? /ResourceNotFoundException/
+            : /required AWS secret CORE_SIGNING_SECRET has no usable/,
+        );
+        const calls = readFileSync(fake.log, "utf8");
+        assert.ok(calls.indexOf("dynamodb put-item") < calls.indexOf("acme/qm/CORE_SIGNING_SECRET"));
+        assert.match(calls, /dynamodb delete-item/);
+        assert.doesNotMatch(calls, /ecs update-service|dynamodb transact-write-items/);
+      } finally {
+        if (priorOverrides === undefined) delete process.env.AWS_FAKE_SECRET_OVERRIDES;
+        else process.env.AWS_FAKE_SECRET_OVERRIDES = priorOverrides;
+        if (priorMissing === undefined) delete process.env.AWS_FAKE_MISSING_SECRET_NAME;
+        else process.env.AWS_FAKE_MISSING_SECRET_NAME = priorMissing;
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+  await t.test("valid", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-runtime-secret-"));
+    const configured = oneServiceConfig();
+    const old = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:7";
+    const current = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:9";
+    const fake = statefulAws(
+      dir,
+      configured,
+      manifestItems(
+        [
+          { id: "old", tasks: { core: old } },
+          { id: "current", previous: "old", tasks: { core: current } },
+        ],
+        "current",
+      ),
+    );
+    try {
+      await awsRollback(configured);
+      const calls = readFileSync(fake.log, "utf8");
+      const lease = calls.indexOf("dynamodb put-item");
+      const secret = calls.indexOf("acme/qm/CORE_SIGNING_SECRET", lease);
+      const update = calls.indexOf("ecs update-service");
+      assert.ok(lease >= 0 && lease < secret && secret < update);
+    } finally {
+      fake.restore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+test("AWS rollback repairs stale or missing PUBLIC_API_URL before reactivating tasks", async (t) => {
+  for (const mode of ["stale", "missing"] as const) {
+    await t.test(mode, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-public-api-url-"));
+      const configured: QmConfig = { ...oneServiceConfig(), apiUrl: "https://api.new.example" };
+      const old = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:7";
+      const current = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:9";
+      const fake = statefulAws(
+        dir,
+        configured,
+        manifestItems(
+          [
+            { id: "old", tasks: { core: old } },
+            { id: "current", previous: "old", tasks: { core: current } },
+          ],
+          "current",
+        ),
+      );
+      const priorOverrides = process.env.AWS_FAKE_SECRET_OVERRIDES;
+      const priorMissing = process.env.AWS_FAKE_MISSING_SECRET_NAME;
+      if (mode === "stale") {
+        process.env.AWS_FAKE_SECRET_OVERRIDES = JSON.stringify({
+          PUBLIC_API_URL: "https://api.stale.example",
+        });
+        delete process.env.AWS_FAKE_MISSING_SECRET_NAME;
+      } else {
+        delete process.env.AWS_FAKE_SECRET_OVERRIDES;
+        process.env.AWS_FAKE_MISSING_SECRET_NAME = "PUBLIC_API_URL";
+      }
+      try {
+        await awsRollback(configured);
+        const calls = readFileSync(fake.log, "utf8");
+        const put = calls.indexOf("secretsmanager put-secret-value --secret-id acme/qm/PUBLIC_API_URL");
+        const update = calls.indexOf("ecs update-service");
+        assert.ok(put >= 0 && put < update);
+        const after = JSON.parse(readFileSync(fake.state, "utf8"));
+        assert.equal(after.secretValues.PUBLIC_API_URL, "https://api.new.example");
+      } finally {
+        if (priorOverrides === undefined) delete process.env.AWS_FAKE_SECRET_OVERRIDES;
+        else process.env.AWS_FAKE_SECRET_OVERRIDES = priorOverrides;
+        if (priorMissing === undefined) delete process.env.AWS_FAKE_MISSING_SECRET_NAME;
+        else process.env.AWS_FAKE_MISSING_SECRET_NAME = priorMissing;
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS rollback refuses historical task definitions outside current environment and secret ownership", async (t) => {
+  for (const kind of [
+    "provider environment",
+    "AWS endpoint plaintext",
+    "legacy API endpoint secret",
+    "Slack endpoint secret",
+    "plugin cross-service secret",
+    "sidecar secret",
+  ] as const) {
+    await t.test(kind, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-stale-task-"));
+      const base = oneServiceConfig();
+      const configured: QmConfig =
+        kind === "plugin cross-service secret"
+          ? {
+              ...base,
+              plugins: [{ name: "linear", image: "ghcr.io/acme/linear:1", secrets: [{ name: "LINEAR_TOKEN" }] }],
+              aws: {
+                ...base.aws!,
+                services: {
+                  ...base.aws!.services,
+                  linear: {
+                    ecrRepository: "qm-linear",
+                    ecsService: "acme-linear",
+                    cpu: 256,
+                    memory: 512,
+                    architecture: "amd64",
+                  },
+                },
+              },
+            }
+          : base;
+      const taskSet = (revision: number): Record<string, string> =>
+        Object.fromEntries(
+          Object.entries(configured.aws!.services).map(([workload, service]) => [
+            workload,
+            `arn:aws:ecs:us-west-2:123456789012:task-definition/${service.ecsService}:${revision}`,
+          ]),
+        );
+      const old = taskSet(7);
+      const current = taskSet(9);
+      const fake = statefulAws(
+        dir,
+        configured,
+        manifestItems(
+          [
+            { id: "old", tasks: old },
+            { id: "current", previous: "old", tasks: current },
+          ],
+          "current",
+        ),
+      );
+      const state = JSON.parse(readFileSync(fake.state, "utf8"));
+      const workload = kind === "plugin cross-service secret" ? "linear" : "core";
+      const definition = state.definitions[old[workload]!];
+      if (kind === "provider environment") {
+        definition.containerDefinitions[0].environment.find(
+          (entry: { name: string }) => entry.name === "DATA_DIR",
+        ).value = "/tmp/lost";
+      } else if (kind === "AWS endpoint plaintext") {
+        definition.containerDefinitions[0].environment.push({
+          name: "AWS_ENDPOINT_URL_S3",
+          value: "https://attacker.example",
+        });
+      } else if (kind === "legacy API endpoint secret") {
+        definition.containerDefinitions[0].secrets.push({
+          name: "AGENT_API_URL",
+          valueFrom: testSecretArn("CORE_SIGNING_SECRET"),
+        });
+      } else if (kind === "Slack endpoint secret") {
+        definition.containerDefinitions[0].secrets.push({
+          name: "SLACK_API_URL",
+          valueFrom: testSecretArn("CORE_SIGNING_SECRET"),
+        });
+      } else if (kind === "plugin cross-service secret") {
+        definition.containerDefinitions[0].secrets.push({
+          name: "DATABASE_URL",
+          valueFrom: testSecretArn("DATABASE_URL"),
+        });
+      } else {
+        definition.containerDefinitions.push({
+          name: "sidecar",
+          image: "attacker.example/sidecar:latest",
+          environment: [],
+          secrets: [{ name: "CORE_SIGNING_SECRET", valueFrom: testSecretArn("CORE_SIGNING_SECRET") }],
+        });
+      }
+      writeFileSync(fake.state, JSON.stringify(state));
+      try {
+        await assert.rejects(
+          awsRollback(configured),
+          kind === "sidecar secret"
+            ? /lacks a trusted digest-pinned task definition/
+            : /stale or unowned (?:environment|secret) entries/,
+        );
+        assert.doesNotMatch(readFileSync(fake.log, "utf8"), /ecs update-service|dynamodb transact-write-items/);
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   }
 });
 
@@ -2514,7 +5733,6 @@ test("AWS rollback surfaces the snapshot even when a rotation manifest sits dire
         {
           id: "r",
           previous: "b",
-          sandboxImage: `registry.fly.io/acme-sandboxes@sha256:${"c".repeat(64)}`,
           tasks: { core: "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:5" },
         },
         {
@@ -2571,15 +5789,164 @@ test("rollback resolves a label through its full-service manifest before mutatin
   }
 });
 
-test("AWS rollback restores the recorded layer without reading the broken current data plane", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-layer-"));
+function awsRollbackLayerFixture(dir: string): {
+  single: QmConfig;
+  fake: ReturnType<typeof statefulAws>;
+  oldBody: string;
+  currentBody: string;
+  oldHash: string;
+  currentHash: string;
+} {
   const single = oneServiceConfig();
   const task = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:2";
-  const oldBody = JSON.stringify({ contract: 1, tools: [], skills: [{ path: "skills/old/SKILL.md", content: "old" }] });
+  const oldBody = JSON.stringify({
+    contract: 1,
+    tools: [],
+    skills: [{ path: "skills/old/SKILL.md", content: "---\nname: old\ndescription: Old.\n---\nOld.\n" }],
+  });
   const currentBody = JSON.stringify({
     contract: 1,
     tools: [],
-    skills: [{ path: "skills/current/SKILL.md", content: "current" }],
+    skills: [
+      { path: "skills/current/SKILL.md", content: "---\nname: current\ndescription: Current.\n---\nCurrent.\n" },
+    ],
+  });
+  const oldHash = createHash("sha256").update(oldBody).digest("hex");
+  const currentHash = createHash("sha256").update(currentBody).digest("hex");
+  const oldLayer = { key: "deployment/layers/old.json", sha256: oldHash };
+  const currentLayer = { key: "deployment/layers/current.json", sha256: currentHash };
+  const fake = statefulAws(
+    dir,
+    single,
+    manifestItems(
+      [
+        { id: "old", tasks: { core: task }, layer: oldLayer },
+        { id: "current", previous: "old", tasks: { core: task }, layer: currentLayer },
+      ],
+      "current",
+    ),
+  );
+  const state = JSON.parse(readFileSync(fake.state, "utf8"));
+  state.objects[oldLayer.key] = oldBody;
+  state.objects[currentLayer.key] = currentBody;
+  writeFileSync(fake.state, JSON.stringify(state));
+  return { single, fake, oldBody, currentBody, oldHash, currentHash };
+}
+
+function durableLayerStateBody(
+  body: string,
+  contentHash: string,
+  generation = 2,
+  operationId: string | null = "1".repeat(32),
+): string {
+  return JSON.stringify({
+    contract: 1,
+    version: generation,
+    generation,
+    source: "durable",
+    bundle: JSON.parse(body),
+    contentHash,
+    runtimeContentHash: contentHash,
+    operationId,
+    status: "applied",
+  });
+}
+
+function layerMutationResponse(
+  version: number,
+  contentHash: string,
+  operationId: string | null,
+  status: "applied" | "degraded" = "applied",
+): Response {
+  return new Response(
+    JSON.stringify({
+      ok: true,
+      version,
+      contentHash,
+      operationId,
+      changed: true,
+      durable: true,
+      status,
+      ...(status === "degraded" ? { message: "projection failed" } : {}),
+    }),
+    { status: status === "degraded" ? 202 : 200 },
+  );
+}
+
+test("AWS rollback bounds deployment-layer artifact downloads before reading them", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-layer-oversized-"));
+  const { single, fake } = awsRollbackLayerFixture(dir);
+  const state = JSON.parse(readFileSync(fake.state, "utf8"));
+  state.objects["deployment/layers/old.json"] = "x".repeat(2_000_000);
+  writeFileSync(fake.state, JSON.stringify(state));
+  try {
+    await assert.rejects(
+      awsRollback(single, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY }),
+      /deployment-layer artifact is invalid/,
+    );
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /s3api get-object .*deployment\/layers\/old\.json .*--range bytes=0-1000000/);
+    assert.doesNotMatch(calls, /ecs update-service/);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS rollback bounds a deployment-layer artifact that grows after descriptor stat", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-layer-growth-"));
+  const { single, fake } = awsRollbackLayerFixture(dir);
+  const originalReadSync = fs.readSync;
+  let injected = false;
+  let largestRead = 0;
+  fs.readSync = ((
+    descriptor: number,
+    buffer: Buffer,
+    offset: number,
+    length: number,
+    position: number | null,
+  ): number => {
+    largestRead = Math.max(largestRead, length);
+    const count = originalReadSync(descriptor, buffer, offset, length, position);
+    if (!injected && position === 0 && count < length) {
+      buffer[offset + count] = 0;
+      injected = true;
+      return count + 1;
+    }
+    return count;
+  }) as typeof fs.readSync;
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(
+      awsRollback(single, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY }),
+      /deployment-layer artifact is invalid/,
+    );
+    assert.equal(injected, true);
+    assert.ok(largestRead <= 1_000_001);
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /ecs update-service/);
+  } finally {
+    fs.readSync = originalReadSync;
+    syncBuiltinESMExports();
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS rollback snapshots the current layer and conditionally restores the recorded layer", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-layer-"));
+  const single = oneServiceConfig();
+  const task = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:2";
+  const oldBody = JSON.stringify({
+    contract: 1,
+    tools: [],
+    skills: [{ path: "skills/old/SKILL.md", content: "---\nname: old\ndescription: Old.\n---\nOld.\n" }],
+  });
+  const currentBody = JSON.stringify({
+    contract: 1,
+    tools: [],
+    skills: [
+      { path: "skills/current/SKILL.md", content: "---\nname: current\ndescription: Current.\n---\nCurrent.\n" },
+    ],
   });
   const artifact = (id: string, body: string) => ({
     key: `deployment/layers/${id}.json`,
@@ -2605,17 +5972,38 @@ test("AWS rollback restores the recorded layer without reading the broken curren
   const priorFetch = globalThis.fetch;
   const priorSecret = process.env.CORE_SIGNING_SECRET;
   const bodies: string[] = [];
-  process.env.CORE_SIGNING_SECRET = "test-signing-secret";
-  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+  const urls: URL[] = [];
+  const currentOperationId = "1".repeat(32);
+  process.env.CORE_SIGNING_SECRET = "test-signing-secret-with-32-bytes";
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    urls.push(url);
     if (init?.method !== "PUT") {
-      return new Response("current release is broken", { status: 503 });
+      return new Response(
+        JSON.stringify({
+          contract: 1,
+          version: 2,
+          generation: 2,
+          source: "durable",
+          bundle: JSON.parse(currentBody),
+          contentHash: currentLayer.sha256,
+          runtimeContentHash: currentLayer.sha256,
+          operationId: currentOperationId,
+          status: "applied",
+        }),
+        { status: 200 },
+      );
     }
     const body = String(init.body ?? "");
     bodies.push(body);
+    const operationId = url.searchParams.get("operationId");
     return new Response(
       JSON.stringify({
+        ok: true,
         version: 3,
         contentHash: createHash("sha256").update(body).digest("hex"),
+        operationId,
+        changed: true,
         durable: true,
         status: "applied",
       }),
@@ -2623,13 +6011,403 @@ test("AWS rollback restores the recorded layer without reading the broken curren
     );
   }) as typeof fetch;
   try {
-    await awsRollback(single, undefined, { configDir: dir });
+    await awsRollback(single, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY });
     assert.deepEqual(bodies, [oldBody]);
+    const put = urls.find((url) => url.searchParams.has("operationId"))!;
+    assert.equal(put.searchParams.get("generation"), "2");
+    assert.equal(put.searchParams.get("source"), "durable");
+    assert.equal(put.searchParams.get("contentHash"), currentLayer.sha256);
+    assert.equal(put.searchParams.get("currentOperationId"), currentOperationId);
+    assert.match(put.searchParams.get("operationId") ?? "", /^[a-f0-9]{32}$/);
     assert.equal(JSON.parse(readFileSync(fake.state, "utf8")).dynamo["deployment/current"].manifestId.S, "old");
   } finally {
     globalThis.fetch = priorFetch;
     if (priorSecret === undefined) delete process.env.CORE_SIGNING_SECRET;
     else process.env.CORE_SIGNING_SECRET = priorSecret;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS rollback restores an acknowledged layer mutation when subsequent layer reads are broken", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-layer-broken-read-"));
+  const single = oneServiceConfig();
+  const targetTask = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:2";
+  const oldBody = JSON.stringify({
+    contract: 1,
+    tools: [],
+    skills: [{ path: "skills/old/SKILL.md", content: "---\nname: old\ndescription: Old.\n---\nOld.\n" }],
+  });
+  const currentBody = JSON.stringify({
+    contract: 1,
+    tools: [],
+    skills: [
+      { path: "skills/current/SKILL.md", content: "---\nname: current\ndescription: Current.\n---\nCurrent.\n" },
+    ],
+  });
+  const oldHash = createHash("sha256").update(oldBody).digest("hex");
+  const currentHash = createHash("sha256").update(currentBody).digest("hex");
+  const oldLayer = { key: "deployment/layers/old.json", sha256: oldHash };
+  const currentLayer = { key: "deployment/layers/current.json", sha256: currentHash };
+  const fake = statefulAws(
+    dir,
+    single,
+    manifestItems(
+      [
+        { id: "old", tasks: { core: targetTask }, layer: oldLayer },
+        { id: "current", previous: "old", tasks: { core: targetTask }, layer: currentLayer },
+      ],
+      "current",
+    ),
+  );
+  const state = JSON.parse(readFileSync(fake.state, "utf8"));
+  state.objects[oldLayer.key] = oldBody;
+  state.objects[currentLayer.key] = currentBody;
+  writeFileSync(fake.state, JSON.stringify(state));
+  const priorFetch = globalThis.fetch;
+  const requests: Array<{ body: string; url: URL }> = [];
+  let reads = 0;
+  const currentOperationId = "1".repeat(32);
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    if (init?.method !== "PUT") {
+      reads += 1;
+      if (reads > 1) return new Response("current release is broken", { status: 503 });
+      return new Response(
+        JSON.stringify({
+          contract: 1,
+          version: 2,
+          generation: 2,
+          source: "durable",
+          bundle: JSON.parse(currentBody),
+          contentHash: currentHash,
+          runtimeContentHash: currentHash,
+          operationId: currentOperationId,
+          status: "applied",
+        }),
+        { status: 200 },
+      );
+    }
+    const body = String(init.body ?? "");
+    requests.push({ body, url });
+    const restoring = body === currentBody;
+    const operationId = url.searchParams.get("operationId");
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        version: restoring ? 4 : 3,
+        contentHash: restoring ? currentHash : oldHash,
+        operationId,
+        changed: true,
+        durable: true,
+        status: restoring ? "applied" : "degraded",
+        ...(restoring ? {} : { message: "projection failed" }),
+      }),
+      { status: restoring ? 200 : 202 },
+    );
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      awsRollback(single, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY }),
+      /deployment layer was not durably applied/,
+    );
+    assert.equal(reads, 1);
+    const forwards = requests.filter((request) => request.body === oldBody);
+    const restores = requests.filter((request) => request.body === currentBody);
+    assert.ok(forwards.length >= 1);
+    assert.equal(restores.length, 1);
+    assert.equal(new Set(forwards.map((request) => request.url.searchParams.get("operationId"))).size, 1);
+    const forwardOperationId = forwards[0]!.url.searchParams.get("operationId");
+    assert.match(forwardOperationId ?? "", /^[a-f0-9]{32}$/);
+    assert.equal(restores[0]!.url.searchParams.get("generation"), "3");
+    assert.equal(restores[0]!.url.searchParams.get("contentHash"), oldHash);
+    assert.equal(restores[0]!.url.searchParams.get("currentOperationId"), forwardOperationId);
+    assert.notEqual(restores[0]!.url.searchParams.get("operationId"), forwardOperationId);
+    const after = JSON.parse(readFileSync(fake.state, "utf8"));
+    assert.equal(after.dynamo["deployment/current"].manifestId.S, "current");
+    assert.equal(
+      after.services["acme-core"].taskDefinition,
+      "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:1",
+    );
+  } finally {
+    globalThis.fetch = priorFetch;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS rollback reuses one deployment-layer operation ID across forward retries", async (t) => {
+  const priorDeadline = process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS;
+  const priorPoll = process.env.QM_AWS_LIVE_PROBE_POLL_MS;
+  process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS = "1000";
+  process.env.QM_AWS_LIVE_PROBE_POLL_MS = "1";
+  t.after(() => {
+    if (priorDeadline === undefined) delete process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS;
+    else process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS = priorDeadline;
+    if (priorPoll === undefined) delete process.env.QM_AWS_LIVE_PROBE_POLL_MS;
+    else process.env.QM_AWS_LIVE_PROBE_POLL_MS = priorPoll;
+  });
+  for (const scenario of ["degraded", "lost-response"] as const) {
+    await t.test(scenario, async () => {
+      const dir = mkdtempSync(join(tmpdir(), `qm-aws-rollback-layer-${scenario}-`));
+      const { single, fake, oldBody, currentBody, oldHash, currentHash } = awsRollbackLayerFixture(dir);
+      const priorFetch = globalThis.fetch;
+      const operationIds: Array<string | null> = [];
+      let attempts = 0;
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        if (init?.method !== "PUT") {
+          return new Response(durableLayerStateBody(currentBody, currentHash), { status: 200 });
+        }
+        assert.equal(String(init.body ?? ""), oldBody);
+        const operationId = url.searchParams.get("operationId");
+        operationIds.push(operationId);
+        attempts += 1;
+        if (attempts === 1) {
+          if (scenario === "degraded") return layerMutationResponse(3, oldHash, operationId, "degraded");
+          throw new Error("deployment-layer response lost after persistence");
+        }
+        return layerMutationResponse(3, oldHash, operationId);
+      }) as typeof fetch;
+      try {
+        await awsRollback(single, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY });
+        assert.equal(attempts, 2);
+        assert.equal(new Set(operationIds).size, 1);
+        assert.match(operationIds[0] ?? "", /^[a-f0-9]{32}$/);
+        assert.equal(JSON.parse(readFileSync(fake.state, "utf8")).dynamo["deployment/current"].manifestId.S, "old");
+      } finally {
+        globalThis.fetch = priorFetch;
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS rollback retries ambiguous layer discovery and restores only its lost-response operation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-layer-ambiguous-"));
+  const { single, fake, oldBody, currentBody, oldHash, currentHash } = awsRollbackLayerFixture(dir);
+  const priorFetch = globalThis.fetch;
+  const forwardOperationIds: Array<string | null> = [];
+  const restores: URL[] = [];
+  let reads = 0;
+  const priorDeadline = process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS;
+  const priorPoll = process.env.QM_AWS_LIVE_PROBE_POLL_MS;
+  process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS = "500";
+  process.env.QM_AWS_LIVE_PROBE_POLL_MS = "1";
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const body = String(init?.body ?? "");
+    if (init?.method !== "PUT") {
+      reads += 1;
+      if (reads === 1) return new Response(durableLayerStateBody(currentBody, currentHash), { status: 200 });
+      if (reads === 2) throw new Error("transient compensation read failure");
+      const operationId = forwardOperationIds[0];
+      return new Response(durableLayerStateBody(oldBody, oldHash, 3, operationId), { status: 200 });
+    }
+    if (body === oldBody) {
+      forwardOperationIds.push(url.searchParams.get("operationId"));
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      throw new Error("deployment-layer response lost after persistence");
+    }
+    assert.equal(body, currentBody);
+    restores.push(url);
+    return layerMutationResponse(4, currentHash, url.searchParams.get("operationId"));
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      awsRollback(single, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY }),
+      /deployment-layer response lost after persistence/,
+    );
+    assert.ok(forwardOperationIds.length >= 1);
+    assert.equal(new Set(forwardOperationIds).size, 1);
+    assert.equal(reads, 3);
+    assert.equal(restores.length, 1);
+    assert.equal(restores[0]!.searchParams.get("generation"), "3");
+    assert.equal(restores[0]!.searchParams.get("contentHash"), oldHash);
+    assert.equal(restores[0]!.searchParams.get("currentOperationId"), forwardOperationIds[0]);
+    assert.notEqual(restores[0]!.searchParams.get("operationId"), forwardOperationIds[0]);
+    const after = JSON.parse(readFileSync(fake.state, "utf8"));
+    assert.equal(after.dynamo["deployment/current"].manifestId.S, "current");
+    assert.equal(
+      after.services["acme-core"].taskDefinition,
+      "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:1",
+    );
+  } finally {
+    if (priorDeadline === undefined) delete process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS;
+    else process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS = priorDeadline;
+    if (priorPoll === undefined) delete process.env.QM_AWS_LIVE_PROBE_POLL_MS;
+    else process.env.QM_AWS_LIVE_PROBE_POLL_MS = priorPoll;
+    globalThis.fetch = priorFetch;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS rollback refuses to compensate across an identical-hash ABA writer", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-layer-aba-"));
+  const { single, fake, oldBody, currentBody, oldHash, currentHash } = awsRollbackLayerFixture(dir);
+  const priorFetch = globalThis.fetch;
+  const forwardUrls: URL[] = [];
+  const restoreUrls: URL[] = [];
+  let reads = 0;
+  const priorDeadline = process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS;
+  const priorPoll = process.env.QM_AWS_LIVE_PROBE_POLL_MS;
+  process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS = "200";
+  process.env.QM_AWS_LIVE_PROBE_POLL_MS = "1";
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(input instanceof Request ? input.url : String(input));
+    const body = String(init?.body ?? "");
+    if (init?.method !== "PUT") {
+      reads += 1;
+      return new Response(durableLayerStateBody(currentBody, currentHash), { status: 200 });
+    }
+    if (body === oldBody) {
+      forwardUrls.push(url);
+      if (forwardUrls.length === 1) {
+        return layerMutationResponse(3, oldHash, url.searchParams.get("operationId"), "degraded");
+      }
+    } else {
+      assert.equal(body, currentBody);
+      restoreUrls.push(url);
+    }
+    return new Response(JSON.stringify({ error: "deployment_layer_conflict" }), { status: 409 });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      awsRollback(single, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY }),
+      /compensation also failed.*deployment layer sync failed \(409\)/,
+    );
+    assert.equal(reads, 1);
+    assert.ok(forwardUrls.length >= 2);
+    assert.ok(restoreUrls.length >= 1);
+    const forwardOperationId = forwardUrls[0]!.searchParams.get("operationId");
+    assert.equal(new Set(forwardUrls.map((url) => url.searchParams.get("operationId"))).size, 1);
+    for (const url of restoreUrls) {
+      assert.equal(url.searchParams.get("generation"), "3");
+      assert.equal(url.searchParams.get("contentHash"), oldHash);
+      assert.equal(url.searchParams.get("currentOperationId"), forwardOperationId);
+    }
+    assert.equal(new Set(restoreUrls.map((url) => url.searchParams.get("operationId"))).size, 1);
+    assert.notEqual(restoreUrls[0]!.searchParams.get("operationId"), forwardOperationId);
+    const after = JSON.parse(readFileSync(fake.state, "utf8"));
+    assert.equal(after.dynamo["deployment/current"].manifestId.S, "current");
+    assert.equal(
+      after.services["acme-core"].taskDefinition,
+      "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:1",
+    );
+  } finally {
+    if (priorDeadline === undefined) delete process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS;
+    else process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS = priorDeadline;
+    if (priorPoll === undefined) delete process.env.QM_AWS_LIVE_PROBE_POLL_MS;
+    else process.env.QM_AWS_LIVE_PROBE_POLL_MS = priorPoll;
+    globalThis.fetch = priorFetch;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS rollback clears an acknowledged version-zero layer mutation without synthesizing a bundle", async (t) => {
+  for (const source of ["none", "filesystem"] as const) {
+    await t.test(source, async () => {
+      const dir = mkdtempSync(join(tmpdir(), `qm-aws-rollback-layer-${source}-`));
+      const { single, fake, oldBody, currentBody, oldHash } = awsRollbackLayerFixture(dir);
+      const priorFetch = globalThis.fetch;
+      const forwardUrls: URL[] = [];
+      const clears: Array<{ body: string; url: URL }> = [];
+      let reads = 0;
+      globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        const body = String(init?.body ?? "");
+        if (init?.method === "DELETE") {
+          clears.push({ body, url });
+          return layerMutationResponse(2, oldHash, url.searchParams.get("operationId"));
+        }
+        if (init?.method === "PUT") {
+          assert.equal(body, oldBody);
+          forwardUrls.push(url);
+          if (forwardUrls.length === 1) {
+            return layerMutationResponse(1, oldHash, url.searchParams.get("operationId"), "degraded");
+          }
+          return new Response(JSON.stringify({ error: "deployment_layer_conflict" }), { status: 409 });
+        }
+        reads += 1;
+        return new Response(
+          JSON.stringify({ contract: 1, version: 0, generation: 0, source, contentHash: null, operationId: null }),
+          { status: 200 },
+        );
+      }) as typeof fetch;
+      try {
+        await assert.rejects(
+          awsRollback(single, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY }),
+          /deployment layer was not durably applied/,
+        );
+        assert.equal(reads, 1);
+        assert.ok(forwardUrls.length >= 1);
+        assert.equal(clears.length, 1);
+        const forwardOperationId = forwardUrls[0]!.searchParams.get("operationId");
+        assert.equal(clears[0]!.body, "");
+        assert.equal(clears[0]!.url.searchParams.get("generation"), "1");
+        assert.equal(clears[0]!.url.searchParams.get("source"), "durable");
+        assert.equal(clears[0]!.url.searchParams.get("contentHash"), oldHash);
+        assert.equal(clears[0]!.url.searchParams.get("currentOperationId"), forwardOperationId);
+        assert.notEqual(clears[0]!.url.searchParams.get("operationId"), forwardOperationId);
+        assert.notEqual(oldBody, currentBody);
+        const after = JSON.parse(readFileSync(fake.state, "utf8"));
+        assert.equal(after.dynamo["deployment/current"].manifestId.S, "current");
+      } finally {
+        globalThis.fetch = priorFetch;
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS rollback treats a pre-mutation layer timeout as already restored", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-rollback-layer-timeout-before-mutation-"));
+  const { single, fake, oldBody } = awsRollbackLayerFixture(dir);
+  const priorFetch = globalThis.fetch;
+  const priorDeadline = process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS;
+  const priorPoll = process.env.QM_AWS_LIVE_PROBE_POLL_MS;
+  process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS = "300";
+  process.env.QM_AWS_LIVE_PROBE_POLL_MS = "1";
+  let reads = 0;
+  let puts = 0;
+  let deletes = 0;
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    if (init?.method === "DELETE") {
+      deletes += 1;
+      throw new Error("clear must not run");
+    }
+    if (init?.method === "PUT") {
+      puts += 1;
+      assert.equal(String(init.body ?? ""), oldBody);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      throw new Error("deployment-layer request timed out before mutation");
+    }
+    reads += 1;
+    return new Response(
+      JSON.stringify({ contract: 1, version: 0, generation: 0, source: "none", contentHash: null, operationId: null }),
+      { status: 200 },
+    );
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      awsRollback(single, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY }),
+      /request timed out before mutation/,
+    );
+    assert.equal(reads, 2);
+    assert.equal(puts, 1);
+    assert.equal(deletes, 0);
+    const after = JSON.parse(readFileSync(fake.state, "utf8"));
+    assert.equal(after.dynamo["deployment/current"].manifestId.S, "current");
+  } finally {
+    if (priorDeadline === undefined) delete process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS;
+    else process.env.QM_AWS_LIVE_PROBE_DEADLINE_MS = priorDeadline;
+    if (priorPoll === undefined) delete process.env.QM_AWS_LIVE_PROBE_POLL_MS;
+    else process.env.QM_AWS_LIVE_PROBE_POLL_MS = priorPoll;
+    globalThis.fetch = priorFetch;
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -2675,7 +6453,7 @@ test("AWS rollback of a scaled-to-zero stack defers the layer sync instead of fa
     throw new Error("no core is running; the layer sync must be deferred");
   }) as typeof fetch;
   try {
-    await awsRollback(single, undefined, { configDir: dir });
+    await awsRollback(single, undefined, { configDir: dir, configIdentity: TEST_CONFIG_IDENTITY });
     const after = JSON.parse(readFileSync(fake.state, "utf8"));
     assert.equal(after.dynamo["deployment/current"].manifestId.S, "old");
     assert.equal(
@@ -2716,20 +6494,32 @@ test("rollback refuses an incomplete manifest before mutating ECS", async () => 
 test("secrets push never creates secret containers outside Terraform", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-push-"));
   const secretsConfig: QmConfig = { ...oneServiceConfig(), env: {} };
+  const adversarialConfig: QmConfig = {
+    ...secretsConfig,
+    aws: { ...secretsConfig.aws!, secretsPrefix: "ResourceNotFoundException/" },
+  };
   const operator = computedSecrets(secretsConfig).filter(
     (secret) => secret.managedBy === "operator" && secret.required,
   );
-  writeFileSync(join(dir, ".env"), operator.map((secret) => `${secret.name}=${TEST_SECRET_VALUE}`).join("\n"));
+  writeFileSync(
+    join(dir, ".env"),
+    operator.map((secret) => `${secret.name}=${selectedTestSecretValue(secret.name)}`).join("\n"),
+  );
   const denied = fakeAws(
     dir,
     `
-if (a.includes("dynamodb get-item")) console.log("{}");
+const args = process.argv.slice(2);
+const secretId = args[args.indexOf("--secret-id") + 1];
+if (a.includes("secretsmanager describe-secret")) console.log(JSON.stringify({ ARN: "arn:aws:secretsmanager:us-west-2:123456789012:secret:" + secretId + "-AbCdEf" }));
+else if (a.includes("secretsmanager get-secret-value") && a.includes("DATABASE_URL")) console.log(JSON.stringify({ ARN: "arn:aws:secretsmanager:us-west-2:123456789012:secret:" + secretId + "-AbCdEf", SecretString: "postgres://database.example/qm" }));
+else if (a.includes("secretsmanager get-secret-value")) console.log("{}");
+else if (a.includes("dynamodb get-item")) console.log("{}");
 else if (a.includes("ecs describe-services")) console.log(JSON.stringify({ services: [{ serviceName: "acme-core", desiredCount: 0, runningCount: 0, tags: [{ key: "Deployment", value: "acme" }, { key: "ManagedBy", value: "terraform" }] }], failures: [] }));
 else if (a.includes("put-secret-value")) { console.error("An error occurred (AccessDeniedException) when calling the PutSecretValue operation"); process.exit(1); }
 console.log("");`,
   );
   try {
-    await assert.rejects(() => awsSecretsPush(secretsConfig, dir), /AccessDeniedException/);
+    await assert.rejects(() => awsSecretsPush(adversarialConfig, dir, testSecretValues(dir)), /AccessDeniedException/);
     assert.ok(
       !readFileSync(denied.log, "utf8").includes("create-secret"),
       "a non-missing error must not be masked by create-secret",
@@ -2740,17 +6530,25 @@ console.log("");`,
   const missing = fakeAws(
     dir,
     `
-if (a.includes("dynamodb get-item")) console.log("{}");
+const args = process.argv.slice(2);
+const secretId = args[args.indexOf("--secret-id") + 1];
+if (a.includes("secretsmanager describe-secret") && secretId.endsWith("/SPRITES_TOKEN")) { console.error("An error occurred (ResourceNotFoundException) when calling the DescribeSecret operation"); process.exit(1); }
+else if (a.includes("secretsmanager describe-secret")) console.log(JSON.stringify({ ARN: "arn:aws:secretsmanager:us-west-2:123456789012:secret:" + secretId + "-AbCdEf" }));
+else if (a.includes("secretsmanager get-secret-value") && a.includes("DATABASE_URL")) console.log(JSON.stringify({ ARN: "arn:aws:secretsmanager:us-west-2:123456789012:secret:" + secretId + "-AbCdEf", SecretString: "postgres://database.example/qm" }));
+else if (a.includes("secretsmanager get-secret-value")) console.log("{}");
+else if (a.includes("dynamodb get-item")) console.log("{}");
 else if (a.includes("ecs describe-services")) console.log(JSON.stringify({ services: [{ serviceName: "acme-core", desiredCount: 0, runningCount: 0, tags: [{ key: "Deployment", value: "acme" }, { key: "ManagedBy", value: "terraform" }] }], failures: [] }));
-else if (a.includes("put-secret-value")) { console.error("An error occurred (ResourceNotFoundException) when calling the PutSecretValue operation"); process.exit(1); }
+else if (a.includes("put-secret-value")) console.log("");
 console.log("");`,
   );
   try {
     await assert.rejects(
-      () => awsSecretsPush(secretsConfig, dir),
+      () => awsSecretsPush(secretsConfig, dir, testSecretValues(dir)),
       /apply the rendered Terraform before pushing secrets/,
     );
-    assert.doesNotMatch(readFileSync(missing.log, "utf8"), /create-secret/);
+    const calls = readFileSync(missing.log, "utf8");
+    assert.ok((calls.match(/secretsmanager describe-secret/g)?.length ?? 0) > 1);
+    assert.doesNotMatch(calls, /put-secret-value|create-secret/);
   } finally {
     missing.restore();
     rmSync(dir, { recursive: true, force: true });
@@ -2880,6 +6678,460 @@ console.log("");`,
   }
 });
 
+test("ambiguous AWS lease acquisition cleanup is holder-conditioned and ignores exception tokens in arguments", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-argv-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb put-item")) { console.error("AccessDeniedException"); process.exit(1); }
+console.log("");`,
+  );
+  const aws = { ...config.aws!, cluster: "ConditionalCheckFailedException" };
+  try {
+    await assert.rejects(
+      withAwsLease(aws, async () => {}),
+      /AccessDeniedException/,
+    );
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /dynamodb delete-item/);
+    assert.match(calls, /--condition-expression holder = :holder/);
+    const put = calls.split("\n").find((line) => line.includes("dynamodb put-item"))!;
+    const cleanup = calls.split("\n").find((line) => line.includes("dynamodb delete-item"))!;
+    const putHolder = JSON.parse(put.match(/--item (.+) --condition-expression/)![1]!).holder.S;
+    const cleanupHolder = JSON.parse(cleanup.match(/--expression-attribute-values (.+) --region/)![1]!)[":holder"].S;
+    assert.equal(cleanupHolder, putHolder);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS lease release failures surface after success and alongside primary failures", async (t) => {
+  for (const primary of [false, true]) {
+    await t.test(primary ? "primary and release fail" : "release fails", async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-release-"));
+      const fake = fakeAws(
+        dir,
+        `
+if (a.includes("dynamodb put-item")) console.log("");
+else if (a.includes("dynamodb delete-item")) { console.error("DeleteLeaseFailure"); process.exit(1); }
+else console.log("");`,
+      );
+      try {
+        await assert.rejects(
+          withAwsLease(config.aws!, async () => {
+            if (primary) throw new Error("primary operation failure");
+          }),
+          primary
+            ? /primary operation failure; the AWS deployment lease could not be released/
+            : /could not release the AWS deployment lease/,
+        );
+        assert.match(readFileSync(fake.log, "utf8"), /dynamodb delete-item/);
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("a standalone AWS lease wrapper exits only after its conditioned release", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-standalone-release-"));
+  const fake = fakeAws(dir, `console.log("");`);
+  const moduleUrl = new URL("../src/aws-lease.ts", import.meta.url).href;
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `import { withAwsLease } from ${JSON.stringify(moduleUrl)}; await withAwsLease(${JSON.stringify(config.aws!)}, async () => {}); process.stdout.write("DONE\\n");`,
+    ],
+    { env: process.env, encoding: "utf8" },
+  );
+  try {
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "DONE\n");
+    assert.match(readFileSync(fake.log, "utf8"), /dynamodb delete-item .*--condition-expression holder = :holder/);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS lease signal cleanup reports a failed conditioned release before exiting", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-signal-release-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb put-item")) console.log("");
+else if (a.includes("dynamodb delete-item")) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700);
+  console.error("DeleteLeaseFailure");
+  process.exit(1);
+}
+else console.log("");`,
+  );
+  const moduleUrl = new URL("../src/aws-lease.ts", import.meta.url).href;
+  const script = `
+import { withAwsLease } from ${JSON.stringify(moduleUrl)};
+await withAwsLease(${JSON.stringify(config.aws!)}, async () => process.stdout.write("READY\\n")).catch(() => {});
+setInterval(() => {}, 1000);
+`;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => (stdout += chunk));
+  child.stderr.on("data", (chunk: string) => (stderr += chunk));
+  let readyTimeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        child.stdout.on("data", () => {
+          if (stdout.includes("READY")) resolve();
+        });
+      }),
+      new Promise<never>((_resolve, reject) => {
+        readyTimeout = setTimeout(() => reject(new Error(`lease signal child did not become ready: ${stderr}`)), 5_000);
+      }),
+    ]);
+    if (readyTimeout) clearTimeout(readyTimeout);
+    for (
+      let attempt = 0;
+      attempt < 500 && !readFileSync(fake.log, "utf8").includes("dynamodb delete-item");
+      attempt++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.match(readFileSync(fake.log, "utf8"), /dynamodb delete-item/);
+    const exited = once(child, "exit") as Promise<[number | null, NodeJS.Signals | null]>;
+    child.kill("SIGTERM");
+    const [code, signal] = await exited;
+    assert.equal(code, 130, JSON.stringify({ signal, stdout, stderr }));
+    assert.match(stderr, /could not release the AWS deployment lease/);
+  } finally {
+    if (readyTimeout) clearTimeout(readyTimeout);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an AWS signal during lease acquisition still performs conditioned cleanup", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-signal-acquire-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb put-item")) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700);
+console.log("");`,
+  );
+  const moduleUrl = new URL("../src/aws-lease.ts", import.meta.url).href;
+  const script = `
+import { setTimeout as wait } from "node:timers/promises";
+import { withAwsLease } from ${JSON.stringify(moduleUrl)};
+await withAwsLease(${JSON.stringify(config.aws!)}, async () => wait(1000)).catch(() => {});
+setInterval(() => {}, 1000);
+`;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => (stderr += chunk));
+  try {
+    for (let attempt = 0; attempt < 500 && !readFileSync(fake.log, "utf8").includes("dynamodb put-item"); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.match(readFileSync(fake.log, "utf8"), /dynamodb put-item/);
+    const exited = once(child, "exit") as Promise<[number | null, NodeJS.Signals | null]>;
+    child.kill("SIGTERM");
+    const [code] = await exited;
+    assert.equal(code, 130, stderr);
+    assert.match(readFileSync(fake.log, "utf8"), /dynamodb delete-item .*--condition-expression holder = :holder/);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an AWS signal queued during a failed conditional acquisition exits before work resumes", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-signal-failed-acquire-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb put-item")) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700);
+  console.error("An error occurred (ConditionalCheckFailedException) when calling the PutItem operation");
+  process.exit(1);
+}
+console.log("");`,
+  );
+  const moduleUrl = new URL("../src/aws-lease.ts", import.meta.url).href;
+  const script = `
+import { withAwsLease } from ${JSON.stringify(moduleUrl)};
+await withAwsLease(${JSON.stringify(config.aws!)}, async () => process.stdout.write("STARTED\\n")).catch(() => process.stdout.write("CAUGHT\\n"));
+setInterval(() => {}, 1000);
+`;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => (stdout += chunk));
+  child.stderr.on("data", (chunk: string) => (stderr += chunk));
+  try {
+    for (let attempt = 0; attempt < 500 && !readFileSync(fake.log, "utf8").includes("dynamodb put-item"); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.match(readFileSync(fake.log, "utf8"), /dynamodb put-item/);
+    const exited = once(child, "exit") as Promise<[number | null, NodeJS.Signals | null]>;
+    child.kill("SIGTERM");
+    const [code] = await exited;
+    assert.equal(code, 130, JSON.stringify({ stdout, stderr }));
+    assert.doesNotMatch(stdout, /STARTED|CAUGHT/);
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /dynamodb delete-item/);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an AWS signal during renewer shutdown waits for the conditioned release", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-signal-join-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb update-item")) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+console.log("");`,
+  );
+  const moduleUrl = new URL("../src/aws-lease.ts", import.meta.url).href;
+  const script = `
+import { readFileSync } from "node:fs";
+import { withAwsLease } from ${JSON.stringify(moduleUrl)};
+await withAwsLease(${JSON.stringify(config.aws!)}, async () => {
+  process.stdout.write("READY\\n");
+  while (!readFileSync(${JSON.stringify(fake.log)}, "utf8").includes("dynamodb update-item")) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  process.stdout.write("RELEASING\\n");
+});
+process.stdout.write("DONE\\n");
+`;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    env: { ...process.env, QM_AWS_LEASE_RENEW_MS: "5" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => (stdout += chunk));
+  child.stderr.on("data", (chunk: string) => (stderr += chunk));
+  let releaseTimeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      new Promise<void>((resolve) => {
+        child.stdout.on("data", () => {
+          if (stdout.includes("RELEASING")) resolve();
+        });
+      }),
+      new Promise<never>((_resolve, reject) => {
+        releaseTimeout = setTimeout(
+          () => reject(new Error(`lease release child did not start release: ${stderr}`)),
+          5_000,
+        );
+      }),
+    ]);
+    if (releaseTimeout) clearTimeout(releaseTimeout);
+    const exited = once(child, "exit") as Promise<[number | null, NodeJS.Signals | null]>;
+    child.kill("SIGTERM");
+    const [code] = await exited;
+    assert.equal(code, 130, stderr);
+    assert.match(readFileSync(fake.log, "utf8"), /dynamodb delete-item .*--condition-expression holder = :holder/);
+  } finally {
+    if (releaseTimeout) clearTimeout(releaseTimeout);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an AWS signal drains an in-flight HTTP boundary before conditioned release", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-signal-http-"));
+  const fake = fakeAws(dir, `console.log("");`);
+  const inFlight = join(dir, "http-in-flight");
+  const resolveRequest = join(dir, "resolve-http");
+  const resumed = join(dir, "resumed-after-http");
+  writeFileSync(join(dir, ".env"), `CORE_SIGNING_SECRET=${TEST_SECRET_VALUE}\n`);
+  const leaseModuleUrl = new URL("../src/aws-lease.ts", import.meta.url).href;
+  const awsModuleUrl = new URL("../src/backends/aws.ts", import.meta.url).href;
+  const script = `
+import { existsSync, writeFileSync } from "node:fs";
+import { setTimeout as wait } from "node:timers/promises";
+import { awsDeploymentLayerTransport } from ${JSON.stringify(awsModuleUrl)};
+import { withAwsLease } from ${JSON.stringify(leaseModuleUrl)};
+globalThis.fetch = async () => {
+  writeFileSync(${JSON.stringify(inFlight)}, "started");
+  while (!existsSync(${JSON.stringify(resolveRequest)})) await wait(10);
+  return new Response("{}");
+};
+await withAwsLease(${JSON.stringify(config.aws!)}, async () => {
+  await awsDeploymentLayerTransport({ config: ${JSON.stringify(config)}, configDir: ${JSON.stringify(dir)}, method: "PUT", body: "{}" });
+  writeFileSync(${JSON.stringify(resumed)}, "ran");
+}).catch(() => {});
+setInterval(() => {}, 1000);
+`;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => (stderr += chunk));
+  try {
+    for (let attempt = 0; attempt < 500 && !existsSync(inFlight); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(existsSync(inFlight), true, stderr);
+    const exited = once(child, "exit") as Promise<[number | null, NodeJS.Signals | null]>;
+    child.kill("SIGTERM");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /dynamodb delete-item/);
+    writeFileSync(resolveRequest, "resolve");
+    const [code] = await exited;
+    assert.equal(code, 130, stderr);
+    assert.equal(existsSync(resumed), false);
+    assert.match(readFileSync(fake.log, "utf8"), /dynamodb delete-item .*--condition-expression holder = :holder/);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an AWS signal marks the lease stopping before a blocked renewal lets work resume", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-signal-stop-"));
+  const fake = fakeAws(
+    dir,
+    `
+if (a.includes("dynamodb update-item")) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500);
+console.log("");`,
+  );
+  const marker = join(dir, "resumed-after-signal");
+  const moduleUrl = new URL("../src/aws-lease.ts", import.meta.url).href;
+  const script = `
+import { readFileSync } from "node:fs";
+import { awsRunInherit, withAwsLease } from ${JSON.stringify(moduleUrl)};
+await withAwsLease(${JSON.stringify(config.aws!)}, async () => {
+  process.stdout.write("READY\\n");
+  while (!readFileSync(${JSON.stringify(fake.log)}, "utf8").includes("dynamodb update-item")) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  awsRunInherit(process.execPath, ["-e", ${JSON.stringify(`require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ran")`)}]);
+}).catch(() => {});
+setInterval(() => {}, 1000);
+`;
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+    env: { ...process.env, QM_AWS_LEASE_RENEW_MS: "5" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => (stdout += chunk));
+  child.stderr.on("data", (chunk: string) => (stderr += chunk));
+  try {
+    for (
+      let attempt = 0;
+      attempt < 500 && !readFileSync(fake.log, "utf8").includes("dynamodb update-item");
+      attempt++
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.match(stdout, /READY/);
+    assert.match(readFileSync(fake.log, "utf8"), /dynamodb update-item/);
+    const exited = once(child, "exit") as Promise<[number | null, NodeJS.Signals | null]>;
+    child.kill("SIGTERM");
+    const [code] = await exited;
+    assert.equal(code, 130, stderr);
+    assert.equal(existsSync(marker), false);
+    assert.match(readFileSync(fake.log, "utf8"), /dynamodb delete-item/);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an AWS signal during a provider child blocks the next mutation and successful return", async (t) => {
+  for (const first of ["awsText", "awsTextAsync"] as const) {
+    await t.test(
+      first === "awsText" ? "queued before the async mutation" : "delivered after the async mutation",
+      async () => {
+        const dir = mkdtempSync(join(tmpdir(), "qm-aws-lease-signal-sync-child-"));
+        const fake = fakeAws(
+          dir,
+          `
+if (a.includes("probe-first")) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 700);
+console.log("");`,
+        );
+        const moduleUrl = new URL("../src/aws-lease.ts", import.meta.url).href;
+        const script = `
+import { awsText, awsTextAsync, withAwsLease } from ${JSON.stringify(moduleUrl)};
+await withAwsLease(${JSON.stringify(config.aws!)}, async () => {
+  ${first === "awsText" ? "awsText" : "await awsTextAsync"}(${JSON.stringify(config.aws!)}, ["probe-first"]);
+  await awsTextAsync(${JSON.stringify(config.aws!)}, ["probe-second"]);
+  process.stdout.write("DONE\\n");
+}).catch(() => {});
+setInterval(() => {}, 1000);
+`;
+        const child = spawn(process.execPath, ["--input-type=module", "--eval", script], {
+          env: process.env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        let stdout = "";
+        let stderr = "";
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => (stdout += chunk));
+        child.stderr.on("data", (chunk: string) => (stderr += chunk));
+        try {
+          for (let attempt = 0; attempt < 500 && !readFileSync(fake.log, "utf8").includes("probe-first"); attempt++) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          assert.match(readFileSync(fake.log, "utf8"), /probe-first/);
+          const exited = once(child, "exit") as Promise<[number | null, NodeJS.Signals | null]>;
+          child.kill("SIGTERM");
+          const [code] = await exited;
+          assert.equal(code, 130, stderr);
+          assert.doesNotMatch(readFileSync(fake.log, "utf8"), /probe-second/);
+          assert.doesNotMatch(stdout, /DONE/);
+          assert.match(
+            readFileSync(fake.log, "utf8"),
+            /dynamodb delete-item .*--condition-expression holder = :holder/,
+          );
+        } finally {
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+          fake.restore();
+          rmSync(dir, { recursive: true, force: true });
+        }
+      },
+    );
+  }
+});
+
 test("AWS live check rejects downed services and classifies probe errors as live drift", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-live-runtime-"));
   const single = oneServiceConfig();
@@ -2917,13 +7169,15 @@ test("AWS live check rejects downed services and classifies probe errors as live
   }
 });
 
-test("AWS live check with an unresolved sandbox pin still evaluates core runtime health", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-aws-live-unresolved-pin-"));
+test("AWS Sprites live check evaluates publisher image readiness and core health", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-live-sprites-"));
   const base = oneServiceConfig();
   const single: QmConfig = {
     ...base,
-    sandbox: { backend: "sprites", app: "acme-sandboxes", secretEnv: ["ACME_API_KEY"] },
+    sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
+    env: { ...base.env, core: { ...base.env.core, HARNESS: "pi" } },
   };
+  assert.equal(serviceEnvironment(single, "core").AWS_DEPLOY_IMAGE, "acme-qm-sandbox");
   const taskArn = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:1";
   const fake = statefulAws(
     dir,
@@ -2936,14 +7190,6 @@ test("AWS live check with an unresolved sandbox pin still evaluates core runtime
       () => awsCheckLive(single, { report: false }),
       (error: unknown) => {
         assert.ok(error instanceof Error);
-        assert.match(
-          error.message,
-          /sandbox pin: AWS deploys take the sandbox layer-image pin from the deployment manifest, which has none/,
-        );
-        assert.match(
-          error.message,
-          /skipped only the core expected-environment and rendered task-definition comparisons/,
-        );
         assert.match(error.message, /core: configured task is not the sole healthy PRIMARY deployment/);
         return true;
       },
@@ -3002,7 +7248,7 @@ test("AWS live check rejects a reachable public URL returning a server error", a
 
 test("AWS live check uses the package-pinned source image without consulting mutable tags", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-live-manifest-"));
-  const single = oneServiceConfig();
+  const single = microvmConfig(oneServiceConfig());
   const taskArn = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:1";
   const fake = statefulAws(
     dir,
@@ -3023,8 +7269,7 @@ test("AWS live check uses the package-pinned source image without consulting mut
   const priorAlbDns = process.env.AWS_FAKE_ALB_DNS;
   const priorSecretValue = process.env.AWS_FAKE_SECRET_VALUE;
   const state = JSON.parse(readFileSync(fake.state, "utf8"));
-  const secretArn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf";
-  const arns = Object.fromEntries(computedSecrets(single).map((secret) => [secret.name, secretArn]));
+  const arns = Object.fromEntries(computedSecrets(single).map((secret) => [secret.name, testSecretArn(secret.name)]));
   state.definitions[taskArn] = {
     ...renderTaskDefinition(
       single,
@@ -3142,8 +7387,9 @@ test("AWS live check detects prebuilt plugin image drift from current config", a
     ),
   );
   const state = JSON.parse(readFileSync(fake.state, "utf8"));
-  const secretArn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf";
-  const arns = Object.fromEntries(computedSecrets(pluginConfig).map((secret) => [secret.name, secretArn]));
+  const arns = Object.fromEntries(
+    computedSecrets(pluginConfig).map((secret) => [secret.name, testSecretArn(secret.name)]),
+  );
   state.definitions[tasks.core] = {
     ...renderTaskDefinition(
       pluginConfig,
@@ -3286,6 +7532,83 @@ test("AWS up refuses foreign exact-name services before acquiring the lease or p
   }
 });
 
+test("AWS up refreshes injected provider preflight under the deployment lease", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-stale-provider-preflight-"));
+  const single = oneServiceConfig();
+  const fake = statefulAws(dir, single, {}, { foreignServiceTags: true });
+  try {
+    await assert.rejects(
+      () =>
+        awsUp(single, dir, {
+          yes: true,
+          preflight: {
+            microvmRebuildRequired: false,
+            publicApiUrlNeedsUpdate: false,
+            secretArns: Object.fromEntries(
+              computedSecrets(single).map((secret) => [secret.name, testSecretArn(secret.name)]),
+            ),
+            secretValues: new Map(),
+          },
+        }),
+      /ownership tags do not match deployment acme/,
+    );
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /dynamodb put-item/);
+    assert.match(calls, /dynamodb delete-item/);
+    assert.doesNotMatch(calls, /rds create-db-snapshot|ecr get-login-password|ecs update-service/);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("AWS up repairs stale PUBLIC_API_URL under the lease before deployment mutation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-up-public-api-url-"));
+  const configured = microvmConfig({ ...oneServiceConfig(), apiUrl: "https://agent.acme.example" });
+  const fake = statefulAws(dir, configured);
+  const docker = join(dir, "docker");
+  writeFileSync(docker, "#!/bin/sh\nexit 0\n");
+  chmodSync(docker, 0o755);
+  const priorPath = process.env.PATH;
+  const priorOverrides = process.env.AWS_FAKE_SECRET_OVERRIDES;
+  process.env.PATH = `${dir}:${priorPath}`;
+  process.env.AWS_FAKE_SECRET_OVERRIDES = JSON.stringify({
+    PUBLIC_API_URL: "https://api.stale.example",
+  });
+  try {
+    await awsUp(configured, dir, { yes: true });
+    const calls = readFileSync(fake.log, "utf8");
+    const lease = calls.indexOf("dynamodb put-item");
+    const put = calls.indexOf("secretsmanager put-secret-value --secret-id acme/qm/PUBLIC_API_URL", lease);
+    const deploymentMutation = calls.search(/rds create-db-snapshot|s3api put-object|ecr get-login-password/);
+    assert.ok(lease >= 0 && lease < put && put < deploymentMutation);
+    const after = JSON.parse(readFileSync(fake.state, "utf8"));
+    assert.equal(after.secretValues.PUBLIC_API_URL, "https://agent.acme.example");
+  } finally {
+    process.env.PATH = priorPath;
+    if (priorOverrides === undefined) delete process.env.AWS_FAKE_SECRET_OVERRIDES;
+    else process.env.AWS_FAKE_SECRET_OVERRIDES = priorOverrides;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("direct AWS up refreshes the full provider preflight under the deployment lease", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-direct-stale-provider-preflight-"));
+  const single = oneServiceConfig();
+  const fake = statefulAws(dir, single, {}, { foreignServiceTagsAfterLease: true });
+  try {
+    await assert.rejects(() => awsUp(single, dir, { yes: true }), /ownership tags do not match deployment acme/);
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /dynamodb put-item/);
+    assert.match(calls, /dynamodb delete-item/);
+    assert.doesNotMatch(calls, /rds create-db-snapshot|ecr get-login-password|ecs update-service/);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("AWS plan uses the package-pinned source image without consulting or mutating mutable labels", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-plan-source-"));
   const single = oneServiceConfig();
@@ -3296,8 +7619,7 @@ test("AWS plan uses the package-pinned source image without consulting or mutati
     manifestItems([{ id: "current", imageLabel: "release", tasks: { core: taskArn } }], "current"),
   );
   const state = JSON.parse(readFileSync(fake.state, "utf8"));
-  const secretArn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf";
-  const arns = Object.fromEntries(computedSecrets(single).map((secret) => [secret.name, secretArn]));
+  const arns = Object.fromEntries(computedSecrets(single).map((secret) => [secret.name, testSecretArn(secret.name)]));
   state.definitions[taskArn] = {
     ...renderTaskDefinition(
       single,
@@ -3345,14 +7667,20 @@ test("aws up resolves image digests only while holding the deploy lease", async 
     `#!/usr/bin/env node\nrequire("node:fs").appendFileSync(${JSON.stringify(dockerLog)}, process.argv.slice(2).join(" ") + "\\n");\n`,
   );
   chmodSync(dockerBin, 0o755);
-  const fake = statefulAws(dir, oneServiceConfig());
+  const single = microvmConfig(oneServiceConfig());
+  const fake = statefulAws(dir, single);
+  const state = JSON.parse(readFileSync(fake.state, "utf8"));
+  const currentTask = state.services["acme-core"].taskDefinition;
+  state.definitions[currentTask].containerDefinitions[0].image =
+    `123456789012.dkr.ecr.us-west-2.amazonaws.com/qm-core@sha256:${"b".repeat(64)}`;
+  writeFileSync(fake.state, JSON.stringify(state));
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
   const lines: string[] = [];
   const log = console.log;
   console.log = (...parts: unknown[]): void => void lines.push(parts.join(" "));
   try {
-    await awsUp(oneServiceConfig(), dir, { yes: true });
+    await awsUp(single, dir, { yes: true });
     const calls = readFileSync(fake.log, "utf8");
     assert.match(
       calls,
@@ -3387,7 +7715,6 @@ test("aws up resolves image digests only while holding the deploy lease", async 
     const transactions = calls.split("\n").filter((line) => line.includes("dynamodb transact-write-items"));
     assert.equal(transactions.length, 1, "the manifest is one unconditional transaction");
     assert.doesNotMatch(calls, /--client-request-token/);
-    assert.doesNotMatch(calls, /dynamodb update-item/);
     assert.match(calls, /ecr batch-delete-image .*imageTag=qm-staging/);
     assert.ok(readFileSync(dockerLog, "utf8").includes("imagetools create"), "the image was pushed via docker");
     assert.match(readFileSync(dockerLog, "utf8"), /--tag [^\s]+\/qm-core:qm-staging/);
@@ -3441,16 +7768,6 @@ test("AWS up requires a complete trusted baseline before a partial deployment", 
       "baseline",
     ),
   );
-  const state = JSON.parse(readFileSync(baseline.state, "utf8"));
-  state.definitions[tasks["web-ui"]] = {
-    containerDefinitions: [
-      {
-        name: "web-ui",
-        image: `123456789012.dkr.ecr.us-west-2.amazonaws.com/qm-web-ui@sha256:${"d".repeat(64)}`,
-      },
-    ],
-  };
-  writeFileSync(baseline.state, JSON.stringify(state));
   const dockerBin = join(dir, "docker");
   writeFileSync(dockerBin, "#!/bin/sh\nexit 0\n");
   chmodSync(dockerBin, 0o755);
@@ -3473,12 +7790,111 @@ test("AWS up requires a complete trusted baseline before a partial deployment", 
   }
 });
 
+test("AWS partial up rejects stale untouched task environment and cross-service secrets before mutation", async (t) => {
+  const cases = [
+    { name: "provider environment", untouched: "core", selected: "web-ui" },
+    { name: "legacy API endpoint plaintext", untouched: "core", selected: "web-ui" },
+    { name: "legacy API endpoint secret", untouched: "core", selected: "web-ui" },
+    { name: "Slack endpoint plaintext", untouched: "core", selected: "web-ui" },
+    { name: "Slack endpoint secret", untouched: "core", selected: "web-ui" },
+    { name: "AWS endpoint plaintext", untouched: "core", selected: "web-ui" },
+    { name: "AWS endpoint secret", untouched: "core", selected: "web-ui" },
+    { name: "provider control secret", untouched: "core", selected: "web-ui" },
+    { name: "cross-service secret", untouched: "web-ui", selected: "core" },
+  ] as const;
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "qm-aws-partial-stale-task-"));
+      const configured = twoServiceConfig();
+      const tasks = {
+        core: "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:4",
+        "web-ui": "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-web-ui:4",
+      };
+      const fake = statefulAws(
+        dir,
+        configured,
+        manifestItems([{ id: "current", imageLabel: "release", tasks }], "current"),
+      );
+      const state = JSON.parse(readFileSync(fake.state, "utf8"));
+      state.services["acme-core"].taskDefinition = tasks.core;
+      state.services["acme-web-ui"].taskDefinition = tasks["web-ui"];
+      const container = state.definitions[tasks[scenario.untouched]].containerDefinitions[0];
+      if (scenario.name === "provider environment") {
+        container.environment.find((entry: { name: string }) => entry.name === "DATA_DIR").value = "/tmp/lost";
+      } else if (scenario.name === "legacy API endpoint plaintext") {
+        container.environment.push({ name: "AGENT_API_URL", value: "https://attacker.example" });
+      } else if (scenario.name === "legacy API endpoint secret") {
+        container.secrets.push({ name: "AGENT_API_URL", valueFrom: testSecretArn("CORE_SIGNING_SECRET") });
+      } else if (scenario.name === "Slack endpoint plaintext") {
+        container.environment.push({ name: "SLACK_API_URL", value: "https://attacker.example" });
+      } else if (scenario.name === "Slack endpoint secret") {
+        container.secrets.push({ name: "SLACK_API_URL", valueFrom: testSecretArn("CORE_SIGNING_SECRET") });
+      } else if (scenario.name === "AWS endpoint plaintext") {
+        container.environment.push({ name: "AWS_ENDPOINT_URL_S3", value: "https://attacker.example" });
+      } else if (scenario.name === "AWS endpoint secret") {
+        container.secrets.push({ name: "AWS_ENDPOINT_URL_S3", valueFrom: testSecretArn("CORE_SIGNING_SECRET") });
+      } else if (scenario.name === "provider control secret") {
+        container.secrets.push({ name: "SECRETS_BACKEND", valueFrom: testSecretArn("CORE_SIGNING_SECRET") });
+      } else {
+        container.secrets.push({ name: "DATABASE_URL", valueFrom: testSecretArn("DATABASE_URL") });
+      }
+      writeFileSync(fake.state, JSON.stringify(state));
+      try {
+        await assert.rejects(
+          awsUp(configured, dir, { yes: true, only: [scenario.selected] }),
+          /stale or unowned (?:environment|secret) entries/,
+        );
+        assert.doesNotMatch(
+          readFileSync(fake.log, "utf8"),
+          /rds create-db-snapshot|s3api put-object|ecr get-login-password|ecs register-task-definition|ecs update-service|dynamodb transact-write-items/,
+        );
+      } finally {
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("AWS up replaces a stale core DATA_DIR with the provider-owned durable path", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-up-data-dir-"));
+  const configured = microvmConfig(oneServiceConfig());
+  const fake = statefulAws(dir, configured);
+  const state = JSON.parse(readFileSync(fake.state, "utf8"));
+  const before = state.services["acme-core"].taskDefinition;
+  state.definitions[before].containerDefinitions[0].environment.find(
+    (entry: { name: string }) => entry.name === "DATA_DIR",
+  ).value = "/tmp/lost";
+  writeFileSync(fake.state, JSON.stringify(state));
+  const docker = join(dir, "docker");
+  writeFileSync(docker, "#!/bin/sh\nexit 0\n");
+  chmodSync(docker, 0o755);
+  const priorPath = process.env.PATH;
+  process.env.PATH = `${dir}:${priorPath}`;
+  try {
+    await awsUp(configured, dir, { yes: true });
+    const after = JSON.parse(readFileSync(fake.state, "utf8"));
+    const current = after.services["acme-core"].taskDefinition;
+    assert.notEqual(current, before);
+    const environment = Object.fromEntries(
+      after.definitions[current].containerDefinitions[0].environment.map(
+        ({ name, value }: { name: string; value: string }) => [name, value],
+      ),
+    );
+    assert.equal(environment.DATA_DIR, "/data");
+  } finally {
+    process.env.PATH = priorPath;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("AWS up cleans staging tags when ECS deployment fails", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-up-cleanup-"));
   const dockerBin = join(dir, "docker");
   writeFileSync(dockerBin, "#!/bin/sh\nexit 0\n");
   chmodSync(dockerBin, 0o755);
-  const fake = statefulAws(dir, oneServiceConfig(), {}, { ignoreUpdate: true });
+  const fake = statefulAws(dir, oneServiceConfig(), {}, { ignoreUpdate: true, staleTaskDefinition: true });
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
   try {
@@ -3503,7 +7919,7 @@ test("AWS up succeeds while a protected old task keeps the rollout from completi
     const base = oneServiceConfig();
     return { ...base, aws: { ...base.aws!, alb: "legacy-alb" } };
   };
-  const fake = statefulAws(dir, drainConfig(), {}, { drainRollout: true });
+  const fake = statefulAws(dir, drainConfig(), {}, { drainRollout: true, staleTaskDefinition: true });
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
   try {
@@ -3529,7 +7945,15 @@ test("AWS up tolerates a transient describe-services failure while polling the r
   const dockerBin = join(dir, "docker");
   writeFileSync(dockerBin, "#!/bin/sh\nexit 0\n");
   chmodSync(dockerBin, 0o755);
-  const fake = statefulAws(dir, oneServiceConfig(), {}, { failDescribeOnceAfterUpdate: true });
+  const fake = statefulAws(
+    dir,
+    oneServiceConfig(),
+    {},
+    {
+      failDescribeOnceAfterUpdate: true,
+      staleTaskDefinition: true,
+    },
+  );
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
   try {
@@ -3549,7 +7973,7 @@ test("AWS up aborts failed tasks only after four polls with no replacement runni
   const dockerBin = join(dir, "docker");
   writeFileSync(dockerBin, "#!/bin/sh\nexit 0\n");
   chmodSync(dockerBin, 0o755);
-  const fake = statefulAws(dir, oneServiceConfig(), {}, { primaryFailedTasks: true });
+  const fake = statefulAws(dir, oneServiceConfig(), {}, { primaryFailedTasks: true, staleTaskDefinition: true });
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
   try {
@@ -3569,7 +7993,15 @@ test("AWS up survives a three-poll failed-task flake that ECS replaces — the w
   const dockerBin = join(dir, "docker");
   writeFileSync(dockerBin, "#!/bin/sh\nexit 0\n");
   chmodSync(dockerBin, 0o755);
-  const fake = statefulAws(dir, oneServiceConfig(), {}, { transientFailedTaskPolls: 3 });
+  const fake = statefulAws(
+    dir,
+    oneServiceConfig(),
+    {},
+    {
+      transientFailedTaskPolls: 3,
+      staleTaskDefinition: true,
+    },
+  );
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
   try {
@@ -3590,7 +8022,7 @@ test("AWS up survives alternating single-service stale reads — only the same w
   writeFileSync(dockerBin, `#!/usr/bin/env node\nconsole.log("Digest: sha256:${"a".repeat(64)}");\n`);
   chmodSync(dockerBin, 0o755);
   const multi = twoServiceConfig();
-  const fake = statefulAws(dir, multi, {}, { alternateStaleReadPolls: 4 });
+  const fake = statefulAws(dir, multi, {}, { alternateStaleReadPolls: 4, staleTaskDefinition: true });
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
   try {
@@ -3613,7 +8045,7 @@ test("AWS up still fails fast on a FAILED rollout state — the ECS circuit-brea
   const dockerBin = join(dir, "docker");
   writeFileSync(dockerBin, "#!/bin/sh\nexit 0\n");
   chmodSync(dockerBin, 0o755);
-  const fake = statefulAws(dir, oneServiceConfig(), {}, { rolloutFailed: true });
+  const fake = statefulAws(dir, oneServiceConfig(), {}, { rolloutFailed: true, staleTaskDefinition: true });
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
   try {
@@ -3625,16 +8057,18 @@ test("AWS up still fails fast on a FAILED rollout state — the ECS circuit-brea
   }
 });
 
-test("AWS up preserves the staging tag when stable-label promotion fails", async () => {
+test("AWS promotion never classifies ImageAlreadyExistsException from its tag argument", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-up-promotion-"));
   const dockerBin = join(dir, "docker");
   writeFileSync(dockerBin, "#!/bin/sh\nexit 0\n");
   chmodSync(dockerBin, 0o755);
-  const fake = statefulAws(dir, oneServiceConfig(), {}, { failPromotion: true });
+  const configured = oneServiceConfig();
+  configured.aws = { ...configured.aws!, imageLabel: "release-ImageAlreadyExistsException" };
+  const fake = statefulAws(dir, configured, {}, { failPromotion: true });
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
   try {
-    await awsUp(oneServiceConfig(), dir, { yes: true });
+    await awsUp(configured, dir, { yes: true });
     const calls = readFileSync(fake.log, "utf8");
     assert.match(calls, /dynamodb transact-write-items/);
     assert.doesNotMatch(calls, /ecr batch-delete-image .*imageTag=qm-/);
@@ -3665,12 +8099,41 @@ test("AWS up treats an already-current stable label as successful promotion", as
   }
 });
 
+test("AWS cleanup never classifies ImageNotFoundException from its repository argument", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-aws-up-cleanup-classification-"));
+  const dockerBin = join(dir, "docker");
+  writeFileSync(dockerBin, "#!/bin/sh\nexit 0\n");
+  chmodSync(dockerBin, 0o755);
+  const configured = oneServiceConfig();
+  configured.aws = {
+    ...configured.aws!,
+    services: {
+      core: { ...configured.aws!.services.core!, ecrRepository: "qm-ImageNotFoundException" },
+    },
+  };
+  const fake = statefulAws(dir, configured, {}, { failCleanup: true });
+  const priorPath = process.env.PATH;
+  const warnings: string[] = [];
+  const warn = console.warn;
+  process.env.PATH = `${dir}:${priorPath}`;
+  console.warn = (...parts: unknown[]): void => void warnings.push(parts.join(" "));
+  try {
+    await awsUp(configured, dir, { yes: true });
+    assert.match(warnings.join("\n"), /could not clean staging image core:qm-staging/);
+  } finally {
+    console.warn = warn;
+    process.env.PATH = priorPath;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("AWS up keeps a healthy rollout and its staging tag when the manifest write fails", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-aws-up-manifest-failure-"));
   const dockerBin = join(dir, "docker");
   writeFileSync(dockerBin, "#!/bin/sh\nexit 0\n");
   chmodSync(dockerBin, 0o755);
-  const fake = statefulAws(dir, oneServiceConfig(), {}, { failTransactions: true });
+  const fake = statefulAws(dir, oneServiceConfig(), {}, { failTransactions: true, staleTaskDefinition: true });
   const initialTask = JSON.parse(readFileSync(fake.state, "utf8")).services["acme-core"].taskDefinition;
   const priorPath = process.env.PATH;
   process.env.PATH = `${dir}:${priorPath}`;
@@ -3689,435 +8152,6 @@ test("AWS up keeps a healthy rollout and its staging tag when the manifest write
     process.env.PATH = priorPath;
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("AWS rejects the Fly sandbox pin on MicroVM stacks and a frozen config override", async () => {
-  const { sandbox: _sandbox, ...microvm } = config;
-  const image = `registry.fly.io/acme-sandboxes@sha256:${"c".repeat(64)}`;
-  await assert.rejects(() => awsPinSandbox(microvm as QmConfig, image), /Lambda MicroVM sandboxes.*infra build-image/);
-  await assert.rejects(() => awsPinSandbox(config, image), /freezes the sandbox pin/);
-});
-
-const flySandboxPinlessConfig = (): QmConfig => ({
-  ...oneServiceConfig(),
-  sandbox: { backend: "sprites", app: "acme-sandboxes" },
-});
-
-const CORE_TASK = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:1";
-const CORE_IMAGE = `123456789012.dkr.ecr.us-west-2.amazonaws.com/qm-core@sha256:${"a".repeat(64)}`;
-const NEW_PIN = `registry.fly.io/acme-sandboxes@sha256:${"c".repeat(64)}`;
-const OLD_PIN = `registry.fly.io/acme-sandboxes@sha256:${"b".repeat(64)}`;
-const FAILED_PIN = `registry.fly.io/acme-sandboxes@sha256:${"d".repeat(64)}`;
-const REBUILT_PIN = `registry.fly.io/acme-sandboxes@sha256:${"e".repeat(64)}`;
-
-function seedCoreDefinition(statePath: string): void {
-  const single = flySandboxPinlessConfig();
-  const arns = Object.fromEntries(
-    computedSecrets(single).map((secret) => [
-      secret.name,
-      "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf",
-    ]),
-  );
-  const state = JSON.parse(readFileSync(statePath, "utf8"));
-  state.definitions[CORE_TASK] = renderTaskDefinition(
-    { ...single, sandbox: { ...single.sandbox!, image: OLD_PIN } },
-    "core",
-    CORE_IMAGE,
-    arns,
-  );
-  writeFileSync(statePath, JSON.stringify(state));
-}
-
-function currentManifestOf(statePath: string): { id: string; manifest: Record<string, unknown> } {
-  const state = JSON.parse(readFileSync(statePath, "utf8"));
-  const id = state.dynamo["deployment/current"].manifestId.S as string;
-  return { id, manifest: JSON.parse(state.dynamo[`deployment/manifest/${id}`].manifest.S) as Record<string, unknown> };
-}
-
-function coreTaskEnv(statePath: string): { task: string; env: Record<string, string> } {
-  const state = JSON.parse(readFileSync(statePath, "utf8"));
-  const task = state.services["acme-core"].taskDefinition as string;
-  const container = (state.definitions[task].containerDefinitions as Array<Record<string, unknown>>).find(
-    (item) => item.name === "core",
-  )!;
-  const env = Object.fromEntries(
-    (container.environment as Array<{ name: string; value: string }>).map((item) => [item.name, item.value]),
-  ) as Record<string, string>;
-  return { task, env };
-}
-
-test("sandbox pin repoints a live core through a re-rendered task and records the manifest under the deployed baseline's label", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-aws-pin-live-"));
-  const single = flySandboxPinlessConfig();
-  const fake = statefulAws(
-    dir,
-    single,
-    manifestItems(
-      [{ id: "baseline", imageLabel: "previous", sandboxImage: OLD_PIN, tasks: { core: CORE_TASK } }],
-      "baseline",
-    ),
-    { failTransactionPuts: 2 },
-  );
-  seedCoreDefinition(fake.state);
-  try {
-    await awsPinSandbox(single, NEW_PIN);
-    const { task, env } = coreTaskEnv(fake.state);
-    assert.notEqual(task, CORE_TASK, "core was repointed to a re-rendered task definition");
-    assert.equal(env.FLY_BASE_IMAGE, NEW_PIN, "the re-rendered task boots sandboxes from the published pin");
-    const { id, manifest } = currentManifestOf(fake.state);
-    assert.equal(manifest.sandboxImage, NEW_PIN);
-    assert.deepEqual(manifest.tasks, { core: task });
-    assert.equal(manifest.previous, "baseline");
-    assert.equal(
-      manifest.imageLabel,
-      "previous",
-      "the pin manifest keeps the deployed baseline's label, not the bumped aws.imageLabel",
-    );
-    const state = JSON.parse(readFileSync(fake.state, "utf8"));
-    assert.equal(state.dynamo["deployment/label/previous"].manifestId.S, id);
-    assert.equal(state.transactAttempts, 3, "two transient manifest-write failures are absorbed by in-process retries");
-    assert.match(readFileSync(fake.log, "utf8"), /ecs update-service .*--service acme-core/);
-  } finally {
-    fake.restore();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("sandbox pin on a scaled-to-zero core records a carried manifest without touching ECS", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-aws-pin-carried-"));
-  const single = flySandboxPinlessConfig();
-  const fake = statefulAws(
-    dir,
-    single,
-    manifestItems(
-      [{ id: "baseline", imageLabel: "previous", sandboxImage: OLD_PIN, tasks: { core: CORE_TASK } }],
-      "baseline",
-    ),
-  );
-  const state = JSON.parse(readFileSync(fake.state, "utf8"));
-  state.services["acme-core"].desiredCount = 0;
-  writeFileSync(fake.state, JSON.stringify(state));
-  try {
-    await awsPinSandbox(single, NEW_PIN);
-    const { id, manifest } = currentManifestOf(fake.state);
-    assert.notEqual(id, "baseline");
-    assert.equal(manifest.sandboxImage, NEW_PIN);
-    assert.deepEqual(
-      manifest.tasks,
-      { core: CORE_TASK },
-      "the pin is carried on the recorded tasks; it takes effect on the next up",
-    );
-    assert.equal(manifest.imageLabel, "previous");
-    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /ecs update-service|ecs register-task-definition/);
-  } finally {
-    fake.restore();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("a failed sandbox-pin rollout restores the prior core task and records no manifest", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-aws-pin-rollback-"));
-  const single = flySandboxPinlessConfig();
-  const fake = statefulAws(
-    dir,
-    single,
-    manifestItems(
-      [{ id: "baseline", imageLabel: "previous", sandboxImage: OLD_PIN, tasks: { core: CORE_TASK } }],
-      "baseline",
-    ),
-    { ignoreUpdate: true },
-  );
-  seedCoreDefinition(fake.state);
-  try {
-    await assert.rejects(() => awsPinSandbox(single, NEW_PIN), /did not reach the requested state/);
-    const state = JSON.parse(readFileSync(fake.state, "utf8"));
-    assert.equal(state.services["acme-core"].taskDefinition, CORE_TASK);
-    assert.equal(state.dynamo["deployment/current"].manifestId.S, "baseline");
-    const calls = readFileSync(fake.log, "utf8");
-    assert.match(calls, /ecs update-service .*--service acme-core/);
-    assert.doesNotMatch(calls, /dynamodb transact-write-items/);
-  } finally {
-    fake.restore();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("a manifest-write failure after the pin repoint is recoverable: the retry records it and up keeps the published pin", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-aws-pin-manifest-failure-"));
-  const dockerBin = join(dir, "docker");
-  writeFileSync(dockerBin, `#!/usr/bin/env node\nconsole.log("Digest: sha256:${"a".repeat(64)}");\n`);
-  chmodSync(dockerBin, 0o755);
-  const single = flySandboxPinlessConfig();
-  const fake = statefulAws(
-    dir,
-    single,
-    manifestItems(
-      [{ id: "baseline", imageLabel: "release", sandboxImage: OLD_PIN, tasks: { core: CORE_TASK } }],
-      "baseline",
-    ),
-    { failTransactionPuts: 3 },
-  );
-  seedCoreDefinition(fake.state);
-  const priorPath = process.env.PATH;
-  process.env.PATH = `${dir}:${priorPath}`;
-  try {
-    await assert.rejects(() => awsPinSandbox(single, NEW_PIN), /rerun `qm sandbox publish` to record the pin/);
-    const half = JSON.parse(readFileSync(fake.state, "utf8"));
-    const repointed = half.services["acme-core"].taskDefinition as string;
-    assert.notEqual(repointed, CORE_TASK, "the live repoint stays applied");
-    assert.equal(
-      half.dynamo["deployment/current"].manifestId.S,
-      "baseline",
-      "the durable manifest still names the stale pin",
-    );
-
-    await awsPinSandbox(single, NEW_PIN);
-    const retried = JSON.parse(readFileSync(fake.state, "utf8"));
-    assert.equal(retried.services["acme-core"].taskDefinition, repointed, "the retry records without another repoint");
-    const { manifest } = currentManifestOf(fake.state);
-    assert.equal(manifest.sandboxImage, NEW_PIN);
-    assert.deepEqual(manifest.tasks, { core: repointed });
-
-    await awsUp(single, dir, { yes: true });
-    const { env } = coreTaskEnv(fake.state);
-    assert.equal(env.FLY_BASE_IMAGE, NEW_PIN, "up resolves the recorded pin instead of reverting the published image");
-    assert.equal(currentManifestOf(fake.state).manifest.sandboxImage, NEW_PIN);
-  } finally {
-    process.env.PATH = priorPath;
-    fake.restore();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("a manifest-write failure rerun with a different digest still converges: publish repoints to the rebuilt pin and up keeps it", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-aws-pin-rerun-digest-"));
-  const dockerBin = join(dir, "docker");
-  writeFileSync(dockerBin, `#!/usr/bin/env node\nconsole.log("Digest: sha256:${"a".repeat(64)}");\n`);
-  chmodSync(dockerBin, 0o755);
-  const single = flySandboxPinlessConfig();
-  const fake = statefulAws(
-    dir,
-    single,
-    manifestItems(
-      [{ id: "baseline", imageLabel: "release", sandboxImage: OLD_PIN, tasks: { core: CORE_TASK } }],
-      "baseline",
-    ),
-    { failTransactionPuts: 3 },
-  );
-  seedCoreDefinition(fake.state);
-  const priorPath = process.env.PATH;
-  process.env.PATH = `${dir}:${priorPath}`;
-  try {
-    await assert.rejects(() => awsPinSandbox(single, FAILED_PIN), /rerun `qm sandbox publish` to record the pin/);
-    const half = coreTaskEnv(fake.state);
-    assert.notEqual(half.task, CORE_TASK, "the repoint to the failed pin stays applied");
-    assert.equal(half.env.FLY_BASE_IMAGE, FAILED_PIN);
-    assert.equal(
-      currentManifestOf(fake.state).manifest.sandboxImage,
-      OLD_PIN,
-      "the durable manifest still names the previous pin",
-    );
-
-    await awsPinSandbox(single, REBUILT_PIN);
-    const rerun = coreTaskEnv(fake.state);
-    assert.equal(rerun.env.FLY_BASE_IMAGE, REBUILT_PIN, "the rerun repoints core to the rebuilt digest");
-    const { manifest } = currentManifestOf(fake.state);
-    assert.equal(manifest.sandboxImage, REBUILT_PIN);
-    assert.deepEqual(manifest.tasks, { core: rerun.task });
-
-    await awsUp(single, dir, { yes: true });
-    assert.equal(
-      coreTaskEnv(fake.state).env.FLY_BASE_IMAGE,
-      REBUILT_PIN,
-      "up keeps the rerun's pin instead of reverting it",
-    );
-    assert.equal(currentManifestOf(fake.state).manifest.sandboxImage, REBUILT_PIN);
-  } finally {
-    process.env.PATH = priorPath;
-    fake.restore();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("sandbox publish refuses to record a core manually repointed at a different workload image", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-aws-pin-manual-repoint-"));
-  const single = flySandboxPinlessConfig();
-  const fake = statefulAws(
-    dir,
-    single,
-    manifestItems(
-      [{ id: "baseline", imageLabel: "release", sandboxImage: OLD_PIN, tasks: { core: CORE_TASK } }],
-      "baseline",
-    ),
-  );
-  seedCoreDefinition(fake.state);
-  try {
-    await awsPinSandbox(single, NEW_PIN);
-    const recorded = currentManifestOf(fake.state);
-    const deployedTask = (recorded.manifest.tasks as Record<string, string>).core!;
-
-    const state = JSON.parse(readFileSync(fake.state, "utf8"));
-    const manual = "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-core:99";
-    const definition = structuredClone(state.definitions[deployedTask]) as {
-      taskDefinitionArn: string;
-      containerDefinitions: Array<{ image: string }>;
-    };
-    definition.taskDefinitionArn = manual;
-    definition.containerDefinitions[0]!.image = `123456789012.dkr.ecr.us-west-2.amazonaws.com/qm-core@sha256:${"9".repeat(64)}`;
-    state.definitions[manual] = definition;
-    state.services["acme-core"].taskDefinition = manual;
-    writeFileSync(fake.state, JSON.stringify(state));
-
-    await assert.rejects(
-      () => awsPinSandbox(single, NEW_PIN),
-      /differs from the deployment manifest's core task beyond the sandbox pin; run `qm up --yes` to converge first/,
-    );
-    const after = JSON.parse(readFileSync(fake.state, "utf8"));
-    assert.equal(
-      after.dynamo["deployment/current"].manifestId.S,
-      recorded.id,
-      "the manual task is never recorded as the manifest's core task",
-    );
-    assert.equal(
-      after.services["acme-core"].taskDefinition,
-      manual,
-      "publish mutates nothing before the converge guard",
-    );
-  } finally {
-    fake.restore();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("up resolves the sandbox pin from the deployment manifest once the config override is removed", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-aws-pin-from-manifest-"));
-  const dockerBin = join(dir, "docker");
-  writeFileSync(dockerBin, `#!/usr/bin/env node\nconsole.log("Digest: sha256:${"a".repeat(64)}");\n`);
-  chmodSync(dockerBin, 0o755);
-  const single = flySandboxPinlessConfig();
-  const fake = statefulAws(
-    dir,
-    single,
-    manifestItems(
-      [{ id: "baseline", imageLabel: "release", sandboxImage: NEW_PIN, tasks: { core: CORE_TASK } }],
-      "baseline",
-    ),
-  );
-  const priorPath = process.env.PATH;
-  process.env.PATH = `${dir}:${priorPath}`;
-  try {
-    await awsUp(single, dir, { yes: true });
-    const { task, env } = coreTaskEnv(fake.state);
-    assert.equal(
-      env.FLY_BASE_IMAGE,
-      NEW_PIN,
-      "core boots sandboxes from the manifest-recorded pin without a config override",
-    );
-    const { manifest } = currentManifestOf(fake.state);
-    assert.equal(manifest.sandboxImage, NEW_PIN);
-    assert.equal((manifest.tasks as Record<string, string>).core, task);
-  } finally {
-    process.env.PATH = priorPath;
-    fake.restore();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("up on a fly-sandbox stack fails closed before mutation when no pin source or no sandbox.app exists", async () => {
-  const single = flySandboxPinlessConfig();
-  const bareDir = mkdtempSync(join(tmpdir(), "qm-aws-pin-missing-"));
-  const bare = statefulAws(bareDir, single);
-  try {
-    await assert.rejects(() => awsUp(single, bareDir, { yes: true }), /first deploy on this stack set sandbox\.image/);
-    assert.doesNotMatch(
-      readFileSync(bare.log, "utf8"),
-      /rds create-db-snapshot|ecr get-login-password|ecs update-service|s3api put-object/,
-    );
-  } finally {
-    bare.restore();
-    rmSync(bareDir, { recursive: true, force: true });
-  }
-  const noApp: QmConfig = { ...single, sandbox: { backend: "sprites" } };
-  const noAppDir = mkdtempSync(join(tmpdir(), "qm-aws-pin-no-app-"));
-  const fake = statefulAws(
-    noAppDir,
-    noApp,
-    manifestItems(
-      [{ id: "baseline", imageLabel: "release", sandboxImage: NEW_PIN, tasks: { core: CORE_TASK } }],
-      "baseline",
-    ),
-  );
-  try {
-    await assert.rejects(() => awsUp(noApp, noAppDir, { dryRun: true }), /no sandbox\.app to boot it in/);
-  } finally {
-    fake.restore();
-    rmSync(noAppDir, { recursive: true, force: true });
-  }
-});
-
-test("an --only deploy that skips core needs no pin source and records the pin baked into the carried core task", async () => {
-  const tasks = {
-    core: CORE_TASK,
-    "web-ui": "arn:aws:ecs:us-west-2:123456789012:task-definition/acme-web-ui:1",
-  };
-  const seedWorkloads = (statePath: string): void => {
-    const state = JSON.parse(readFileSync(statePath, "utf8"));
-    state.definitions[CORE_TASK] = { containerDefinitions: [{ name: "core", image: CORE_IMAGE }] };
-    writeFileSync(statePath, JSON.stringify(state));
-  };
-
-  const overrideDir = mkdtempSync(join(tmpdir(), "qm-aws-only-pin-carry-"));
-  const dockerBin = join(overrideDir, "docker");
-  writeFileSync(dockerBin, "#!/bin/sh\nexit 0\n");
-  chmodSync(dockerBin, 0o755);
-  const overridden = twoServiceConfig();
-  const bakedPin = `registry.fly.io/acme-sandboxes@sha256:${"9".repeat(64)}`;
-  assert.notEqual(overridden.sandbox!.image, bakedPin);
-  const carried = statefulAws(
-    overrideDir,
-    overridden,
-    manifestItems([{ id: "baseline", imageLabel: "previous", sandboxImage: bakedPin, tasks }], "baseline"),
-  );
-  seedWorkloads(carried.state);
-  const priorPath = process.env.PATH;
-  process.env.PATH = `${overrideDir}:${priorPath}`;
-  try {
-    await awsUp(overridden, overrideDir, { yes: true, only: ["web-ui"] });
-    const { manifest } = currentManifestOf(carried.state);
-    assert.equal(
-      manifest.sandboxImage,
-      bakedPin,
-      "the recorded pin is the one baked into the carried core task, not the config override",
-    );
-    assert.equal((manifest.tasks as Record<string, string>).core, CORE_TASK);
-  } finally {
-    process.env.PATH = priorPath;
-    carried.restore();
-    rmSync(overrideDir, { recursive: true, force: true });
-  }
-
-  const pinlessDir = mkdtempSync(join(tmpdir(), "qm-aws-only-pinless-"));
-  const pinlessDocker = join(pinlessDir, "docker");
-  writeFileSync(pinlessDocker, "#!/bin/sh\nexit 0\n");
-  chmodSync(pinlessDocker, 0o755);
-  const pinless: QmConfig = { ...twoServiceConfig(), sandbox: { backend: "sprites", app: "acme-sandboxes" } };
-  const bare = statefulAws(
-    pinlessDir,
-    pinless,
-    manifestItems([{ id: "baseline", imageLabel: "previous", tasks }], "baseline"),
-  );
-  seedWorkloads(bare.state);
-  process.env.PATH = `${pinlessDir}:${priorPath}`;
-  try {
-    await awsUp(pinless, pinlessDir, { yes: true, only: ["web-ui"] });
-    const { manifest } = currentManifestOf(bare.state);
-    assert.equal(manifest.sandboxImage, undefined, "a core-less deploy never needs a pin on a pin-less stack");
-    assert.equal((manifest.tasks as Record<string, string>).core, CORE_TASK);
-  } finally {
-    process.env.PATH = priorPath;
-    bare.restore();
-    rmSync(pinlessDir, { recursive: true, force: true });
   }
 });
 
@@ -4165,8 +8199,7 @@ test("AWS live check accepts a successful deploy mid-drain: PRIMARY at full stre
     { drainRollout: true },
   );
   const state = JSON.parse(readFileSync(fake.state, "utf8"));
-  const secretArn = "arn:aws:secretsmanager:us-west-2:123456789012:secret:test-AbCdEf";
-  const arns = Object.fromEntries(computedSecrets(single).map((secret) => [secret.name, secretArn]));
+  const arns = Object.fromEntries(computedSecrets(single).map((secret) => [secret.name, testSecretArn(secret.name)]));
   state.definitions[taskArn] = {
     ...renderTaskDefinition(
       single,
@@ -4188,8 +8221,9 @@ test("AWS live check accepts a successful deploy mid-drain: PRIMARY at full stre
 test("AWS renders config secretEnv extras and aliases as Secrets Manager references", () => {
   const extras: QmConfig = {
     ...config,
+    env: { ...config.env, core: { ...config.env.core, DEPLOY_APPS_DOMAIN: "apps.agent.acme.example" } },
     secretEnv: {
-      core: { OPENAI_API_KEY: "OPENAI_API_KEY", DEPLOY_APPS_SESSION_SECRET: "PORTAL_SESSION_SECRET" },
+      core: { CUSTOM_API_KEY: "CUSTOM_API_KEY", DEPLOY_APPS_SESSION_SECRET: "PORTAL_SESSION_SECRET" },
       slack: { SLACK_AUX_BOT_TOKEN: "SLACK_AUX_BOT_TOKEN" },
     },
   };
@@ -4201,7 +8235,7 @@ test("AWS renders config secretEnv extras and aliases as Secrets Manager referen
       s.valueFrom,
     ]),
   );
-  assert.equal(secrets.OPENAI_API_KEY, "arn:aws:secretsmanager:us-west-2:123456789012:secret:acme/qm/OPENAI_API_KEY");
+  assert.equal(secrets.CUSTOM_API_KEY, "arn:aws:secretsmanager:us-west-2:123456789012:secret:acme/qm/CUSTOM_API_KEY");
   assert.equal(
     secrets.SLACK_AUX_BOT_TOKEN,
     "arn:aws:secretsmanager:us-west-2:123456789012:secret:acme/qm/SLACK_AUX_BOT_TOKEN",
@@ -4266,9 +8300,10 @@ test("AWS renders adopted logGroup and stopTimeout pins; the defaults stay deriv
 });
 
 test("AWS doctor classifies an un-pushed secret store as pending, not drift", () => {
-  const rnf = new Error(
-    "An error occurred (ResourceNotFoundException) when calling the GetSecretValue operation: Secrets Manager can't find the specified secret.",
-  );
+  const rnf = Object.assign(new Error("aws command failed"), {
+    stderr:
+      "An error occurred (ResourceNotFoundException) when calling the GetSecretValue operation: Secrets Manager can't find the specified secret.",
+  });
   const secrets = computedSecrets({
     contract: 1,
     orgId: "acme",
@@ -4311,4 +8346,67 @@ test("AWS doctor still fails a pushed secret store holding a placeholder value",
   assert.deepEqual(probe.pending, []);
   assert.equal(probe.failures.length, 1);
   assert.match(probe.failures[0]!, /CORE_SIGNING_SECRET: missing, placeholder, or insecure value/);
+});
+
+test("AWS doctor rejects individually valid duplicate runtime secrets", () => {
+  const value = "individually-valid-duplicate-runtime-secret";
+  const probe = probeAwsSecretStore(
+    ["CAPABILITY_SECRET", "CORE_SIGNING_SECRET"].map((name) => ({
+      name,
+      services: ["core"],
+      description: "",
+      required: true,
+      managedBy: "operator" as const,
+    })),
+    () => value,
+    () => {},
+  );
+  assert.deepEqual(probe.pending, []);
+  assert.deepEqual(probe.failures, ["secrets failed runtime validation: CAPABILITY_SECRET, CORE_SIGNING_SECRET"]);
+});
+
+test("AWS doctor never classifies ResourceNotFoundException from an error message without process output", () => {
+  const probe = probeAwsSecretStore(
+    [
+      {
+        name: "CORE_SIGNING_SECRET",
+        services: ["core"],
+        description: "",
+        required: true,
+        managedBy: "operator",
+      },
+    ],
+    () => {
+      throw new Error("aws get ResourceNotFoundException failed: AccessDeniedException");
+    },
+    () => {},
+  );
+  assert.deepEqual(probe.pending, []);
+  assert.equal(probe.failures.length, 1);
+  assert.match(probe.failures[0]!, /AccessDeniedException/);
+});
+
+test("AWS doctor only classifies the primary structured AWS error code", () => {
+  const denied = Object.assign(new Error("aws command failed"), {
+    stderr:
+      "An error occurred (AccessDeniedException) when calling the GetSecretValue operation: resource acme-ResourceNotFoundException is denied",
+  });
+  const probe = probeAwsSecretStore(
+    [
+      {
+        name: "CORE_SIGNING_SECRET",
+        services: ["core"],
+        description: "",
+        required: true,
+        managedBy: "operator",
+      },
+    ],
+    () => {
+      throw denied;
+    },
+    () => {},
+  );
+  assert.deepEqual(probe.pending, []);
+  assert.equal(probe.failures.length, 1);
+  assert.match(probe.failures[0]!, /aws command failed/);
 });

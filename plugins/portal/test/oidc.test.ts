@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { exportJWK, SignJWT } from "jose";
+import { exportJWK, SignJWT, type JWTPayload } from "jose";
 import {
   pkcePair,
   buildAuthorizeUrl,
@@ -143,6 +143,16 @@ test("verifyIdToken requires a valid signature, issuer, audience, subject, nonce
     .setExpirationTime("5m")
     .sign(privateKey);
   await assert.rejects(verifyIdToken(provider, wrongSingleParty, "N", fetchJwks), /authorized party/);
+  for (const sub of [7, ""]) {
+    const invalidSubject = await new SignJWT({ nonce: "N", sub } as unknown as JWTPayload)
+      .setProtectedHeader({ alg: "EdDSA", kid: "key-1" })
+      .setIssuer("https://idp.example.test")
+      .setAudience("client-1")
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(privateKey);
+    await assert.rejects(verifyIdToken(provider, invalidSubject, "N", fetchJwks), /nonempty string/);
+  }
   const [header, payload, signature] = signed.split(".");
   const tamperedSignature = `${signature?.startsWith("A") ? "B" : "A"}${signature?.slice(1)}`;
   await assert.rejects(verifyIdToken(provider, `${header}.${payload}.${tamperedSignature}`, "N", fetchJwks));
@@ -150,15 +160,78 @@ test("verifyIdToken requires a valid signature, issuer, audience, subject, nonce
 });
 
 test("resolvePrincipal claim=sub returns the subject untouched", () => {
-  assert.equal(resolvePrincipal({ claim: "sub" }, { sub: "U1", claims: {}, userinfo: { email: "a@b.com" } }), "U1");
+  assert.equal(
+    resolvePrincipal({ claim: "sub" }, { sub: "U1", claims: { sub: "U1" }, userinfo: { email: "a@b.com" } }),
+    "U1",
+  );
+});
+
+test("resolvePrincipal requires matching nonempty signed and UserInfo subjects", () => {
+  for (const sub of [undefined, null, 7, "", "other"]) {
+    assert.throws(
+      () =>
+        resolvePrincipal(
+          { claim: "sub" },
+          { sub: "userinfo-sub", claims: sub === undefined ? {} : { sub }, userinfo: {} },
+        ),
+      /subject mismatch/,
+    );
+  }
 });
 
 test("resolvePrincipal claim=email returns the verified email, normalized", () => {
   const got = resolvePrincipal(
     { claim: "email" },
-    { sub: "g-123", claims: {}, userinfo: { email: " Alice@Example.com ", email_verified: true } },
+    { sub: "g-123", claims: { sub: "g-123" }, userinfo: { email: " Alice@Example.com ", email_verified: true } },
   );
   assert.equal(got, "alice@example.com");
+});
+
+test("resolvePrincipal accepts bounded ASCII dot-atom email claims", () => {
+  for (const value of ["Operator+alerts@Example.com", "first.last@sub-domain.example.com"]) {
+    assert.equal(
+      resolvePrincipal(
+        { claim: "email" },
+        { sub: "g", claims: { sub: "g" }, userinfo: { email: value, email_verified: true } },
+      ),
+      value.toLowerCase(),
+    );
+  }
+});
+
+test("resolvePrincipal rejects malformed verified email claims", () => {
+  for (const value of [
+    ".admin@example.com",
+    "admin.@example.com",
+    "ad..min@example.com",
+    "admin@example.com.",
+    "admin@bad..example.com",
+    "admin@-bad.example.com",
+    "admin@bad-.example.com",
+    "admin@sub_domain.example.com",
+    "admin@example.com:443",
+    "admin@example.com/path",
+    "admin@example.com?next=1",
+    "admin@example.com#fragment",
+    "admin@[127.0.0.1]",
+    "admin@[::1]",
+    "admin@127.0.0.1",
+    "Kate@example.com",
+    "admín@example.com",
+    "admin@exámple.com",
+    `${"a".repeat(65)}@example.com`,
+    `admin@${"a".repeat(64)}.example.com`,
+  ]) {
+    assert.throws(
+      () =>
+        resolvePrincipal(
+          { claim: "email" },
+          { sub: "g", claims: { sub: "g" }, userinfo: { email: value, email_verified: true } },
+        ),
+      /invalid email/,
+      value,
+    );
+  }
 });
 
 test("resolvePrincipal claim=email requires the verified userinfo response", () => {
@@ -166,54 +239,104 @@ test("resolvePrincipal claim=email requires the verified userinfo response", () 
     () =>
       resolvePrincipal(
         { claim: "email" },
-        { sub: "g-123", claims: { email: "a@acme.com", email_verified: "true" }, userinfo: {} },
+        { sub: "g-123", claims: { sub: "g-123", email: "a@acme.com", email_verified: "true" }, userinfo: {} },
       ),
     /no email/,
   );
 });
 
 test("resolvePrincipal claim=email rejects missing or unverified emails", () => {
-  assert.throws(() => resolvePrincipal({ claim: "email" }, { sub: "g", claims: {}, userinfo: {} }), /no email/);
   assert.throws(
-    () => resolvePrincipal({ claim: "email" }, { sub: "g", claims: {}, userinfo: { email: "a@b.com" } }),
-    /not verified/,
+    () => resolvePrincipal({ claim: "email" }, { sub: "g", claims: { sub: "g" }, userinfo: {} }),
+    /no email/,
   );
-  assert.throws(
-    () =>
-      resolvePrincipal(
-        { claim: "email" },
-        { sub: "g", claims: {}, userinfo: { email: "a@b.com", email_verified: false } },
-      ),
-    /not verified/,
-  );
+  for (const verified of [undefined, false, "true", 1, null]) {
+    assert.throws(
+      () =>
+        resolvePrincipal(
+          { claim: "email" },
+          {
+            sub: "g",
+            claims: { sub: "g" },
+            userinfo: { email: "a@b.com", ...(verified === undefined ? {} : { email_verified: verified }) },
+          },
+        ),
+      /not verified/,
+    );
+  }
 });
 
-test("resolvePrincipal allowedEmailDomain gates the email suffix and the hd claim", () => {
+test("resolvePrincipal allowedEmailDomain uses signed hd only for Google issuers", () => {
   const rule = { claim: "email" as const, allowedEmailDomain: "example.com" };
-  const ok = resolvePrincipal(rule, {
+  const broker = resolvePrincipal(rule, {
+    issuer: "https://portal.example.test/idp",
     sub: "g",
-    claims: {},
-    userinfo: { email: "a@example.com", email_verified: true, hd: "example.com" },
+    claims: { sub: "g" },
+    userinfo: { email: "a@example.com", email_verified: true, hd: "evil.com" },
   });
-  assert.equal(ok, "a@example.com");
-  assert.throws(
-    () => resolvePrincipal(rule, { sub: "g", claims: {}, userinfo: { email: "a@gmail.com", email_verified: true } }),
-    /permitted domain/,
-  );
+  assert.equal(broker, "a@example.com");
+  const google = resolvePrincipal(rule, {
+    issuer: "https://accounts.google.com",
+    sub: "g",
+    claims: { sub: "g", hd: "EXAMPLE.COM" },
+    userinfo: { email: "a@example.com", email_verified: true, hd: "evil.com" },
+  });
+  assert.equal(google, "a@example.com");
+  for (const [issuer, domain] of [
+    ["https://accounts.google.com", "gmail.com"],
+    ["accounts.google.com", "googlemail.com"],
+  ] as const) {
+    const consumerRule = { claim: "email" as const, allowedEmailDomain: domain };
+    for (const claims of [{ sub: "g" }, { sub: "g", hd: "evil.com" }]) {
+      assert.throws(
+        () =>
+          resolvePrincipal(consumerRule, {
+            issuer,
+            sub: "g",
+            claims,
+            userinfo: { email: `attacker@${domain}`, email_verified: true, hd: domain },
+          }),
+        /permitted domain/,
+      );
+    }
+    assert.equal(
+      resolvePrincipal(consumerRule, {
+        issuer,
+        sub: "g",
+        claims: { sub: "g", hd: domain },
+        userinfo: { email: `member@${domain}`, email_verified: true },
+      }),
+      `member@${domain}`,
+    );
+  }
   assert.throws(
     () =>
       resolvePrincipal(rule, {
+        issuer: "https://portal.example.test/idp",
         sub: "g",
-        claims: {},
-        userinfo: { email: "a@example.com", email_verified: true, hd: "evil.com" },
+        claims: { sub: "g" },
+        userinfo: { email: "a@gmail.com", email_verified: true },
       }),
     /permitted domain/,
   );
+  for (const hd of [undefined, null, 7, "evil.com", "example.com.", "exámple.com"]) {
+    assert.throws(
+      () =>
+        resolvePrincipal(rule, {
+          issuer: "https://accounts.google.com",
+          sub: "g",
+          claims: { sub: "g", ...(hd === undefined ? {} : { hd }) },
+          userinfo: { email: "a@example.com", email_verified: true, hd: "example.com" },
+        }),
+      /permitted domain/,
+    );
+  }
   assert.throws(
     () =>
       resolvePrincipal(rule, {
+        issuer: "accounts.google.com",
         sub: "g",
-        claims: {},
+        claims: { sub: "g", hd: "example.com" },
         userinfo: { email: "a@notexample.com", email_verified: true },
       }),
     /permitted domain/,
@@ -223,12 +346,83 @@ test("resolvePrincipal allowedEmailDomain gates the email suffix and the hd clai
 test("resolvePrincipal allowedEmails permits only the seeded verified addresses", () => {
   const rule = { claim: "email" as const, allowedEmails: ["Admin@Example.com"] };
   assert.equal(
-    resolvePrincipal(rule, { sub: "g", claims: {}, userinfo: { email: "admin@example.com", email_verified: true } }),
+    resolvePrincipal(rule, {
+      sub: "g",
+      claims: { sub: "g" },
+      userinfo: { email: "admin@example.com", email_verified: true },
+    }),
     "admin@example.com",
   );
   assert.throws(
     () =>
-      resolvePrincipal(rule, { sub: "g", claims: {}, userinfo: { email: "other@example.com", email_verified: true } }),
+      resolvePrincipal(rule, {
+        sub: "g",
+        claims: { sub: "g" },
+        userinfo: { email: "other@example.com", email_verified: true },
+      }),
     /permitted email list/,
+  );
+  assert.throws(
+    () =>
+      resolvePrincipal(
+        { claim: "email", allowedEmails: ["kate@example.com"] },
+        { sub: "g", claims: { sub: "g" }, userinfo: { email: "Kate@example.com", email_verified: true } },
+      ),
+    /invalid email/,
+  );
+});
+
+test("Google exact allowlists require signed hosted domains except for consumer Gmail domains", () => {
+  const rule = {
+    claim: "email" as const,
+    allowedEmails: ["admin@example.com", "owner@gmail.com", "legacy@googlemail.com"],
+  };
+  assert.equal(
+    resolvePrincipal(rule, {
+      issuer: "https://accounts.google.com",
+      sub: "g",
+      claims: { sub: "g", hd: "EXAMPLE.COM" },
+      userinfo: { email: "admin@example.com", email_verified: true, hd: "evil.com" },
+    }),
+    "admin@example.com",
+  );
+  for (const claims of [{ sub: "g" }, { sub: "g", hd: "evil.com" }]) {
+    assert.throws(
+      () =>
+        resolvePrincipal(rule, {
+          issuer: "https://accounts.google.com",
+          sub: "g",
+          claims,
+          userinfo: { email: "admin@example.com", email_verified: true, hd: "example.com" },
+        }),
+      /permitted domain/,
+    );
+  }
+  for (const [issuer, email] of [
+    ["https://accounts.google.com", "owner@gmail.com"],
+    ["accounts.google.com", "legacy@googlemail.com"],
+  ] as const) {
+    assert.equal(
+      resolvePrincipal(rule, {
+        issuer,
+        sub: "g",
+        claims: { sub: "g" },
+        userinfo: { email, email_verified: true, hd: "evil.com" },
+      }),
+      email,
+    );
+  }
+  assert.throws(
+    () =>
+      resolvePrincipal(
+        { claim: "email", allowedEmails: ["owner@gmail.com"], allowedEmailDomain: "gmail.com" },
+        {
+          issuer: "https://accounts.google.com",
+          sub: "g",
+          claims: { sub: "g" },
+          userinfo: { email: "owner@gmail.com", email_verified: true },
+        },
+      ),
+    /permitted domain/,
   );
 });

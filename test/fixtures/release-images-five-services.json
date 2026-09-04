@@ -1,0 +1,10 @@
+{
+  "sandboxBase": "ghcr.io/yc-software/qm/sandbox-base@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "services": {
+    "admin": "ghcr.io/yc-software/qm/admin@sha256:123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+    "auth": "ghcr.io/yc-software/qm/auth@sha256:23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
+    "core": "ghcr.io/yc-software/qm/core@sha256:3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012",
+    "portal": "ghcr.io/yc-software/qm/portal@sha256:456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123",
+    "web-ui": "ghcr.io/yc-software/qm/web-ui@sha256:56789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01234"
+  }
+}

@@ -98,6 +98,26 @@ test("provider config accepts a memorable provider with an allow-listed child en
   assert.equal(config?.routes[0]?.manage, false);
 });
 
+test("memorable redaction values preserve prototype-like environment names", () => {
+  const env = Object.fromEntries([
+    ["__proto__", "proto-secret"],
+    ["constructor", "constructor-secret"],
+    ["prototype", "prototype-secret"],
+  ]) as NodeJS.ProcessEnv;
+  const config = parseMemoryProviderConfig(
+    JSON.stringify({ providers: [{ id: "procedures", type: "memorable" }], routes: [] }),
+    env,
+  );
+  const provider = config?.providers[0];
+  if (provider?.type !== "memorable") throw new Error("expected memorable provider");
+  assert.deepEqual(Object.keys(provider.redactValues), ["__proto__", "constructor", "prototype"]);
+  assert.equal(Object.getPrototypeOf(provider.redactValues), Object.prototype);
+  assert.equal(Object.hasOwn(provider.redactValues, "__proto__"), true);
+  assert.equal(provider.redactValues.__proto__, "proto-secret");
+  assert.deepEqual(JSON.parse(JSON.stringify(provider.redactValues)), env);
+  assert.equal((Object.prototype as { polluted?: unknown }).polluted, undefined);
+});
+
 test("provider config rejects explicit capture on a memorable route", () => {
   assert.throws(
     () =>

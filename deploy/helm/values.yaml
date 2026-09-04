@@ -2,6 +2,13 @@ image:
   repository: ghcr.io/yc-software/qm
   separator: "/"
   tag: ""
+  digests:
+    core: ""
+    auth: ""
+    web-ui: ""
+    admin: ""
+    portal: ""
+    egress-proxy: ""
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

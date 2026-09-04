@@ -16,6 +16,7 @@ const ALL_SECRETS = [
   "SKILL_SIGNING_SECRET",
   "PUBLIC_API_URL",
   "FLY_API_TOKEN",
+  "SPRITES_TOKEN",
   "SLACK_BOT_TOKEN",
   "SLACK_APP_TOKEN",
 ];
@@ -136,7 +137,7 @@ test("explicit --build-from overrides a configured imageFrom default", () => {
   assert.doesNotMatch(result.out, /image-from configured-source/);
 });
 
-test("--only narrows a fly plan to the named component (and rejects unknown names)", () => {
+test("--only narrows Fly mutations while auditing every owned app (and rejects unknown names)", () => {
   const cfg = flyConfig("fly-only");
   const { result, logPath } = fly(["plan", "--only", "core"], cfg, { secrets: [] });
   assert.equal(result.code, 0, result.out);
@@ -145,7 +146,18 @@ test("--only narrows a fly plan to the named component (and rejects unknown name
     cmds.some((c) => c.includes("qm-e2e-core")),
     "gated core",
   );
-  assert.ok(!cmds.some((c) => c.includes("qm-e2e-web-ui")), "did NOT touch web-ui");
+  assert.ok(
+    cmds.some((c) => c[0] === "secrets" && c[1] === "list" && c.includes("qm-e2e-web-ui")),
+    "audited web-ui secrets",
+  );
+  assert.ok(
+    !cmds.some(
+      (c) =>
+        c.includes("qm-e2e-web-ui") &&
+        ((c[0] === "secrets" && (c[1] === "set" || c[1] === "unset")) || c[0] === "deploy"),
+    ),
+    "did not mutate web-ui",
+  );
 
   const bad = fly(["plan", "--only", "nope"], cfg, { secrets: [] });
   assert.equal(bad.result.code, 1);
@@ -164,6 +176,23 @@ test("status (fly) shells flyctl status per app", () => {
   const cmds = fakeFlyCommands(logPath);
   assert.ok(cmds.some((c) => c[0] === "status" && c.includes("qm-e2e-core")));
   assert.ok(cmds.some((c) => c[0] === "status" && c.includes("qm-e2e-web-ui")));
+});
+
+test("status (fly) surfaces an unowned zero-machine prefix app without mutating it", () => {
+  const cfg = flyConfig("fly-status-unowned");
+  const { result, logPath } = fly(["status"], cfg, {
+    apps: ["qm-e2e-core", "qm-e2e-web-ui", "qm-e2e-orphan"],
+  });
+  assert.equal(result.code, 0, result.out);
+  assert.match(result.out, /qm-e2e-orphan:[\s\S]*verify and remove it or restore its ownership marker/);
+  const commands = fakeFlyCommands(logPath);
+  assert.ok(
+    !commands.some(
+      (command) =>
+        command.includes("qm-e2e-orphan") &&
+        (command[0] === "scale" || command[0] === "deploy" || (command[0] === "secrets" && command[1] !== "list")),
+    ),
+  );
 });
 
 test("logs (fly) shells flyctl logs, and notes that --tail is docker-only", () => {

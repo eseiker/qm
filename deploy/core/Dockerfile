@@ -14,6 +14,7 @@ COPY skills-seed ./skills-seed
 COPY plugins/onboarding ./plugins/onboarding
 COPY plugins/chassis ./plugins/chassis
 COPY tsconfig.json ./
+RUN find . -type f -exec sha256sum {} + | LC_ALL=C sort | sha256sum | cut -d' ' -f1 > .build-sha
 
 ENV NODE_ENV=production
 ENV DATA_DIR=/data

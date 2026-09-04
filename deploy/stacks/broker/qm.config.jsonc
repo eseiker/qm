@@ -6,14 +6,15 @@
   "contract": 1,
   "orgId": "acme",
   "publicUrl": "https://agent.example.com",
+  "botName": "Acme",
   "target": "fly",
   "appPrefix": "qm",
   "region": "sjc",
   "flyOrg": "personal",
   "deployAppPrefix": "qm-d",
   "sandbox": {
-    "app": "acme-sandboxes",
-    "image": "registry.fly.io/acme-sandboxes@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+    "backend": "sprites",
+    "namePrefix": "acme",
   },
   "services": ["core", "slack", "admin", "web-ui", "portal", "auth"],
   "env": {
@@ -34,7 +35,6 @@
     "auth": {
       "AUTH_EMAIL_TRANSPORT": "resend",
       "AUTH_ALLOWED_EMAIL_DOMAIN": "example.com",
-      "AUTH_BRAND_NAME": "Acme",
     },
   },
 }

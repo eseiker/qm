@@ -8,8 +8,8 @@
   "flyOrg": "personal",
   "deployAppPrefix": "qm-d",
   "sandbox": {
-    "app": "acme-sandboxes",
-    "image": "registry.fly.io/acme-sandboxes@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+    "backend": "sprites",
+    "namePrefix": "acme",
   },
   "services": ["core", "slack", "admin", "web-ui", "portal"],
   "env": {
@@ -17,6 +17,7 @@
       "ADMIN_BASE_PATH": "/admin",
     },
     "core": {
+      "FLY_DEPLOY_BASE_IMAGE": "registry.fly.io/acme-deploy-runner@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
       "HARNESS": "pi",
       "SNAPSHOT_STORE": "s3",
       "TRANSFER_STORE": "s3",

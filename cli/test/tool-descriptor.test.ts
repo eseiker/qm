@@ -307,6 +307,13 @@ test("parseSkillFrontmatter requires name + description + body; requiredCapabili
     () => parseSkillFrontmatter("---\nname: x\ndescription: y\nrequiredCapabilities: a, b\n---\nbody", "SKILL.md"),
     /must be a YAML list/,
   );
+  assert.deepEqual(
+    parseSkillFrontmatter(
+      "---\n__proto__: preserved\nconstructor: preserved\nprototype: preserved\nname: safe\ndescription: safe\nrequiredCapabilities: [one]\n---\nbody",
+      "SKILL.md",
+    ),
+    { name: "safe", description: "safe", requiredCapabilities: ["one"] },
+  );
 });
 
 test("drift-lock: cli skill parser matches the core seed parser's output", () => {

@@ -36,9 +36,7 @@ function jsonbSafe(value: unknown): unknown {
   if (typeof value === "string") return jsonbSafeString(value);
   if (Array.isArray(value)) return value.map(jsonbSafe);
   if (value && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value)) out[jsonbSafeString(k)] = jsonbSafe(v);
-    return out;
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [jsonbSafeString(k), jsonbSafe(v)]));
   }
   return value;
 }
@@ -48,10 +46,9 @@ export function jsonbStringify(value: unknown): string {
 }
 
 function applyPatch<T>(value: T, patch: Partial<T>): T {
-  const next = { ...value } as Record<string, unknown>;
+  const next = { ...value, ...patch } as Record<string, unknown>;
   for (const [k, v] of Object.entries(patch)) {
     if (v === undefined) delete next[k];
-    else next[k] = v;
   }
   return next as T;
 }

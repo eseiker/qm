@@ -194,6 +194,16 @@ export function createSkillStore(opts: SkillStoreOptions = {}): SkillStore {
       if (s.status === "draft") throw new Error("skill must be reviewed before it is published");
       const missing = s.manifest.requiredCapabilities.filter((c) => !s.grantedCapabilities.includes(c));
       if (missing.length) throw new Error(`skill requires ungranted capabilities: ${missing.join(", ")}`);
+      const collision = (await skills.all()).find(
+        (other) =>
+          other.id !== s.id &&
+          other.status === "published" &&
+          other.scopeId === s.scopeId &&
+          other.manifest.name === s.manifest.name,
+      );
+      if (collision) {
+        throw new Error(`scope already has a published skill named ${JSON.stringify(s.manifest.name)}`);
+      }
       s.status = "published";
       s.updatedAt = Date.now();
       await skills.put(s.id, s);
@@ -272,6 +282,9 @@ export function createSkillStore(opts: SkillStoreOptions = {}): SkillStore {
       const existing = (await skills.all()).find(
         (x) => x.status === "published" && x.scopeId === targetScopeId && x.manifest.name === s.manifest.name,
       );
+      if (existing && existing.createdBy !== s.createdBy) {
+        throw new Error(`scope already has a published skill named ${JSON.stringify(s.manifest.name)}`);
+      }
       const at = Date.now();
       const promoted: Skill = {
         id: existing?.id ?? randomUUID(),

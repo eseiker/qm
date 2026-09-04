@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -18,40 +17,35 @@ import {
 import type { ResolvedPlugin } from "../src/plugins.ts";
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const TEST_CONFIG_IDENTITY = { dev: -1n, ino: -1n };
 
 test("Fly runs the live session smoke inside the private core machine", () => {
   assert.equal(flyLiveSessionCommand(), "node src/deployment/postdeploy-smoke.ts session http://127.0.0.1:8080");
 });
 
-test("a fly config's sandbox block rewrites the core fly.toml [env] (app, image, env literals)", () => {
+test("a Fly deployment configures core to create Sprites with the configured name prefix", () => {
   const { config } = loadConfigAt(join(repoRoot, "deploy", "stacks", "acme", "qm.config.jsonc"));
   const cfg = {
     ...config,
     sandbox: {
-      app: "acme-sb",
-      image: "registry.fly.io/acme-sb@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
-      env: { TZ: "UTC" },
-      secretEnv: ["COMPANY_API_TOKEN"],
+      backend: "sprites" as const,
+      namePrefix: "acme-sb",
     },
   };
 
   const core = derivedTomlFor(cfg, "core", repoRoot);
-  assert.match(core, /FLY_SANDBOX_APP_NAME = "acme-sb"/, "sandbox.app overrides the baked app name");
-  assert.match(
-    core,
-    /FLY_BASE_IMAGE = "registry\.fly\.io\/acme-sb@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"/,
-    "FLY_BASE_IMAGE is the config's digest pin",
-  );
-  assert.match(core, /FLY_RESIDENT_ENV_TZ = "UTC"/, "sandbox.env literal forwarded as FLY_RESIDENT_ENV_*");
-  assert.doesNotMatch(
-    core,
-    /FLY_RESIDENT_ENV_COMPANY_API_TOKEN/,
-    "secretEnv value/name must not be written to the toml",
-  );
+  assert.match(core, /SANDBOX_BACKEND = "sprites"/);
+  assert.match(core, /SPRITES_NAME_PREFIX = "acme-sb"/);
 
   const admin = derivedTomlFor(cfg, "admin", repoRoot);
-  assert.doesNotMatch(admin, /FLY_RESIDENT_ENV_TZ/);
-  assert.doesNotMatch(admin, /FLY_SANDBOX_APP_NAME = "acme-sb"/);
+  assert.doesNotMatch(admin, /SANDBOX_BACKEND|SPRITES_NAME_PREFIX/);
+});
+
+test("a legacy Fly sandbox app preserves the historical Sprite name prefix", () => {
+  const { config } = loadConfigAt(join(repoRoot, "deploy", "stacks", "acme", "qm.config.jsonc"));
+  const core = derivedTomlFor({ ...config, sandbox: { app: "acme-sandboxes" } }, "core", repoRoot);
+  assert.match(core, /SANDBOX_BACKEND = "sprites"/);
+  assert.doesNotMatch(core, /SPRITES_NAME_PREFIX/);
 });
 
 test("the fly target routes security screen proxy configuration only to core", () => {
@@ -84,6 +78,48 @@ test("the fly target routes security screen proxy configuration only to core", (
     ),
     [],
   );
+});
+
+test("the Fly portal receives the same effective deployment apps domain selected by the core", () => {
+  const base: QmConfig = {
+    contract: 1,
+    orgId: "acme",
+    publicUrl: "https://acme.example.com",
+    target: "fly",
+    appPrefix: "acme",
+    region: "sjc",
+    flyOrg: "personal",
+    services: ["core", "portal"],
+    plugins: [],
+    skills: [],
+    env: {},
+    imageOverrides: {},
+  };
+  for (const [name, core, expected] of [
+    [
+      "common",
+      {
+        DEPLOY_PROVIDER: "porter",
+        DEPLOY_APPS_DOMAIN: "common.example.com",
+        PORTER_DEPLOY_APPS_DOMAIN: "porter.example.com",
+        AWS_DEPLOY_APPS_DOMAIN: "aws.example.com",
+      },
+      "common.example.com",
+    ],
+    ["legacy AWS fallback", { DEPLOY_PROVIDER: "fly", AWS_DEPLOY_APPS_DOMAIN: "aws.example.com" }, "aws.example.com"],
+  ] as const) {
+    const config: QmConfig = { ...base, env: { core } };
+    const portal = generatedEnv(derivedTomlFor(config, "portal", repoRoot));
+    assert.equal(portal.DEPLOY_APPS_DOMAIN, expected, name);
+  }
+  const noDomain = generatedEnv(
+    derivedTomlFor(
+      { ...base, env: { core: { DEPLOY_PROVIDER: "fly", PORTER_DEPLOY_APPS_DOMAIN: "porter.example.com" } } },
+      "portal",
+      repoRoot,
+    ),
+  );
+  assert.equal(noDomain.DEPLOY_APPS_DOMAIN, undefined);
 });
 
 test("the fly target derives a plugin fly.toml wiring it to the core over 6PN", () => {
@@ -137,6 +173,31 @@ test("a plugin's entry env can override the injected wiring (entry env wins)", (
   assert.match(derivedPluginTomlFor(config, plugin), /CORE_API_URL = "http:\/\/elsewhere:9000"/);
 });
 
+test("Fly forces production mode after every image and source plugin environment merge", () => {
+  const config: QmConfig = {
+    contract: 1,
+    orgId: "acme",
+    publicUrl: "https://acme.example.com",
+    target: "fly",
+    appPrefix: "qm",
+    region: "sjc",
+    flyOrg: "personal",
+    services: ["core"],
+    plugins: [],
+    skills: [],
+    env: {},
+    imageOverrides: {},
+  };
+  for (const plugin of [
+    { name: "image-plugin", kind: "image" as const, image: "ghcr.io/x:1", env: { NODE_ENV: "development" } },
+    { name: "source-plugin", kind: "source" as const, env: { NODE_ENV: "test" } },
+  ]) {
+    const toml = derivedPluginTomlFor(config, plugin);
+    assert.match(toml, /^\s*NODE_ENV = "production"$/m, plugin.name);
+    assert.doesNotMatch(toml, /^\s*NODE_ENV = "(?:development|test)"$/m, plugin.name);
+  }
+});
+
 test("a plugin env value with quotes/backslashes is escaped into valid TOML", () => {
   const config: QmConfig = {
     contract: 1,
@@ -174,21 +235,54 @@ test("--only rejects a name that is neither a service nor a plugin (before any F
   };
   const emptyDir = mkdtempSync(join(tmpdir(), "qm-fly-only-"));
   await assert.rejects(
-    () => flyUp(config, emptyDir, { dryRun: true, only: ["nope"] }),
+    () => flyUp(config, emptyDir, { configIdentity: TEST_CONFIG_IDENTITY, dryRun: true, only: ["nope"] }),
     /--only "nope" is not a service or plugin/,
   );
 });
 
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { flyPinSandbox, flyRollback, flySecretsPush } from "../src/backends/fly.ts";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { flyRollback, flySecretsPush } from "../src/backends/fly.ts";
+import { readEnvFile } from "../src/util.ts";
 
 function fakeFly(dir: string, script: string): { log: string; restore: () => void } {
   const bin = join(dir, "fly-fake");
   const log = join(dir, "fly.log");
+  const state = join(dir, "fly-state.json");
   writeFileSync(log, "");
   writeFileSync(
     bin,
-    `#!/usr/bin/env node\nconst fs = require("node:fs");\nconst a = process.argv.slice(2).join(" ");\nfs.appendFileSync(${JSON.stringify(log)}, a + "\\n");\n${script}\n`,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const a = args.join(" ");
+const fakeStatePath = ${JSON.stringify(state)};
+const fakeState = fs.existsSync(fakeStatePath) ? JSON.parse(fs.readFileSync(fakeStatePath, "utf8")) : { apps: [], secrets: {} };
+const fakeAppIndex = args.indexOf("-a");
+const fakeTargetApp = args[0] === "apps" && args[1] === "create" ? args[2] : fakeAppIndex < 0 ? "" : args[fakeAppIndex + 1];
+if (args[0] === "apps" && args[1] === "create" && fakeTargetApp && !fakeState.apps.includes(fakeTargetApp)) fakeState.apps.push(fakeTargetApp);
+if (args[0] === "secrets" && args[1] === "set" && fakeTargetApp) {
+  const assignment = args[args.length - 1];
+  const name = assignment.slice(0, assignment.indexOf("="));
+  fakeState.secrets[fakeTargetApp] = [...new Set([...(fakeState.secrets[fakeTargetApp] || []), name])];
+}
+if (args[0] === "secrets" && args[1] === "unset" && fakeTargetApp) {
+  const removed = new Set(args.slice(fakeAppIndex + 2));
+  fakeState.secrets[fakeTargetApp] = (fakeState.secrets[fakeTargetApp] || []).filter((name) => !removed.has(name));
+}
+fs.writeFileSync(fakeStatePath, JSON.stringify(fakeState));
+fs.appendFileSync(${JSON.stringify(log)}, a + "\\n");
+let fakeEmitted = false;
+const fakeOutput = console.log.bind(console);
+console.log = (...values) => {
+  if (args[0] === "secrets" && args[1] === "list" && values.length === 1 && values[0] === "ok") return;
+  fakeEmitted = true;
+  fakeOutput(...values);
+};
+${script}
+if (!fakeEmitted && args[0] === "apps" && args[1] === "list") console.log(JSON.stringify(fakeState.apps.map((Name) => ({ Name }))));
+else if (!fakeEmitted && args[0] === "secrets" && args[1] === "list") console.log(JSON.stringify((fakeState.secrets[fakeTargetApp] || []).map((Name) => ({ Name }))));
+else if (!fakeEmitted && args[0] === "status") console.log(JSON.stringify({ Machines: [] }));
+`,
   );
   chmodSync(bin, 0o755);
   const prior = process.env.FLY_BIN;
@@ -236,7 +330,7 @@ test("the Fly S3 probe is valid CommonJS that reports async failures", () => {
   }
 });
 
-test("fly secrets push stages a dual-role secret under BOTH names on the core app", async () => {
+test("fly secrets push stages runtime and Sprites credentials on the core app", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-fly-push-"));
   const config: QmConfig = {
     contract: 1,
@@ -250,7 +344,7 @@ test("fly secrets push stages a dual-role secret under BOTH names on the core ap
     skills: [],
     env: { core: { HARNESS: "pi" } },
     imageOverrides: {},
-    sandbox: { app: "acme-sb", secretEnv: ["ANTHROPIC_API_KEY", "COMPANY_TOKEN"] },
+    sandbox: { backend: "sprites", namePrefix: "acme-sb" },
   };
   mkdirSync(join(dir, "plugins", "srcplug"), { recursive: true });
   writeFileSync(join(dir, "plugins", "srcplug", "Dockerfile"), "FROM scratch\n");
@@ -258,14 +352,13 @@ test("fly secrets push stages a dual-role secret under BOTH names on the core ap
     join(dir, ".env"),
     [
       "ANTHROPIC_API_KEY=k",
-      "CAPABILITY_SECRET=cap",
-      "COMPANY_TOKEN=t",
+      "CAPABILITY_SECRET=capability-secret-that-is-long-enough",
       `CONNECTOR_SECRET_KEY=${"connector".repeat(4)}`,
       `CORE_SIGNING_SECRET=${"core-signing".repeat(3)}`,
-      "PORTAL_IDENTITY_SECRET=identity",
+      "PORTAL_IDENTITY_SECRET=portal-identity-secret-that-is-long-enough",
       `SKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}`,
-      "FLY_SANDBOX_API_TOKEN=f",
-      "PUBLIC_API_URL=https://core.example.test",
+      "SPRITES_TOKEN=f",
+      "PUBLIC_API_URL=https://acme.example.com",
       "SLACK_BOT_TOKEN=xoxb",
       "SLACK_APP_TOKEN=xapp",
     ].join("\n"),
@@ -279,18 +372,13 @@ test("fly secrets push stages a dual-role secret under BOTH names on the core ap
   const log = console.log;
   console.log = (): void => {};
   try {
-    await flySecretsPush(config, dir);
+    await flySecretsPush(config, dir, readEnvFile(join(dir, ".env")));
     const calls = readFileSync(fake.log, "utf8");
     assert.ok(
       calls.includes("secrets set --stage -a acme-core ANTHROPIC_API_KEY=-"),
       "plain name for the core process",
     );
-    assert.ok(
-      calls.includes("secrets set --stage -a acme-core FLY_RESIDENT_ENV_ANTHROPIC_API_KEY=-"),
-      "renamed variant forwarded into sandboxes",
-    );
-    assert.ok(calls.includes("secrets set --stage -a acme-core FLY_RESIDENT_ENV_COMPANY_TOKEN=-"));
-    assert.ok(!calls.includes("-a acme-core COMPANY_TOKEN=-"), "a sandbox-only secret is not staged plain");
+    assert.ok(calls.includes("secrets set --stage -a acme-core SPRITES_TOKEN=-"));
     assert.ok(
       calls.includes("secrets set --stage -a acme-core SLACK_BOT_TOKEN=-"),
       "virtual-service secrets stage plain on core",
@@ -331,7 +419,7 @@ test("fly secrets push warns that staged secrets are not live when machines are 
     skills: [],
     env: { core: { HARNESS: "mock" } },
     imageOverrides: {},
-    sandbox: { app: "acme-sb" },
+    sandbox: { backend: "sprites", namePrefix: "acme-sb" },
   };
   writeFileSync(
     join(dir, ".env"),
@@ -341,7 +429,7 @@ test("fly secrets push warns that staged secrets are not live when machines are 
       `CORE_SIGNING_SECRET=${"core-signing".repeat(3)}`,
       "PORTAL_IDENTITY_SECRET=portal-identity-secret-that-is-long-enough",
       `SKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}`,
-      "FLY_SANDBOX_API_TOKEN=fly",
+      "SPRITES_TOKEN=fly",
     ].join("\n"),
   );
   const fake = fakeFly(
@@ -359,7 +447,7 @@ else if (a.startsWith("secrets set ")) fs.readFileSync(0, "utf8");
     warnings.push(msg);
   };
   try {
-    await flySecretsPush(config, dir);
+    await flySecretsPush(config, dir, readEnvFile(join(dir, ".env")));
     assert.ok(
       warnings.some((line) => line.includes("staged secrets are NOT live yet on acme-core")),
       warnings.join("\n"),
@@ -387,7 +475,7 @@ test("fly secrets push stays quiet about staging when no machines are running", 
     skills: [],
     env: { core: { HARNESS: "mock" } },
     imageOverrides: {},
-    sandbox: { app: "acme-sb" },
+    sandbox: { backend: "sprites", namePrefix: "acme-sb" },
   };
   writeFileSync(
     join(dir, ".env"),
@@ -397,7 +485,7 @@ test("fly secrets push stays quiet about staging when no machines are running", 
       `CORE_SIGNING_SECRET=${"core-signing".repeat(3)}`,
       "PORTAL_IDENTITY_SECRET=portal-identity-secret-that-is-long-enough",
       `SKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}`,
-      "FLY_SANDBOX_API_TOKEN=fly",
+      "SPRITES_TOKEN=fly",
     ].join("\n"),
   );
   const fake = fakeFly(
@@ -415,7 +503,7 @@ else if (a.startsWith("secrets set ")) fs.readFileSync(0, "utf8");
     warnings.push(msg);
   };
   try {
-    await flySecretsPush(config, dir);
+    await flySecretsPush(config, dir, readEnvFile(join(dir, ".env")));
     assert.ok(!warnings.some((line) => line.includes("staged secrets are NOT live")), warnings.join("\n"));
   } finally {
     console.log = log;
@@ -425,7 +513,7 @@ else if (a.startsWith("secrets set ")) fs.readFileSync(0, "utf8");
   }
 });
 
-test("fly secrets push removes the disabled Fly app publisher token", async () => {
+test("fly secrets push removes retired core publisher aliases while ignoring disabled routes", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-fly-push-publisher-off-"));
   const config: QmConfig = {
     contract: 1,
@@ -434,12 +522,14 @@ test("fly secrets push removes the disabled Fly app publisher token", async () =
     target: "fly",
     region: "sjc",
     flyOrg: "personal",
-    services: ["core"],
+    services: ["core", "admin"],
     plugins: [],
     skills: [],
     env: { core: { HARNESS: "mock" } },
     imageOverrides: {},
-    sandbox: { app: "acme-sb" },
+    secretEnv: {
+      slack: { FLY_API_TOKEN: "DISABLED_FLY_TOKEN" },
+    },
   };
   writeFileSync(
     join(dir, ".env"),
@@ -449,25 +539,95 @@ test("fly secrets push removes the disabled Fly app publisher token", async () =
       `CORE_SIGNING_SECRET=${"core-signing".repeat(3)}`,
       "PORTAL_IDENTITY_SECRET=portal-identity-secret-that-is-long-enough",
       `SKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}`,
-      "FLY_SANDBOX_API_TOKEN=fly",
+      "SPRITES_TOKEN=fly",
     ].join("\n"),
   );
   const fake = fakeFly(
     dir,
     `
-if (a === "secrets list -a acme-core") console.log("FLY_DEPLOY_API_TOKEN digest");
+if (a.startsWith("apps list")) console.log(JSON.stringify([{ Name: "acme-core" }, { Name: "acme-admin" }]));
+else if (a === "secrets list -a acme-core --json") console.log(JSON.stringify(["QM_OWNER_CD83933C6C53374D", "FLY_DEPLOY_API_TOKEN", "FLY_API_TOKEN"].map((Name) => ({ Name }))));
+else if (a === "secrets list -a acme-admin --json") console.log(JSON.stringify([{ Name: "QM_OWNER_CD83933C6C53374D" }]));
 else if (a.startsWith("secrets set ")) fs.readFileSync(0, "utf8");
 `,
   );
   const log = console.log;
-  console.log = (): void => {};
+  const messages: string[] = [];
+  console.log = (...args: unknown[]): void => {
+    messages.push(args.join(" "));
+  };
   try {
-    await flySecretsPush(config, dir);
-    assert.match(readFileSync(fake.log, "utf8"), /secrets unset --stage -a acme-core FLY_DEPLOY_API_TOKEN/);
+    await flySecretsPush(config, dir, readEnvFile(join(dir, ".env")));
+    const calls = readFileSync(fake.log, "utf8");
+    assert.match(calls, /secrets unset --stage -a acme-core .*\bFLY_DEPLOY_API_TOKEN\b/);
+    assert.match(calls, /secrets unset --stage -a acme-core .*\bFLY_API_TOKEN\b/);
+    assert.doesNotMatch(calls, /input DISABLED_FLY_TOKEN|secrets set[^\n]*FLY_API_TOKEN/);
+    assert.ok(messages.some((line) => line.includes("FLY_API_TOKEN")));
   } finally {
     console.log = log;
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fly secrets push rejects FLY_API_TOKEN routed through active core topology", async (t) => {
+  for (const route of ["core", "slack"] as const) {
+    await t.test(route, async () => {
+      const dir = mkdtempSync(join(tmpdir(), `qm-fly-push-current-${route}-fly-secrets-`));
+      const config: QmConfig = {
+        contract: 1,
+        orgId: "acme",
+        publicUrl: "https://acme.example.com",
+        target: "fly",
+        region: "sjc",
+        flyOrg: "personal",
+        services: route === "core" ? ["core"] : ["core", "slack"],
+        plugins: [],
+        skills: [],
+        env: { core: { HARNESS: "mock" } },
+        imageOverrides: {},
+        secretEnv: {
+          [route]: {
+            FLY_API_TOKEN: "CURRENT_FLY_TOKEN",
+          },
+        },
+      };
+      const configPath = join(dir, "qm.config.jsonc");
+      writeFileSync(configPath, JSON.stringify(config));
+      const loadedConfig = loadConfigAt(configPath).config;
+      writeFileSync(
+        join(dir, ".env"),
+        [
+          "CAPABILITY_SECRET=capability-secret-that-is-long-enough",
+          `CONNECTOR_SECRET_KEY=${"connector".repeat(4)}`,
+          `CORE_SIGNING_SECRET=${"core-signing".repeat(3)}`,
+          "PORTAL_IDENTITY_SECRET=portal-identity-secret-that-is-long-enough",
+          `SKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}`,
+          "SPRITES_TOKEN=fly",
+          "CURRENT_FLY_TOKEN=current-fly",
+        ].join("\n"),
+      );
+      const fake = fakeFly(
+        dir,
+        `
+if (a === "secrets list -a acme-core --json") console.log(JSON.stringify([{ Name: "FLY_API_TOKEN" }]));
+else if (a.startsWith("secrets set ")) fs.readFileSync(0, "utf8");
+`,
+      );
+      const log = console.log;
+      console.log = (): void => {};
+      try {
+        await assert.rejects(
+          flySecretsPush(loadedConfig, dir, readEnvFile(join(dir, ".env"))),
+          /cannot target provider-owned destination core\.FLY_API_TOKEN/,
+        );
+        assert.equal(readFileSync(fake.log, "utf8"), "");
+      } finally {
+        console.log = log;
+        fake.restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
   }
 });
 
@@ -489,12 +649,12 @@ test("fly secrets push falls back to an ambient secret when the scaffold entry i
   writeFileSync(
     join(dir, ".env"),
     [
-      "CAPABILITY_SECRET=cap",
+      "CAPABILITY_SECRET=capability-secret-that-is-long-enough",
       `CONNECTOR_SECRET_KEY=${"connector".repeat(4)}`,
       "CORE_SIGNING_SECRET=",
-      "PORTAL_IDENTITY_SECRET=identity",
+      "PORTAL_IDENTITY_SECRET=portal-identity-secret-that-is-long-enough",
       `SKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}`,
-      "FLY_SANDBOX_API_TOKEN=fly",
+      "SPRITES_TOKEN=fly",
     ].join("\n"),
   );
   const fake = fakeFly(
@@ -506,7 +666,7 @@ test("fly secrets push falls back to an ambient secret when the scaffold entry i
   const log = console.log;
   console.log = (): void => {};
   try {
-    await flySecretsPush(config, dir);
+    await flySecretsPush(config, dir, readEnvFile(join(dir, ".env")));
     assert.match(readFileSync(fake.log, "utf8"), /value:ambient-signing-secret-that-is-long-enough/);
   } finally {
     console.log = log;
@@ -523,6 +683,7 @@ test("fly live check requires deployed machines and a healthy public endpoint", 
     contract: 1,
     orgId: "acme",
     publicUrl: "https://qm.example.test",
+    apiUrl: "https://api.example.test",
     target: "fly",
     region: "sjc",
     flyOrg: "personal",
@@ -554,13 +715,28 @@ else console.log("ok");`,
   const log = console.log;
   console.log = (...args: unknown[]): void => void lines.push(args.join(" "));
   try {
+    const healthUrls: string[] = [];
     await flyCheckLive(config, dir, {
-      fetchImpl: async (url) => {
-        assert.equal(url, "https://qm.example.test/healthz");
+      fetchImpl: async (url, init) => {
+        assert.equal(init?.redirect, "manual");
+        healthUrls.push(String(url));
         return new Response('{"ok":true}', { status: 200 });
       },
       report: false,
     });
+    assert.deepEqual(healthUrls, ["https://qm.example.test/healthz", "https://api.example.test/healthz"]);
+    await assert.rejects(
+      flyCheckLive(config, dir, {
+        fetchImpl: async (url, init) => {
+          assert.equal(init?.redirect, "manual");
+          return String(url).startsWith(config.apiUrl!)
+            ? new Response(null, { status: 302, headers: { location: config.publicUrl } })
+            : new Response('{"ok":true}', { status: 200 });
+        },
+        report: false,
+      }),
+      /https:\/\/api\.example\.test\/healthz: HTTP 302/,
+    );
     assert.deepEqual(lines, [], "JSON callers can suppress all human-readable live-check output");
     const calls = readFileSync(fake.log, "utf8");
     for (const app of ["acme-core", "acme-web-ui", "acme-portal"]) {
@@ -573,6 +749,141 @@ else console.log("ok");`,
     );
   } finally {
     console.log = log;
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fly live check rejects stale secrets on their wrong workload", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-fly-live-stale-secrets-"));
+  const config: QmConfig = {
+    contract: 1,
+    orgId: "acme",
+    publicUrl: "https://qm.example.test",
+    target: "fly",
+    region: "sjc",
+    flyOrg: "personal",
+    services: ["portal"],
+    plugins: [],
+    skills: [],
+    env: {},
+    imageOverrides: {},
+  };
+  const stale = [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "CAPABILITY_SECRET",
+    "FLY_APP_NAME",
+    "MixedCaseSecret",
+    "SLACK_API_URL",
+    "STOLEN_PORTAL_KEY",
+    "lowercase_secret",
+  ];
+  const fake = fakeFly(
+    dir,
+    `
+if (a.startsWith("apps list")) console.log(JSON.stringify([{ Name: "acme-portal" }]));
+else if (a.startsWith("secrets list")) console.log(${JSON.stringify(
+      [
+        "NAME  DIGEST  CREATED AT",
+        "QM_OWNER_CD83933C6C53374D digest now",
+        ...stale.map((name) => `${name} digest now`),
+      ].join("\n"),
+    )});
+else if (a.startsWith("status")) console.log(JSON.stringify({ Machines: [{ state: "started", region: "sjc", config: { image: "registry.fly.io/acme-portal@sha256:${"a".repeat(64)}", env: { QM_DEPLOYMENT_ID: "qm-v2:personal:acme:acme" } } }] }));
+else console.log("ok");`,
+  );
+  try {
+    await assert.rejects(
+      () => flyCheckLive(config, dir, { fetchImpl: async () => new Response("ok"), report: false }),
+      (error: unknown) => {
+        const message = String(error);
+        for (const name of stale) assert.match(message, new RegExp(name));
+        return true;
+      },
+    );
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fly live check rejects a mismatched materialized public API coordinate", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-fly-live-public-api-"));
+  const config: QmConfig = {
+    contract: 1,
+    orgId: "acme",
+    publicUrl: "https://qm.example.test",
+    apiUrl: "https://api.example.test",
+    target: "fly",
+    region: "sjc",
+    flyOrg: "personal",
+    services: ["core"],
+    plugins: [],
+    skills: [],
+    env: { core: { HARNESS: "pi" } },
+    imageOverrides: {},
+  };
+  const env = generatedEnv(derivedTomlFor(config, "core", repoRoot));
+  const fake = fakeFly(
+    dir,
+    `
+if (a.startsWith("apps list")) console.log(JSON.stringify([{ Name: "acme-core" }]));
+else if (a.startsWith("secrets list")) console.log(JSON.stringify([{ Name: "QM_OWNER_CD83933C6C53374D" }, { Name: "PUBLIC_API_URL" }]));
+else if (a.startsWith("status")) console.log(JSON.stringify({ Machines: [{ id: "machine-core", state: "started", region: "sjc", config: { image: "registry.fly.io/app@sha256:abc", env: ${JSON.stringify(env)} } }] }));
+else if (a.startsWith("checks list")) console.log(JSON.stringify({ machine: [{ status: "passing" }] }));
+else if (a.includes("QM_PUBLIC_API_URL_CHECK=1")) { console.error("mismatch"); process.exit(42); }
+else console.log("ok");`,
+  );
+  try {
+    await assert.rejects(
+      () => flyCheckLive(config, dir, { fetchImpl: async () => new Response("ok"), report: false }),
+      /PUBLIC_API_URL does not match the configured public API coordinate/,
+    );
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /^secrets (?:set|unset)|^scale count|^apps destroy/m);
+  } finally {
+    fake.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("fly live check surfaces an unowned zero-machine app in the deployment prefix", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-fly-live-unowned-prefix-"));
+  const config: QmConfig = {
+    contract: 1,
+    orgId: "acme",
+    publicUrl: "https://qm.example.test",
+    target: "fly",
+    region: "sjc",
+    flyOrg: "personal",
+    services: ["portal"],
+    plugins: [],
+    skills: [],
+    env: {},
+    imageOverrides: {},
+  };
+  const env = generatedEnv(derivedTomlFor(config, "portal", repoRoot));
+  const fake = fakeFly(
+    dir,
+    `
+if (a.startsWith("apps list")) console.log(JSON.stringify([{ Name: "acme-portal" }, { Name: "acme-retired" }]));
+else if (a === "secrets list -a acme-portal --json") console.log(JSON.stringify([{ Name: "QM_OWNER_CD83933C6C53374D" }]));
+else if (a === "secrets list -a acme-retired --json") console.log("[]");
+else if (a === "status -a acme-retired --json") console.log(JSON.stringify({ Machines: [] }));
+else if (a === "status -a acme-portal --json") console.log(JSON.stringify({ Machines: [{ id: "machine-portal", state: "started", region: "sjc", config: { image: "registry.fly.io/app@sha256:abc", env: ${JSON.stringify(env)} } }] }));
+else if (a.startsWith("checks list")) console.log(JSON.stringify({ machine: [{ status: "passing" }] }));
+else console.log("ok");`,
+  );
+  try {
+    await assert.rejects(
+      () => flyCheckLive(config, dir, { fetchImpl: async () => new Response("ok"), report: false }),
+      /acme-retired: unowned app uses the deployment prefix; verify and remove it or restore its ownership marker/,
+    );
+    assert.doesNotMatch(readFileSync(fake.log, "utf8"), /^secrets (?:set|unset)|^scale count|^apps destroy/m);
+  } finally {
     fake.restore();
     rmSync(dir, { recursive: true, force: true });
   }
@@ -975,11 +1286,14 @@ test("fly secrets push rejects weak signing keys before staging anything", async
   };
   writeFileSync(
     join(dir, ".env"),
-    `CAPABILITY_SECRET=cap\nCONNECTOR_SECRET_KEY=${"connector".repeat(4)}\nPORTAL_IDENTITY_SECRET=identity\nCORE_SIGNING_SECRET=short\nSKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}\nFLY_SANDBOX_API_TOKEN=f\n`,
+    `CAPABILITY_SECRET=${"capability".repeat(4)}\nCONNECTOR_SECRET_KEY=${"connector".repeat(4)}\nPORTAL_IDENTITY_SECRET=${"identity".repeat(4)}\nCORE_SIGNING_SECRET=short\nSKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}\nSPRITES_TOKEN=f\n`,
   );
   const fake = fakeFly(dir, "");
   try {
-    await assert.rejects(() => flySecretsPush(config, dir), /CORE_SIGNING_SECRET.*too short/);
+    await assert.rejects(
+      () => flySecretsPush(config, dir, readEnvFile(join(dir, ".env"))),
+      /required secrets are missing or invalid: CORE_SIGNING_SECRET/,
+    );
     assert.equal(readFileSync(fake.log, "utf8"), "");
   } finally {
     fake.restore();
@@ -1001,7 +1315,7 @@ test("fly secrets push refuses an unmarked pre-existing app", async () => {
     skills: [],
     env: { core: { HARNESS: "mock" } },
     imageOverrides: {},
-    sandbox: { app: "acme-sb" },
+    sandbox: { backend: "sprites", namePrefix: "acme-sb" },
   };
   writeFileSync(
     join(dir, ".env"),
@@ -1009,7 +1323,7 @@ test("fly secrets push refuses an unmarked pre-existing app", async () => {
       `CAPABILITY_SECRET=${"capability".repeat(4)}`,
       `CONNECTOR_SECRET_KEY=${"connector".repeat(4)}`,
       `CORE_SIGNING_SECRET=${"core-signing".repeat(3)}`,
-      `FLY_SANDBOX_API_TOKEN=FlyV1-scoped`,
+      `SPRITES_TOKEN=SpriteV1-scoped`,
       `PORTAL_IDENTITY_SECRET=${"identity".repeat(4)}`,
       `SKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}`,
     ].join("\n"),
@@ -1019,13 +1333,14 @@ test("fly secrets push refuses an unmarked pre-existing app", async () => {
     `
 if (a.startsWith("apps create")) console.log("already been taken");
 else if (a.startsWith("apps list")) console.log(JSON.stringify([{ Name: "acme-core" }]));
-else if (a.startsWith("secrets list")) console.log("CORE_SIGNING_SECRET");
+else if (a.startsWith("secrets list")) console.log(JSON.stringify([{ Name: "CORE_SIGNING_SECRET" }]));
+else if (a.startsWith("status")) console.log(JSON.stringify({ Machines: [] }));
 else console.log("ok");`,
   );
   try {
     await assert.rejects(
-      () => flySecretsPush(config, dir),
-      /already exists but is not marked as owned by this deployment/,
+      () => flySecretsPush(config, dir, readEnvFile(join(dir, ".env"))),
+      /cannot reconcile Fly secrets without verified ownership:[\s\S]*missing deployment marker/,
     );
     assert.doesNotMatch(readFileSync(fake.log, "utf8"), /CAPABILITY_SECRET=-/);
   } finally {
@@ -1048,7 +1363,7 @@ test("fly secrets push refuses a same-named app outside the configured Fly organ
     skills: [],
     env: { core: { HARNESS: "mock" } },
     imageOverrides: {},
-    sandbox: { app: "acme-sb" },
+    sandbox: { backend: "sprites", namePrefix: "acme-sb" },
   };
   writeFileSync(
     join(dir, ".env"),
@@ -1056,7 +1371,7 @@ test("fly secrets push refuses a same-named app outside the configured Fly organ
       `CAPABILITY_SECRET=${"capability".repeat(4)}`,
       `CONNECTOR_SECRET_KEY=${"connector".repeat(4)}`,
       `CORE_SIGNING_SECRET=${"core-signing".repeat(3)}`,
-      `FLY_SANDBOX_API_TOKEN=FlyV1-scoped`,
+      `SPRITES_TOKEN=SpriteV1-scoped`,
       `PORTAL_IDENTITY_SECRET=${"identity".repeat(4)}`,
       `SKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}`,
     ].join("\n"),
@@ -1070,7 +1385,7 @@ else console.log("ok");`,
   );
   try {
     await assert.rejects(
-      () => flySecretsPush(config, dir),
+      () => flySecretsPush(config, dir, readEnvFile(join(dir, ".env"))),
       /app acme-core exists outside configured Fly organization operator-org/,
     );
     assert.doesNotMatch(
@@ -1084,261 +1399,27 @@ else console.log("ok");`,
   }
 });
 
-test("fly rollback joins a bare digest with @ and records the pin in the config file", () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-fly-rollback-"));
-  const appPrefix = "qmrbtest";
-  const digest = `sha256:${"d".repeat(64)}`;
-  const config: QmConfig = {
-    contract: 1,
-    orgId: "acme",
-    publicUrl: "https://acme.example.com",
-    target: "fly",
-    appPrefix,
-    region: "sjc",
-    flyOrg: "personal",
-    services: ["core"],
-    plugins: [],
-    skills: [],
-    env: {},
-    imageOverrides: {},
-    sandbox: { app: `${appPrefix}-sb` },
-  };
-  const configPath = join(dir, "qm.config.jsonc");
-  writeFileSync(
-    configPath,
-    `${JSON.stringify({ contract: 1, orgId: "acme", sandbox: { app: `${appPrefix}-sb` } }, null, 2)}\n`,
-  );
-  const marker = `QM_OWNER_${createHash("sha256").update(`qm-v2:personal:acme:${appPrefix}`).digest("hex").slice(0, 16).toUpperCase()}`;
-  const fake = fakeFly(
-    dir,
-    `
-if (a.startsWith("apps list")) console.log(JSON.stringify([{ Name: "${appPrefix}-core" }]));
-else if (a.startsWith("secrets list")) console.log("NAME  DIGEST  CREATED AT\\n${marker}  abc123  1m ago");
-else if (a.startsWith("status")) console.log(JSON.stringify({ Machines: [{ id: "machine-core", config: { image: "registry.fly.io/${appPrefix}-core:cur" } }] }));
-else if (a.startsWith("image show")) console.log(JSON.stringify([{ MachineID: "machine-core", Registry: "registry.fly.io", Repository: "${appPrefix}-core", Tag: "cur", Digest: "sha256:${"a".repeat(64)}" }]));
-else console.log("");`,
-  );
-  const resolved = `sha256:${"e".repeat(64)}`;
-  const docker = join(dir, "docker");
-  writeFileSync(docker, `#!/usr/bin/env bash\necho "Digest: ${resolved}"\n`);
-  chmodSync(docker, 0o755);
-  const priorPath = process.env.PATH;
-  process.env.PATH = `${dir}:${priorPath ?? ""}`;
-  const generated = join(dir, ".generated", "fly", appPrefix);
-  const log = console.log;
-  console.log = (): void => {};
-  try {
-    flyRollback(config, configPath, digest);
-    const toml = readFileSync(join(generated, "core.fly.toml"), "utf8");
-    assert.ok(
-      toml.includes(`FLY_BASE_IMAGE = "registry.fly.io/${appPrefix}-sb@${digest}"`),
-      "digest joins the repository with @, not :",
-    );
-    const pinned = JSON.parse(readFileSync(configPath, "utf8")) as { sandbox?: { image?: string } };
-    assert.equal(
-      pinned.sandbox?.image,
-      `registry.fly.io/${appPrefix}-sb@${digest}`,
-      "the pin is durable in the config file",
-    );
-
-    flyRollback(config, configPath, "v12");
-    const tagged = readFileSync(join(generated, "core.fly.toml"), "utf8");
-    assert.ok(
-      tagged.includes(`FLY_BASE_IMAGE = "registry.fly.io/${appPrefix}-sb:v12@${resolved}"`),
-      "a tag is resolved to its immutable digest",
-    );
-    const repinned = JSON.parse(readFileSync(configPath, "utf8")) as { sandbox?: { image?: string } };
-    assert.equal(
-      repinned.sandbox?.image,
-      `registry.fly.io/${appPrefix}-sb:v12@${resolved}`,
-      "a tag pin would never compare stale; only a digest may land in the config",
-    );
-  } finally {
-    console.log = log;
-    if (priorPath === undefined) delete process.env.PATH;
-    else process.env.PATH = priorPath;
-    fake.restore();
-    rmSync(dir, { recursive: true, force: true });
-    if (existsSync(generated)) rmSync(generated, { recursive: true, force: true });
-  }
-});
-
-test("fly rollback with no sandbox config fails cleanly instead of deriving a garbage ref", () => {
-  const config: QmConfig = {
-    contract: 1,
-    orgId: "acme",
-    publicUrl: "https://acme.example.com",
-    target: "fly",
-    region: "sjc",
-    flyOrg: "personal",
-    services: ["core"],
-    plugins: [],
-    skills: [],
-    env: {},
-    imageOverrides: {},
-  };
+test("Fly rollback is unsupported", () => {
   assert.throws(
-    () => flyRollback(config, "/nonexistent/config.json", `sha256:${"e".repeat(64)}`),
-    /cannot derive an image repository/,
+    () =>
+      flyRollback(
+        {
+          contract: 1,
+          orgId: "acme",
+          publicUrl: "https://acme.example.com",
+          target: "fly",
+          services: ["core"],
+          plugins: [],
+          skills: [],
+          env: {},
+          imageOverrides: {},
+          sandbox: { backend: "sprites", namePrefix: "acme" },
+        },
+        "/deployment/qm.config.jsonc",
+        "old",
+      ),
+    /rollback is not implemented for target fly/,
   );
-});
-
-test("fly rollback validates an image pin before changing the committed config", () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-fly-rollback-invalid-"));
-  const configPath = join(dir, "qm.config.jsonc");
-  const raw = JSON.stringify({ contract: 1, orgId: "acme", sandbox: { app: "acme-sb" } }, null, 2) + "\n";
-  writeFileSync(configPath, raw);
-  const config: QmConfig = {
-    contract: 1,
-    orgId: "acme",
-    publicUrl: "https://acme.example.com",
-    target: "fly",
-    services: ["core"],
-    plugins: [],
-    skills: [],
-    env: {},
-    imageOverrides: {},
-    sandbox: { app: "acme-sb" },
-  };
-  try {
-    assert.throws(
-      () => flyRollback(config, configPath, "sha256:not-a-digest"),
-      /must resolve to an image tag or sha256 digest/,
-    );
-    assert.equal(readFileSync(configPath, "utf8"), raw);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("fly rollback refuses to change the committed config when the image cannot be resolved", () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-fly-rollback-missing-"));
-  const configPath = join(dir, "qm.config.jsonc");
-  const raw = JSON.stringify({ contract: 1, orgId: "acme", sandbox: { app: "acme-sb" } }, null, 2) + "\n";
-  writeFileSync(configPath, raw);
-  const docker = join(dir, "docker");
-  writeFileSync(docker, "#!/usr/bin/env bash\necho missing >&2\nexit 1\n");
-  chmodSync(docker, 0o755);
-  const priorPath = process.env.PATH;
-  process.env.PATH = `${dir}:${priorPath ?? ""}`;
-  const config: QmConfig = {
-    contract: 1,
-    orgId: "acme",
-    publicUrl: "https://acme.example.com",
-    target: "fly",
-    services: ["core"],
-    plugins: [],
-    skills: [],
-    env: {},
-    imageOverrides: {},
-    sandbox: { app: "acme-sb" },
-  };
-  try {
-    assert.throws(() => flyRollback(config, configPath, "v12"), /could not resolve an immutable digest/);
-    assert.equal(readFileSync(configPath, "utf8"), raw);
-  } finally {
-    if (priorPath === undefined) delete process.env.PATH;
-    else process.env.PATH = priorPath;
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("fly sandbox pin re-derives the core [env] and unsets any stale FLY_BASE_IMAGE secret", () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-fly-pin-"));
-  const appPrefix = "qmpintest";
-  const pin = `registry.fly.io/${appPrefix}-sb@sha256:${"c".repeat(64)}`;
-  const config: QmConfig = {
-    contract: 1,
-    orgId: "acme",
-    publicUrl: "https://acme.example.com",
-    target: "fly",
-    appPrefix,
-    region: "sjc",
-    flyOrg: "personal",
-    services: ["core"],
-    plugins: [],
-    skills: [],
-    env: {},
-    imageOverrides: {},
-    sandbox: { app: `${appPrefix}-sb`, image: pin },
-  };
-  const marker = `QM_OWNER_${createHash("sha256").update(`qm-v2:personal:acme:${appPrefix}`).digest("hex").slice(0, 16).toUpperCase()}`;
-  const fake = fakeFly(
-    dir,
-    `
-if (a.startsWith("apps list")) console.log(JSON.stringify([{ Name: "${appPrefix}-core" }]));
-else if (a.startsWith("status")) console.log(JSON.stringify({ Machines: [{ id: "machine-core", config: { image: "registry.fly.io/${appPrefix}-core:cur" } }] }));
-else if (a.startsWith("image show")) console.log(JSON.stringify([{ MachineID: "machine-core", Registry: "registry.fly.io", Repository: "${appPrefix}-core", Tag: "cur", Digest: "sha256:${"a".repeat(64)}" }]));
-else if (a.startsWith("secrets list")) console.log("NAME            DIGEST  CREATED AT\\n${marker}  abc123  1m ago\\nFLY_BASE_IMAGE  abc123  1m ago");
-else console.log("");`,
-  );
-  const generated = join(dir, ".generated", "fly", appPrefix);
-  const log = console.log;
-  console.log = (): void => {};
-  try {
-    flyPinSandbox(config, pin, dir);
-    const calls = readFileSync(fake.log, "utf8");
-    assert.ok(
-      calls.includes(`secrets unset --stage -a ${appPrefix}-core FLY_BASE_IMAGE`),
-      "the stale shadowing secret is removed",
-    );
-    assert.ok(!/secrets set/.test(calls), "the pin is never staged as a Fly secret");
-    const deploy = calls.split("\n").find((line) => line.startsWith("deploy"));
-    assert.ok(
-      deploy?.includes(`--image registry.fly.io/${appPrefix}-core@sha256:${"a".repeat(64)}`),
-      `rolls the current immutable image: ${deploy}`,
-    );
-    const toml = readFileSync(join(generated, "core.fly.toml"), "utf8");
-    assert.ok(toml.includes(`FLY_BASE_IMAGE = "${pin}"`), "the pin lands in the derived [env], owned by the config");
-    assert.ok(deploy?.includes(join(generated, "core.fly.toml")), "deploy uses the derived config");
-  } finally {
-    console.log = log;
-    fake.restore();
-    rmSync(dir, { recursive: true, force: true });
-    if (existsSync(generated)) rmSync(generated, { recursive: true, force: true });
-  }
-});
-
-test("fly sandbox pin refuses to mutate an unmarked app with the configured name", () => {
-  const dir = mkdtempSync(join(tmpdir(), "qm-fly-pin-unowned-"));
-  const appPrefix = "qmpinunowned";
-  const pin = `registry.fly.io/${appPrefix}-sb@sha256:${"d".repeat(64)}`;
-  const config: QmConfig = {
-    contract: 1,
-    orgId: "acme",
-    publicUrl: "https://acme.example.com",
-    target: "fly",
-    appPrefix,
-    region: "sjc",
-    flyOrg: "personal",
-    services: ["core"],
-    plugins: [],
-    skills: [],
-    env: {},
-    imageOverrides: {},
-    sandbox: { app: `${appPrefix}-sb`, image: pin },
-  };
-  const fake = fakeFly(
-    dir,
-    `
-if (a.startsWith("apps list")) console.log(JSON.stringify([{ Name: "${appPrefix}-core" }]));
-else if (a.startsWith("secrets list")) console.log("NAME  DIGEST  CREATED AT");
-else console.log("");`,
-  );
-  const log = console.log;
-  console.log = (): void => {};
-  try {
-    assert.throws(
-      () => flyPinSandbox(config, pin),
-      /not marked as owned by deployment qm-v2:personal:acme:qmpinunowned/,
-    );
-    const calls = readFileSync(fake.log, "utf8");
-    assert.doesNotMatch(calls, /secrets unset|deploy/, "an unowned app is never mutated");
-  } finally {
-    console.log = log;
-    fake.restore();
-    rmSync(dir, { recursive: true, force: true });
-  }
 });
 
 test("fly secrets push stages a secretEnv alias under its declared env name on its service's app", async () => {
@@ -1355,22 +1436,23 @@ test("fly secrets push stages a secretEnv alias under its declared env name on i
     skills: [],
     env: { core: { HARNESS: "mock" } },
     imageOverrides: {},
-    secretEnv: { core: { DEPLOY_APPS_SESSION_SECRET: "PORTAL_SESSION_SECRET", EXTRA_API_KEY: "EXTRA_API_KEY" } },
+    secretEnv: { core: { DEPLOY_APPS_SESSION_SECRET: "DEPLOY_APPS_STORE", EXTRA_API_KEY: "EXTRA_API_KEY" } },
   };
   writeFileSync(
     join(dir, ".env"),
     [
-      "CAPABILITY_SECRET=cap",
+      "CAPABILITY_SECRET=capability-secret-that-is-long-enough",
       `CONNECTOR_SECRET_KEY=${"connector".repeat(4)}`,
       `CORE_SIGNING_SECRET=${"core-signing".repeat(3)}`,
-      "FLY_SANDBOX_API_TOKEN=fly",
-      "PORTAL_IDENTITY_SECRET=identity",
+      "SPRITES_TOKEN=fly",
+      "PORTAL_IDENTITY_SECRET=portal-identity-secret-that-is-long-enough",
       `SKILL_SIGNING_SECRET=${"skill-signing".repeat(3)}`,
       "ADMIN_GRANTS=admin@example.com:org_admin",
       "OIDC_CLIENT_ID=client",
       "OIDC_CLIENT_SECRET=oidc",
       "PORTAL_EXPECTED_TEAM_ID=T1",
       `PORTAL_SESSION_SECRET=${"portal-session".repeat(3)}`,
+      `DEPLOY_APPS_STORE=${"deploy-session".repeat(3)}`,
       "EXTRA_API_KEY=extra-value",
     ].join("\n"),
   );
@@ -1381,7 +1463,7 @@ test("fly secrets push stages a secretEnv alias under its declared env name on i
   const log = console.log;
   console.log = (): void => {};
   try {
-    await flySecretsPush(config, dir);
+    await flySecretsPush(config, dir, readEnvFile(join(dir, ".env")));
     const calls = readFileSync(fake.log, "utf8");
     assert.ok(
       calls.includes("secrets set --stage -a acme-portal PORTAL_SESSION_SECRET=-"),
@@ -1397,7 +1479,7 @@ test("fly secrets push stages a secretEnv alias under its declared env name on i
       "config secretEnv extras stage on their service",
     );
     assert.ok(
-      calls.includes(`value:${"portal-session".repeat(3)}`),
+      calls.includes(`value:${"deploy-session".repeat(3)}`),
       "the aliased delivery pushes the store secret's value",
     );
   } finally {

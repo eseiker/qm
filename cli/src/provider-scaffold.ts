@@ -48,8 +48,6 @@ function renderConfig(orgId: string, values: ConfigValues): string {
   // "botName": "straylight",
   // "orgName": "Acme Corp",
 
-  // Where to deploy: "docker" runs local containers, "fly" deploys Fly apps,
-  // and "aws" runs the control plane on ECS and agent computers on Lambda MicroVMs.
   "target": ${JSON.stringify(values.target)},
 
   // The vendor supplying the base model: "anthropic", "openai", or "openrouter"
@@ -110,7 +108,7 @@ const AWS_AGENTS_APPENDIX = `
    \`aws iam get-open-id-connect-provider --open-id-connect-provider-arn arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com\`.
    If it is absent, an account administrator creates it once with
    \`aws iam create-open-id-connect-provider --url https://token.actions.githubusercontent.com --client-id-list sts.amazonaws.com\`.
-2. Run \`npm exec qm -- infra render\`, review the result, then run
+2. Run \`npm exec --yes=false -- qm infra render\`, review the result, then run
    \`terraform -chdir=infra init && terraform -chdir=infra apply\`. This creates
    inert ECS services, RDS, CloudFront, an ALB origin restricted to CloudFront,
    and the MicroVM roles. Set \`publicUrl\` to
@@ -118,7 +116,7 @@ const AWS_AGENTS_APPENDIX = `
    \`env.core.AWS_PUBLIC_ORIGIN_URL\` to \`http://<alb_hostname>\`.
 3. Sign-in is handled by the built-in \`auth\` broker: set
    \`env.auth.AUTH_ALLOWED_EMAIL_DOMAIN\` (or leave it out and supply
-   \`AUTH_ALLOWED_EMAILS\`), then run \`npm exec qm -- setup\` for the sender address
+   \`AUTH_ALLOWED_EMAILS\`), then run \`npm exec --yes=false -- qm setup\` for the sender address
    and the Resend or SMTP credentials; the CLI generates the broker's keys and the
    portal's client credentials and wires \`OIDC_*\` itself. To use an external
    identity provider instead, drop \`"auth"\` from \`services\`, configure
@@ -126,20 +124,21 @@ const AWS_AGENTS_APPENDIX = `
    or \`OIDC_ALLOWED_EMAIL_DOMAIN\` tenant gate, and register
    \`<publicUrl>/auth/callback\` with the provider. Add optional services and their
    ECS/ECR entries now, then render and apply once more.
-4. Run \`npm exec qm -- infra build-image\` to build the Lambda MicroVM guest image
-   and record its immutable version and execution role in the config.
-5. Fill the gitignored \`.env\` and run \`npm exec qm -- secrets push\`.
-6. Run \`npm exec qm -- doctor\`, \`npm exec qm -- plan\`,
-   \`npm exec qm -- up --yes\`, and
-   \`npm exec qm -- check --live\`, in that order.
+4. Run \`npm exec --yes=false -- qm infra build-image\` to build and record
+   \`AWS_DEPLOY_IMAGE\`, the always-required Lambda MicroVM image for the AWS deployment
+   publisher. Agent computers reuse the same image when the sandbox backend is \`aws\`.
+5. Fill the gitignored \`.env\` and run \`npm exec --yes=false -- qm secrets push\`.
+6. Run \`npm exec --yes=false -- qm doctor\`, \`npm exec --yes=false -- qm plan\`,
+   \`npm exec --yes=false -- qm up --yes\`, and
+   \`npm exec --yes=false -- qm check --live\`, in that order.
 
-To tear down this target, run \`npm exec qm -- down\`, then persist the destructive
+To tear down this target, run \`npm exec --yes=false -- qm down\`, then persist the destructive
 lifecycle settings in Terraform state with \`terraform -chdir=infra apply
 -var='ecr_force_delete=true' -var='object_store_force_destroy=true'
 -var='db_skip_final_snapshot=true' -var='secret_recovery_window_days=0'\`.
 After that apply completes, run
-\`npm exec qm -- infra delete-task-definitions --yes\`, then
-\`npm exec qm -- infra delete-image --yes\`, then run \`terraform -chdir=infra destroy
+\`npm exec --yes=false -- qm infra delete-task-definitions --yes\`, then
+\`npm exec --yes=false -- qm infra delete-image --yes\`, then run \`terraform -chdir=infra destroy
 -var='ecr_force_delete=true' -var='object_store_force_destroy=true'
 -var='db_skip_final_snapshot=true' -var='secret_recovery_window_days=0'\`.
 Applying the settings before destroy lets Terraform remove deployed images,
@@ -164,15 +163,13 @@ export const dockerScaffold: ProviderScaffold = {
       secretEnv: "",
       sandbox: `,
 
-  // The Fly app agents execute in. The core boots the immutable sandbox image
-  // recorded by \`qm sandbox publish\`.
-  "sandbox": { "app": ${JSON.stringify(`${orgId}-sandboxes`)} }`,
+  "sandbox": { "backend": "local" }`,
     }),
   ignores: [".env", "node_modules/", ".generated/"],
   agentsAppendix: "",
   files: noFiles,
-  configurationHint: "docker: confirm the local public port and Fly sandbox app before setup",
-  finalCommand: "npm exec qm -- up",
+  configurationHint: "docker: confirm the local public port and Docker socket before setup",
+  finalCommand: "npm exec --yes=false -- qm up",
   finalWhy: "pull images, start services, print URLs",
 };
 
@@ -198,15 +195,13 @@ export const flyScaffold: ProviderScaffold = {
   "secretEnv": { "core": { "ADMIN_GRANTS": "ADMIN_GRANTS" } },`,
       sandbox: `
 
-  // The Fly app agents execute in. The core boots the immutable sandbox image
-  // recorded by \`qm sandbox publish\`.
-  "sandbox": { "app": ${JSON.stringify(`${orgId}-sandboxes`)} }`,
+  "sandbox": { "backend": "sprites", "namePrefix": ${JSON.stringify(`${orgId}-sandboxes`)} }`,
     }),
   ignores: [".env", "node_modules/", ".generated/"],
   agentsAppendix: "",
   files: noFiles,
   configurationHint: "fly: confirm flyOrg, region, app names, public URL, and identity gate before setup",
-  finalCommand: "npm exec qm -- up",
+  finalCommand: "npm exec --yes=false -- qm up",
   finalWhy: "pull images, start services, print URLs",
 };
 
@@ -254,12 +249,7 @@ export const awsScaffold: ProviderScaffold = {
 
   // The initial admin seed is kept in the provider secret store, never in config.
   "secretEnv": { "core": { "ADMIN_GRANTS": "ADMIN_GRANTS" } }`,
-      sandbox: `
-
-  // Where agent sandboxes execute. Omitting "sandbox" entirely runs AWS Lambda MicroVMs
-  // (published by \`qm infra build-image\`). To boot an operator-published sandbox layer
-  // image in a Fly app instead (published by \`qm sandbox publish\`), declare it explicitly:
-  //   "sandbox": { "backend": "sprites", "app": ${JSON.stringify(`${orgId}-sandboxes`)} }`,
+      sandbox: "",
     });
   },
   ignores: [

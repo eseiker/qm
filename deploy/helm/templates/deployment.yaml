@@ -29,7 +29,7 @@ spec:
       {{- end }}
       containers:
         - name: {{ $name }}
-          image: "{{ $root.Values.image.repository }}{{ $root.Values.image.separator | default "/" }}{{ $svc.image }}:{{ $svc.tag | default $root.Values.image.tag | default $root.Chart.AppVersion }}"
+          image: {{ include "qm.image" (dict "root" $root "name" $name "service" $svc) | quote }}
           imagePullPolicy: {{ $root.Values.image.pullPolicy }}
           {{- with $svc.command }}
           command:

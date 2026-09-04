@@ -177,14 +177,19 @@ test("pg channel-policy: history appends a revision per set with provenance", { 
 test("pg surface-cache: mentions JSONB round-trips and survives a mention-less edit", { skip }, async () => {
   const cache = createPostgresSurfaceCache(URL!);
   try {
-    await cache.ingest([
-      { container: "Cm", ts: "9.0", text: "hi @jordan", mentions: { U1: "jordan", U2: "avery" }, createdAt: 1 },
-    ]);
+    const mentions = JSON.parse(
+      '{"U1":"jordan","__proto__":"proto-name","constructor":"constructor-name","prototype":"prototype-name","U2":"avery"}',
+    ) as Record<string, string>;
+    await cache.ingest([{ container: "Cm", ts: "9.0", text: "hi @jordan", mentions, createdAt: 1 }]);
     let msgs = await cache.readMessages("Cm");
-    assert.deepEqual(msgs[0]!.mentions, { U1: "jordan", U2: "avery" });
+    assert.deepEqual(msgs[0]!.mentions, mentions);
+    assert.deepEqual(Object.keys(msgs[0]!.mentions!).sort(), ["U1", "U2", "__proto__", "constructor", "prototype"]);
+    assert.equal(Object.getPrototypeOf(msgs[0]!.mentions!), Object.prototype);
     await cache.ingest([{ container: "Cm", ts: "9.0", text: "hi @jordan edited", editedAt: 5, createdAt: 1 }]);
     msgs = await cache.readMessages("Cm");
-    assert.deepEqual(msgs[0]!.mentions, { U1: "jordan", U2: "avery" }, "a mention-less edit keeps the prior mentions");
+    assert.deepEqual(msgs[0]!.mentions, mentions, "a mention-less edit keeps the prior mentions");
+    assert.equal(Object.hasOwn(msgs[0]!.mentions!, "__proto__"), true);
+    assert.equal((Object.prototype as { polluted?: unknown }).polluted, undefined);
   } finally {
     await cache.close();
   }

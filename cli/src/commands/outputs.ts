@@ -1,8 +1,8 @@
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { QmConfig } from "../config.ts";
 import { hostingProvider } from "../backends/registry.ts";
 import { CliError, note, ok } from "../log.ts";
+import { readRenderedFile, removeRenderedFile, writeRenderedFile } from "../safe-write.ts";
 import { renderSlackManifests, slackManifestCreationUrl, usesSlackOidc } from "../slack-manifests.ts";
 
 export interface DeploymentOutputs {
@@ -20,10 +20,14 @@ export interface DeploymentOutputs {
   };
 }
 
-function manifestPath(configDir: string, name: "slack-app-manifest.yml" | "slack-sso-manifest.yml"): string {
+function manifestFile(
+  configDir: string,
+  name: "slack-app-manifest.yml" | "slack-sso-manifest.yml",
+): { content: string; path: string } {
   const path = join(configDir, name);
-  if (!existsSync(path)) throw new CliError(`${name} is missing; run \`qm slack render\``);
-  return path;
+  const content = readRenderedFile(configDir, [name]);
+  if (content === undefined) throw new CliError(`${name} is missing; run \`qm slack render\``);
+  return { content, path };
 }
 
 export function deploymentOutputs(config: QmConfig, configDir: string): DeploymentOutputs {
@@ -35,15 +39,15 @@ export function deploymentOutputs(config: QmConfig, configDir: string): Deployme
   ) {
     throw new CliError("outputs requires the slack, web-ui, admin, and portal services");
   }
-  const botPath = manifestPath(configDir, "slack-app-manifest.yml");
-  const bot = readFileSync(botPath, "utf8");
+  const botFile = manifestFile(configDir, "slack-app-manifest.yml");
+  const bot = botFile.content;
   const expected = renderSlackManifests(config);
   if (bot !== expected.bot) {
     throw new CliError(`Slack manifests do not match the current configuration; run \`qm slack render\``);
   }
   const slackSso = usesSlackOidc(config);
-  const ssoPath = slackSso ? manifestPath(configDir, "slack-sso-manifest.yml") : undefined;
-  const sso = ssoPath ? readFileSync(ssoPath, "utf8") : undefined;
+  const ssoFile = slackSso ? manifestFile(configDir, "slack-sso-manifest.yml") : undefined;
+  const sso = ssoFile?.content;
   if (sso !== undefined && sso !== expected.sso) {
     throw new CliError(`Slack manifests do not match the current configuration; run \`qm slack render\``);
   }
@@ -60,11 +64,11 @@ export function deploymentOutputs(config: QmConfig, configDir: string): Deployme
     userConnectionsUrl: `${base}/keychain`,
     healthUrl: `${base}/healthz`,
     slack: {
-      bot: { manifest: botPath, createUrl: slackManifestCreationUrl(bot) },
-      ...(ssoPath && sso
+      bot: { manifest: botFile.path, createUrl: slackManifestCreationUrl(bot) },
+      ...(ssoFile && sso
         ? {
             sso: {
-              manifest: ssoPath,
+              manifest: ssoFile.path,
               createUrl: slackManifestCreationUrl(sso),
               signInUrl: `${base}/auth/login`,
               redirectUrl,
@@ -99,13 +103,12 @@ export function runOutputs(config: QmConfig, configDir: string, json: boolean): 
 
 export function renderSlackFiles(config: QmConfig, configDir: string): void {
   const manifests = renderSlackManifests(config);
-  const ssoPath = join(configDir, "slack-sso-manifest.yml");
-  writeFileSync(join(configDir, "slack-app-manifest.yml"), manifests.bot);
+  writeRenderedFile(configDir, ["slack-app-manifest.yml"], manifests.bot);
   if (usesSlackOidc(config)) {
-    writeFileSync(ssoPath, manifests.sso);
+    writeRenderedFile(configDir, ["slack-sso-manifest.yml"], manifests.sso);
     ok("rendered Slack bot and SSO app manifests");
   } else {
-    if (existsSync(ssoPath)) unlinkSync(ssoPath);
+    removeRenderedFile(configDir, ["slack-sso-manifest.yml"]);
     ok("rendered Slack bot app manifest");
   }
 }

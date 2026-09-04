@@ -77,10 +77,10 @@ test("GET /deployments/:id/ relays a gzip-serving app as a decodable response", 
   assert.equal(lastCoreRequest?.principal, "alice", "the signed-in user rides as the principal");
 });
 
-test("GET /deployments/:id/ passes an app redirect through without following it", async () => {
+test("GET /deployments/:id/ rejects an app redirect", async () => {
   const r = await rawGet("/deployments/redirecting-app/", { ...IDENTITY, "accept-encoding": "identity" });
-  assert.equal(r.status, 302, "the 3xx reaches the browser, which follows it itself");
-  assert.equal(r.headers.location, "/d/redirecting-app/home");
+  assert.equal(r.status, 502);
+  assert.equal(r.headers.location, undefined);
 });
 
 test("GET /deployments/:id/ requires a signed-in user", async () => {

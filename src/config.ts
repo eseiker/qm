@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { providerBaseUrlsFromEnv, type ProviderBaseUrls } from "./model/provider-endpoints.ts";
 import { join, resolve } from "node:path";
 import {
@@ -11,6 +11,7 @@ import { parseMemoryStrategyKind, type MemoryStrategyKind } from "./memory/strat
 import { parseMemoryProviderConfig, type MemoryProviderConfig } from "./memory/provider-config.ts";
 import { sanitizeBranding } from "./resolution/branding.ts";
 import type { OrgBranding } from "./resolution/config-store.ts";
+import { isStrongSigningSecret, MIN_SIGNING_SECRET_BYTES } from "./auth/source-auth.ts";
 import { validateCoreSecretEnv } from "./deployment/secret-schema.ts";
 import { DEFAULT_CAPTURE_QUIET_MS } from "./memory/strategies/per-turn.ts";
 import { parseSecurityPosture, type SecurityPosture } from "./security/security-posture.ts";
@@ -256,7 +257,6 @@ function awsSandboxEnv(env: NodeJS.ProcessEnv): AwsSandboxEnv {
     ...(numEnvStrict("AWS_SANDBOX_SNAPSHOT_INTERVAL_MS", env.AWS_SANDBOX_SNAPSHOT_INTERVAL_MS) !== undefined
       ? { snapshotIntervalMs: numEnvStrict("AWS_SANDBOX_SNAPSHOT_INTERVAL_MS", env.AWS_SANDBOX_SNAPSHOT_INTERVAL_MS) }
       : {}),
-    ...(env.QM_CORE_CONTAINER ? { coreContainer: env.QM_CORE_CONTAINER } : {}),
     ...(numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) !== undefined
       ? { defaultTimeoutSec: numEnvStrict("SANDBOX_TIMEOUT_SEC", env.SANDBOX_TIMEOUT_SEC) }
       : {}),
@@ -285,6 +285,7 @@ function localSandboxEnv(env: NodeJS.ProcessEnv): LocalSandboxEnv {
   return {
     ...(env.LOCAL_SANDBOX_IMAGE ? { image: env.LOCAL_SANDBOX_IMAGE } : {}),
     ...(env.LOCAL_SANDBOX_DOCKER_BIN ? { dockerBin: env.LOCAL_SANDBOX_DOCKER_BIN } : {}),
+    ...(env.QM_CORE_CONTAINER ? { coreContainer: env.QM_CORE_CONTAINER } : {}),
     ...(numEnvStrict("LOCAL_SANDBOX_CPUS", env.LOCAL_SANDBOX_CPUS) !== undefined
       ? { cpus: numEnvStrict("LOCAL_SANDBOX_CPUS", env.LOCAL_SANDBOX_CPUS) }
       : {}),
@@ -345,11 +346,11 @@ function porterApiBaseUrl(env: NodeJS.ProcessEnv): string | undefined {
     deployProjectId !== undefined && deployClusterId !== undefined
       ? `${(env.PORTER_DEPLOY_URL ?? "https://dashboard.porter.run").replace(/\/+$/, "")}/api/v2/alpha/projects/${deployProjectId}/clusters/${deployClusterId}`
       : undefined;
-  return env.PORTER_SANDBOX_BASE_URL ?? derived;
+  return env.PORTER_SANDBOX_BASE_URL?.trim() || derived;
 }
 
 const porterLocatorPresent = (env: NodeJS.ProcessEnv): boolean =>
-  Boolean(porterApiBaseUrl(env) || env.PORTER_CLUSTER_ID || env.KUBERNETES_SERVICE_HOST);
+  Boolean(porterApiBaseUrl(env) || env.PORTER_CLUSTER_ID?.trim() || env.KUBERNETES_SERVICE_HOST?.trim());
 
 function porterDeployVisibilityStrict(value: string | undefined): PorterDeployEnv["visibility"] {
   if (value === undefined || value.trim() === "") return undefined;
@@ -360,7 +361,7 @@ function porterDeployVisibilityStrict(value: string | undefined): PorterDeployEn
   );
 }
 
-function porterDeployEnv(env: NodeJS.ProcessEnv): PorterDeployEnv {
+function porterDeployEnv(env: NodeJS.ProcessEnv, appsDomain: string | undefined): PorterDeployEnv {
   const token = env.PORTER_DEPLOY_API_TOKEN;
   const baseUrl = porterApiBaseUrl(env);
   const visibility = porterDeployVisibilityStrict(env.PORTER_DEPLOY_VISIBILITY);
@@ -370,7 +371,7 @@ function porterDeployEnv(env: NodeJS.ProcessEnv): PorterDeployEnv {
     ...(token ? { token } : {}),
     ...(baseUrl ? { baseUrl } : {}),
     ...(runnerImage ? { runnerImage } : {}),
-    ...(env.PORTER_DEPLOY_APPS_DOMAIN ? { appsDomain: env.PORTER_DEPLOY_APPS_DOMAIN } : {}),
+    ...(appsDomain ? { appsDomain } : {}),
     ...(visibility ? { visibility } : {}),
     ...(env.PORTER_SANDBOX_NAME_PREFIX ? { namePrefix: env.PORTER_SANDBOX_NAME_PREFIX } : {}),
     ...(ttlSec !== undefined ? { ttlSec } : {}),
@@ -452,13 +453,41 @@ interface AwsDeployEnv {
   dataRoleArn?: string;
 }
 
+function runtimeOrigin(name: string, value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  const invalid = (): never => {
+    throw new Error(
+      `${name} must be an HTTP(S) origin without credentials, a path, query, fragment, backslash, or non-canonical delimiters`,
+    );
+  };
+  if (!value.trim()) return invalid();
+  const match = /^(https?):\/\/([^/?#\\\s%]+)\/?$/iu.exec(value);
+  if (!match || match[2]!.includes("@") || match[2]!.endsWith(":")) return invalid();
+  try {
+    const url = new URL(value);
+    if (url.username || url.password || url.pathname !== "/" || url.search || url.hash || url.hostname.endsWith(".")) {
+      throw new Error("origin");
+    }
+    return url.origin;
+  } catch {
+    return invalid();
+  }
+}
+
 function deployAppsEnv(
   env: NodeJS.ProcessEnv,
   defaultLoginUrl: string | undefined,
 ): { deployAppsSessionSecret?: string; deployAppsLoginUrl?: string } {
   const explicit = env.DEPLOY_APPS_SESSION_SECRET;
   const shared = env.PORTAL_SESSION_SECRET;
-  const loginUrl = env.DEPLOY_APPS_LOGIN_URL ?? (explicit || shared ? defaultLoginUrl : undefined);
+  const sessionSecret = explicit ?? shared;
+  if (sessionSecret !== undefined && !isStrongSigningSecret(sessionSecret)) {
+    const name = explicit !== undefined ? "DEPLOY_APPS_SESSION_SECRET" : "PORTAL_SESSION_SECRET";
+    throw new Error(`${name} must be at least ${MIN_SIGNING_SECRET_BYTES} UTF-8 bytes`);
+  }
+  const configuredLoginUrl = runtimeOrigin("DEPLOY_APPS_LOGIN_URL", env.DEPLOY_APPS_LOGIN_URL);
+  let loginUrl = configuredLoginUrl;
+  if (env.DEPLOY_APPS_LOGIN_URL === undefined) loginUrl = explicit || shared ? defaultLoginUrl : undefined;
   if (loginUrl && !explicit && !shared) {
     throw new Error("DEPLOY_APPS_LOGIN_URL requires DEPLOY_APPS_SESSION_SECRET");
   }
@@ -467,7 +496,7 @@ function deployAppsEnv(
   }
   const secret = explicit ?? (loginUrl ? shared : undefined);
   if (!secret || !loginUrl) return {};
-  return { deployAppsSessionSecret: secret, deployAppsLoginUrl: loginUrl.replace(/\/$/, "") };
+  return { deployAppsSessionSecret: secret, deployAppsLoginUrl: loginUrl };
 }
 
 const SHARED_PLATFORM_SUFFIXES = [
@@ -498,25 +527,45 @@ function sharedPlatformSuffixOf(domain: string): string | undefined {
 const HOSTNAME_LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
 const HOSTNAME_RE = new RegExp(`^${HOSTNAME_LABEL}(?:\\.${HOSTNAME_LABEL})+$`);
 
-function deployAppsDomainEnv(env: NodeJS.ProcessEnv, deployProvider: string): string | undefined {
-  const raw = env.DEPLOY_APPS_DOMAIN?.trim();
-  if (raw) {
-    const canonical = raw.toLowerCase().replace(/\.$/, "");
-    if (!HOSTNAME_RE.test(canonical)) {
-      throw new Error(
-        `DEPLOY_APPS_DOMAIN (${raw}) is not a plain DNS name — set it to a bare domain like apps.example.com (no scheme, port, path, or wildcard prefix).`,
-      );
-    }
-    const suffix = sharedPlatformSuffixOf(canonical);
-    if (suffix) {
-      throw new Error(
-        `DEPLOY_APPS_DOMAIN (${canonical}) is under ${suffix}, a shared platform domain that cannot carry per-app subdomains — attach a custom domain you control (set DEPLOY_APPS_DOMAIN=apps.<your-domain> with a wildcard DNS record pointing at this instance), or unset it to keep serving apps signed-in at /d/<app>/.`,
-      );
-    }
-    return canonical;
+function canonicalAppsDomain(name: string, raw: string, maximumLength: number, allowSharedPlatform: boolean): string {
+  const canonical = raw.toLowerCase().replace(/\.$/, "");
+  if (canonical.length > maximumLength) {
+    throw new Error(`${name} must be at most ${maximumLength} ASCII characters`);
   }
-  if (deployProvider === "porter" && env.PORTER_DEPLOY_APPS_DOMAIN) return env.PORTER_DEPLOY_APPS_DOMAIN;
-  return env.AWS_DEPLOY_APPS_DOMAIN;
+  if (!HOSTNAME_RE.test(canonical) || /\.\d+$/.test(canonical)) {
+    throw new Error(
+      `${name} (${raw}) is not a plain DNS name — set it to a bare domain like apps.example.com (no scheme, port, path, wildcard prefix, or IP address).`,
+    );
+  }
+  const suffix = sharedPlatformSuffixOf(canonical);
+  if (!allowSharedPlatform && suffix) {
+    throw new Error(
+      `${name} (${canonical}) is under ${suffix}, a shared platform domain that cannot carry per-app subdomains — attach a custom domain you control (set DEPLOY_APPS_DOMAIN=apps.<your-domain> with a wildcard DNS record pointing at this instance), or unset it to keep serving apps signed-in at /d/<app>/.`,
+    );
+  }
+  return canonical;
+}
+
+function deployAppsDomainEnv(env: NodeJS.ProcessEnv): string | undefined {
+  const commonValue = env.DEPLOY_APPS_DOMAIN;
+  const common = commonValue?.trim();
+  const name = common ? "DEPLOY_APPS_DOMAIN" : "AWS_DEPLOY_APPS_DOMAIN";
+  const selected = common ? commonValue : env.AWS_DEPLOY_APPS_DOMAIN;
+  const raw = selected?.trim();
+  if (!raw) return undefined;
+  if (/[^\S ]/u.test(selected!)) {
+    throw new Error(`${name} must contain only a bare DNS name`);
+  }
+  return canonicalAppsDomain(name, raw, 126, false);
+}
+
+function porterDeployAppsDomainEnv(env: NodeJS.ProcessEnv): string | undefined {
+  if (env.PORTER_DEPLOY_APPS_DOMAIN === undefined) return undefined;
+  const raw = env.PORTER_DEPLOY_APPS_DOMAIN;
+  if (!raw.trim()) {
+    throw new Error("PORTER_DEPLOY_APPS_DOMAIN must be a nonblank plain DNS name");
+  }
+  return canonicalAppsDomain("PORTER_DEPLOY_APPS_DOMAIN", raw, 189, true);
 }
 
 function awsDeployEnv(env: NodeJS.ProcessEnv): AwsDeployEnv {
@@ -555,7 +604,6 @@ function awsDeployEnv(env: NodeJS.ProcessEnv): AwsDeployEnv {
     ...(numEnvStrict("AWS_DEPLOY_SUSPENDED_SEC", env.AWS_DEPLOY_SUSPENDED_SEC) !== undefined
       ? { suspendedDurationSeconds: numEnvStrict("AWS_DEPLOY_SUSPENDED_SEC", env.AWS_DEPLOY_SUSPENDED_SEC) }
       : {}),
-    ...(env.AWS_DEPLOY_APPS_DOMAIN ? { appsDomain: env.AWS_DEPLOY_APPS_DOMAIN } : {}),
     ...(env.AWS_DEPLOY_GATE_SECRET ? { gateSecret: env.AWS_DEPLOY_GATE_SECRET } : {}),
     ...(numEnvStrict("AWS_DEPLOY_TOKEN_TTL_MIN", env.AWS_DEPLOY_TOKEN_TTL_MIN) !== undefined
       ? { tokenTtlMinutes: numEnvStrict("AWS_DEPLOY_TOKEN_TTL_MIN", env.AWS_DEPLOY_TOKEN_TTL_MIN) }
@@ -777,6 +825,20 @@ function modelProviderEnvStrict(env: NodeJS.ProcessEnv): ModelProvider | undefin
   return declared;
 }
 
+export function imageBuildSha(
+  env: NodeJS.ProcessEnv,
+  path: string | URL = new URL("../.build-sha", import.meta.url),
+): string | undefined {
+  const explicit = env.GIT_SHA?.trim();
+  if (explicit) return explicit;
+  try {
+    const baked = readFileSync(path, "utf8").trim();
+    return /^[a-f0-9]{64}$/.test(baked) ? baked : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const harness = harnessEnvStrict(env.HARNESS);
   const codexAuthCredential = env.CODEX_AUTH_CREDENTIAL?.trim() || undefined;
@@ -787,7 +849,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     codexOAuthConfigured && codexAuthCandidate
       ? { ...env, CODEX_AUTH_FILE: codexAuthCandidate }
       : { ...env, CODEX_AUTH_FILE: undefined };
-  const deployAppsDomain = deployAppsDomainEnv(env, env.DEPLOY_PROVIDER ?? "docker");
+  const deployAppsDomain = deployAppsDomainEnv(env);
+  const porterDeployAppsDomain = porterDeployAppsDomainEnv(env);
+  if (
+    env.DEPLOY_PROVIDER === "porter" &&
+    deployAppsDomain !== undefined &&
+    deployAppsDomain === porterDeployAppsDomain
+  ) {
+    throw new Error("the gated deployment apps domain must differ from PORTER_DEPLOY_APPS_DOMAIN");
+  }
   const missingSecrets = validateCoreSecretEnv(secretEnv);
   if (missingSecrets.length) {
     throw new Error(`missing or insecure required core secrets: ${missingSecrets.join(", ")}`);
@@ -803,6 +873,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
   const modelProvider = modelProviderEnvStrict(env);
+  const primarySandboxSelector = env.SANDBOX_BACKEND?.trim();
+  const secondarySandboxSelector = env.SANDBOX_SECONDARY_BACKEND?.trim();
   for (const key of ["SESSION_STORE", "RUN_STORE", "ARTIFACT_STORE"] as const) {
     if (env[key] === "sqlite") {
       throw new Error(
@@ -817,19 +889,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       `[config] HARNESS is ${env.HARNESS?.trim() ? '"mock"' : "unset, which means mock"} in production — this deployment answers every message with canned text and calls no model provider. Set HARNESS=pi to run real agent turns.`,
     );
   }
-  if (env.SANDBOX_BACKEND === "sprites" && !env.SPRITES_EGRESS_PROXY_URL) {
+  if (
+    (primarySandboxSelector === "sprites" || secondarySandboxSelector === "sprites") &&
+    !env.SPRITES_EGRESS_PROXY_URL
+  ) {
     console.warn(
       "[config] SANDBOX_BACKEND=sprites without SPRITES_EGRESS_PROXY_URL — sandboxes run with NO egress enforcement (fail-open); set SPRITES_EGRESS_PROXY_URL to the public egress proxy to force sandbox traffic through it.",
     );
   }
   const dataDir = resolve(env.DATA_DIR ?? "./data");
-  const porterSandboxSelected = env.SANDBOX_BACKEND === "porter" || env.SANDBOX_SECONDARY_BACKEND === "porter";
+  const porterSandboxSelected = primarySandboxSelector === "porter" || secondarySandboxSelector === "porter";
   if (porterSandboxSelected && !env.PORTER_SANDBOX_EGRESS_PROXY_URL) {
     console.warn(
       "[config] SANDBOX_BACKEND=porter without PORTER_SANDBOX_EGRESS_PROXY_URL — sandboxes run with NO egress enforcement (fail-open); set PORTER_SANDBOX_EGRESS_PROXY_URL to the egress proxy to force sandbox traffic through it.",
     );
   }
-  if (env.DEPLOY_PROVIDER === "porter" && !env.PORTER_DEPLOY_APPS_DOMAIN && !env.DEPLOY_APPS_DOMAIN) {
+  if (env.DEPLOY_PROVIDER === "porter" && !porterDeployAppsDomain && !deployAppsDomain) {
     console.warn(
       "[config] DEPLOY_PROVIDER=porter without an apps domain — published apps use hostnames assigned by the cluster and are reachable signed-in at /d/<app>/; set DEPLOY_APPS_DOMAIN to a domain you control to serve each app on its own subdomain.",
     );
@@ -849,11 +924,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       "SANDBOX_BACKEND must be set explicitly in production — use sprites, smolmachines, porter, aws, or local.",
     );
   }
-  const sandboxBackend = sandboxBackendEnvStrict(env.SANDBOX_BACKEND);
-  const secondaryRaw = env.SANDBOX_SECONDARY_BACKEND?.trim();
+  const sandboxBackend = sandboxBackendEnvStrict(primarySandboxSelector);
   let sandboxSecondaryBackend: Config["sandboxSecondaryBackend"];
-  if (secondaryRaw) {
-    const secondary = sandboxBackendEnvStrict(secondaryRaw, "SANDBOX_SECONDARY_BACKEND");
+  if (secondarySandboxSelector) {
+    const secondary = sandboxBackendEnvStrict(secondarySandboxSelector, "SANDBOX_SECONDARY_BACKEND");
     if (secondary === sandboxBackend) throw new Error("SANDBOX_SECONDARY_BACKEND must differ from SANDBOX_BACKEND.");
     sandboxSecondaryBackend = secondary;
   }
@@ -901,8 +975,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   ) {
     throw new Error("SECURITY_SCREEN_TIMEOUT_MS must be a positive integer no greater than 2147483647");
   }
-  const publicApiUrl = env.PUBLIC_API_URL ?? env.AGENT_API_URL;
-  const publicUrl = env.PUBLIC_WEB_URL ?? publicApiUrl;
+  const publicApiUrl = runtimeOrigin(
+    env.PUBLIC_API_URL !== undefined ? "PUBLIC_API_URL" : "AGENT_API_URL",
+    env.PUBLIC_API_URL ?? env.AGENT_API_URL,
+  );
+  const publicWebUrl = runtimeOrigin("PUBLIC_WEB_URL", env.PUBLIC_WEB_URL);
+  const publicUrl = env.PUBLIC_WEB_URL !== undefined ? publicWebUrl : publicApiUrl;
+  const deployApps = deployAppsEnv(env, publicUrl);
+  if (deployAppsDomain && (!deployApps.deployAppsSessionSecret || !deployApps.deployAppsLoginUrl)) {
+    throw new Error("a gated deployment apps domain requires a complete deploy-app session and login origin");
+  }
+  if (deployAppsDomain && !deployApps.deployAppsLoginUrl?.startsWith("https://")) {
+    throw new Error("a gated deployment apps domain requires an HTTPS login origin");
+  }
+  if (deployAppsDomain && publicWebUrl && deployApps.deployAppsLoginUrl !== publicWebUrl) {
+    throw new Error("DEPLOY_APPS_LOGIN_URL must equal PUBLIC_WEB_URL for a gated deployment apps domain");
+  }
   const deployProvider = env.DEPLOY_PROVIDER ?? "docker";
   if (
     deployProvider !== "aws" &&
@@ -967,6 +1055,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     (turnWallClockMs > 0 ? 2 * turnWallClockMs : CONFIG_DEFAULTS.runMaxAgeMs);
   const slack = slackPluginConfigFromEnv(env);
   const memoryProviderConfig = parseMemoryProviderConfig(env.MEMORY_PROVIDER_CONFIG, env);
+  const buildSha = imageBuildSha(env);
   return {
     production: env.NODE_ENV === "production",
     allowUnauthenticatedCore: boolEnvStrict("ALLOW_UNAUTHENTICATED_CORE", env.ALLOW_UNAUTHENTICATED_CORE) ?? false,
@@ -1068,7 +1157,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         CONFIG_DEFAULTS.backgroundJobTtlMaxSec) * 1000,
     backgroundWorkEnabled:
       boolEnvStrict("BACKGROUND_WORK_ENABLED", env.BACKGROUND_WORK_ENABLED) ?? CONFIG_DEFAULTS.backgroundWorkEnabled,
-    ...(env.GIT_SHA ? { buildSha: env.GIT_SHA } : {}),
+    ...(buildSha ? { buildSha } : {}),
     ecsTaskProtection: boolEnvStrict("ECS_TASK_PROTECTION", env.ECS_TASK_PROTECTION) ?? true,
     ...(env.ECS_AGENT_URI ? { ecsAgentUri: env.ECS_AGENT_URI } : {}),
     monitorPollMs: numEnvStrict("MONITOR_POLL_MS", env.MONITOR_POLL_MS) ?? CONFIG_DEFAULTS.monitorPollMs,
@@ -1088,7 +1177,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     secretsPrefix: env.SECRETS_PREFIX ?? "",
     ...(publicApiUrl ? { apiBaseUrl: publicApiUrl } : {}),
     ...(publicUrl ? { publicUrl } : {}),
-    ...(env.PUBLIC_WEB_URL ? { publicWebUrl: env.PUBLIC_WEB_URL } : {}),
+    ...(publicWebUrl ? { publicWebUrl } : {}),
     ...(env.FLY_APP_NAME ? { flyAppName: env.FLY_APP_NAME } : {}),
     ...(slack ? { slack } : {}),
     runStore,
@@ -1121,7 +1210,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     deployGitDir: env.DEPLOY_GIT_DIR ? resolve(env.DEPLOY_GIT_DIR) : join(dataDir, "deploy-git"),
     deployDialTimeoutMs:
       numEnvStrict("DEPLOY_DIAL_TIMEOUT_MS", env.DEPLOY_DIAL_TIMEOUT_MS) ?? CONFIG_DEFAULTS.deployDialTimeoutMs,
-    ...deployAppsEnv(env, publicUrl),
+    ...deployApps,
     deepIdleMachineMs:
       numEnvStrict("DEEP_IDLE_MACHINE_MS", env.DEEP_IDLE_MACHINE_MS) ?? CONFIG_DEFAULTS.deepIdleMachineMs,
     devIdleMachineMs: numEnvStrict("DEV_IDLE_MACHINE_MS", env.DEV_IDLE_MACHINE_MS) ?? CONFIG_DEFAULTS.devIdleMachineMs,
@@ -1156,12 +1245,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     spritesSandbox: spritesSandboxEnv(env),
     smolmachinesSandbox: smolmachinesSandboxEnv(env),
     porterSandbox: porterSandboxEnv(env),
-    porterDeploy: porterDeployEnv(env),
+    porterDeploy: porterDeployEnv(env, porterDeployAppsDomain),
     awsDeploy: {
       ...awsDeployEnv(env),
-      ...(env.DEPLOY_APPS_DOMAIN && deployAppsDomain && !env.AWS_DEPLOY_APPS_DOMAIN
-        ? { appsDomain: deployAppsDomain }
-        : {}),
+      ...(deployAppsDomain ? { appsDomain: deployAppsDomain } : {}),
     },
     ...(deployAppsDomain ? { deployAppsDomain } : {}),
     flyDeploy: flyDeployEnv(env),

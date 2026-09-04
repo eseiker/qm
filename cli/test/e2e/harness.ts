@@ -80,10 +80,10 @@ export function writeConfig(
     env: {},
     imageOverrides: {},
     services: ["core"],
-    sandbox: {
-      app: `${config.orgId}-sandboxes`,
-      image: `registry.fly.io/${config.orgId}-sandboxes@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a`,
-    },
+    sandbox:
+      config.target === "fly"
+        ? { backend: "sprites", namePrefix: `${config.orgId}-sandboxes` }
+        : { backend: config.target === "aws" ? "aws" : "local" },
     ...config,
   };
   const path = join(dir, CONFIG_FILENAME);
@@ -227,17 +227,24 @@ export function fakeFly(dir: string, opts: FakeFlyOpts = {}): string {
     `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
+const appOwners = ${appOwners};
 if (process.env.FAKE_FLY_LOG) fs.appendFileSync(process.env.FAKE_FLY_LOG, JSON.stringify(args) + "\\n");
 if (args[0] === "status" && ${failStatusApps}.includes(args[args.indexOf("-a") + 1])) { console.error("status: fake fly failure (app not found)"); process.exit(1); }
 if (${fail} && args[0] === ${fail}) { console.error(args[0] + ": fake fly failure (app not found)"); process.exit(1); }
 const has = (a, b) => args[0] === a && args[1] === b;
 if (has("apps", "create")) { console.log("created"); }
 else if (has("apps", "list")) { console.log(JSON.stringify(${apps})); }
-else if (has("secrets", "list")) { for (const s of ${secrets}) console.log(s); }
+else if (has("secrets", "list")) {
+  const app = args[args.indexOf("-a") + 1];
+  const owner = appOwners[app];
+  const marker = owner ? "QM_OWNER_" + require("node:crypto").createHash("sha256").update(owner).digest("hex").slice(0, 16).toUpperCase() : undefined;
+  const names = [...new Set([...(marker ? [marker] : []), ...${secrets}])];
+  console.log(JSON.stringify(names.map((Name) => ({ Name }))));
+}
 else if (has("mpg", "list")) { console.log("pg-1 test-pg"); }
 else if (args[0] === "status") {
   const app = args[args.indexOf("-a") + 1];
-  const owner = ${appOwners}[app];
+  const owner = appOwners[app];
   if (args.includes("--json")) console.log(JSON.stringify({ Machines: [{ config: { image: "registry.fly.io/fake:latest", env: owner ? { QM_DEPLOYMENT_ID: owner } : {} } }] }));
   else console.log("App status: running");
 }

@@ -290,6 +290,67 @@ test("pins public repository traffic to the validated address without redirects 
   }
 });
 
+test("scrubs mixed-case Git and SSH controls from clone and checkout", async () => {
+  const source = makeSourceRepo();
+  const dir = mkdtempSync(join(tmpdir(), "qm-git-env-scrub-"));
+  const capture = join(dir, "calls.jsonl");
+  const git = join(dir, "git");
+  const hostile = {
+    Git_Config_Parameters: "'core.abbrev=7'",
+    gIt_Config_Count: "1",
+    GiT_Config_Key_0: "credential.helper",
+    git_Config_Value_0: "!payload",
+    sSh_AskPass: join(dir, "askpass"),
+    SsH_Auth_Sock: join(dir, "agent.sock"),
+  };
+  const inherited = new Map(Object.keys(hostile).map((name) => [name, process.env[name]]));
+  writeFileSync(
+    git,
+    `#!${process.execPath}
+const { appendFileSync } = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(capture)}, JSON.stringify({ command: args[0], names: Object.keys(process.env) }) + "\\n");
+const result = spawnSync("git", args, { env: process.env, stdio: "inherit" });
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+`,
+  );
+  chmodSync(git, 0o700);
+  for (const [name, value] of Object.entries(hostile)) process.env[name] = value;
+  try {
+    const fetched = await createGitFetcher({ allowLocalRepos: true, gitBin: git }).fetch(
+      src({ url: source.dir, ref: source.sha }),
+    );
+    assert.equal(fetched.commit, source.sha);
+    const calls = readFileSync(capture, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { command: string; names: string[] })
+      .filter((call) => call.command === "clone" || call.command === "checkout");
+    assert.deepEqual(
+      calls.map((call) => call.command),
+      ["clone", "checkout"],
+    );
+    for (const call of calls) {
+      for (const name of Object.keys(hostile)) {
+        assert.equal(
+          call.names.some((candidate) => candidate.toLowerCase() === name.toLowerCase()),
+          false,
+          `${call.command} inherited ${name}`,
+        );
+      }
+    }
+  } finally {
+    for (const [name, value] of inherited) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    rmSync(source.dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("accepts a public IPv6-literal repository without DNS resolution", async () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-git-ipv6-"));
   const capture = join(dir, "env");

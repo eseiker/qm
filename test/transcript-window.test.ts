@@ -138,6 +138,24 @@ test("windowedTranscript: a fat tool payload is previewed, and the entry says so
   assert.equal(w.entries[0]!.truncated, undefined, "a small entry is shipped whole and unmarked");
 });
 
+test("windowedTranscript: truncation preserves prototype-like payload keys", () => {
+  const payload = JSON.parse(
+    `{"before":1,"__proto__":{"polluted":true},"constructor":"constructor-value","prototype":"prototype-value","output":${JSON.stringify("x".repeat(ENTRY_STRING_BUDGET + 1))}}`,
+  ) as Record<string, unknown>;
+  const projected = windowedTranscript([{ ...entry(0, "tool_result"), payload }]).entries[0]!;
+  const output = projected.payload as Record<string, unknown>;
+  assert.equal(projected.truncated, true);
+  assert.deepEqual(Object.keys(output), ["before", "__proto__", "constructor", "prototype", "output"]);
+  assert.equal(Object.getPrototypeOf(output), Object.prototype);
+  assert.equal(Object.hasOwn(output, "__proto__"), true);
+  assert.deepEqual(output.__proto__, { polluted: true });
+  assert.equal(output.constructor, "constructor-value");
+  assert.equal(output.prototype, "prototype-value");
+  assert.equal((output.output as string).length, ENTRY_STRING_BUDGET);
+  assert.deepEqual(Object.keys(JSON.parse(JSON.stringify(output)) as Record<string, unknown>), Object.keys(output));
+  assert.equal((Object.prototype as { polluted?: unknown }).polluted, undefined);
+});
+
 test("windowedTranscript: conversation text is never truncated — only tool payloads are", () => {
   const said = "y".repeat(50_000);
   const log = [

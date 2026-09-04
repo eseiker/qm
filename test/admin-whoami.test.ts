@@ -88,12 +88,12 @@ test("whoami is 404 when the admin plane is unwired", async () => {
   }
 });
 
-test("whoami audits an admin.whoami event for a resolved actor", async () => {
+test("whoami status checks do not append audit events", async () => {
   const s = start();
   try {
     await whoami(s.base, "admin-alice@default-org");
     const actions = (await s.built.auditLog.events()).map((e) => e.action);
-    assert.ok(actions.includes("admin.whoami"), "the whoami read is audited");
+    assert.equal(actions.includes("admin.whoami"), false);
   } finally {
     await s.close();
   }

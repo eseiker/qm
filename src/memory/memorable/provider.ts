@@ -18,13 +18,14 @@ export interface MemorableProviderDeps {
 }
 
 function maskInput(input: Record<string, unknown>, mask: (text: string) => string): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(input)) {
-    if (typeof value === "string") out[key] = mask(value);
-    else if (value && typeof value === "object") out[key] = JSON.parse(mask(JSON.stringify(value)));
-    else out[key] = value;
-  }
-  return out;
+  return Object.fromEntries(
+    Object.entries(input).map(([key, value]) => {
+      let masked = value;
+      if (typeof value === "string") masked = mask(value);
+      else if (value && typeof value === "object") masked = JSON.parse(mask(JSON.stringify(value)));
+      return [key, masked];
+    }),
+  );
 }
 
 function redactCapture(capture: MemorableCapture, mask: (text: string) => string): MemorableCapture {

@@ -65,6 +65,33 @@ test("automatic capture derives a redacted procedure from the session and relays
   assert.ok(!JSON.stringify(capture).includes("sk-live-abcdef123456"));
 });
 
+test("automatic capture redaction preserves prototype-like tool-input keys", async () => {
+  const relayed: MemorableCapture[] = [];
+  const special = JSON.parse(
+    '{"tool":"execute","callId":"special","__proto__":{"token":"secret-proto"},"constructor":"secret-constructor","prototype":"secret-prototype"}',
+  ) as Record<string, unknown>;
+  const provider = createMemorableMemoryProvider({
+    argv: ["memorable"],
+    env: {},
+    loadEntries: async () => [entry("user", { text: "run it" }, 1), entry("tool_call", special, 2)],
+    mask: (text) => text.replaceAll("secret", "masked"),
+    relay: async (_bin, capture) => {
+      relayed.push(capture);
+      return { ok: true };
+    },
+  });
+  assert.equal(await provider.capture(personal, [], 1, "U1", { mode: "automatic", sessionId: "s1" }), 1);
+  const input = relayed[0]!.workflows[0]!.tool_calls[0]!.input;
+  assert.deepEqual(Object.keys(input), ["__proto__", "constructor", "prototype"]);
+  assert.equal(Object.getPrototypeOf(input), Object.prototype);
+  assert.equal(Object.hasOwn(input, "__proto__"), true);
+  assert.deepEqual(input.__proto__, { token: "masked-proto" });
+  assert.equal(input.constructor, "masked-constructor");
+  assert.equal(input.prototype, "masked-prototype");
+  assert.deepEqual(Object.keys(JSON.parse(JSON.stringify(input)) as Record<string, unknown>), Object.keys(input));
+  assert.equal((Object.prototype as { polluted?: unknown }).polluted, undefined);
+});
+
 test("explicit writes and captures without a session are ignored", async () => {
   let relays = 0;
   const provider = createMemorableMemoryProvider({

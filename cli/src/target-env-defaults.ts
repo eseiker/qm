@@ -1,4 +1,4 @@
-import type { QmConfig } from "./config.ts";
+import { sandboxBackend, type QmConfig } from "./config.ts";
 import type { Target } from "./providers.ts";
 
 /**
@@ -8,7 +8,7 @@ import type { Target } from "./providers.ts";
 export type TargetEnvDefaults = (config: QmConfig, service: string, name: string) => string | undefined;
 
 export const FLY_TEMPLATE_ENV_DEFAULTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
-  core: { HARNESS: "pi" },
+  core: { HARNESS: "pi", SANDBOX_BACKEND: "sprites" },
 };
 
 const AWS_RENDER_ENV_DEFAULTS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
@@ -16,12 +16,18 @@ const AWS_RENDER_ENV_DEFAULTS: Readonly<Record<string, Readonly<Record<string, s
 };
 
 export const TARGET_ENV_DEFAULTS: Record<Target, TargetEnvDefaults> = {
-  docker: () => undefined,
-  fly: (_config, service, name) => FLY_TEMPLATE_ENV_DEFAULTS[service]?.[name],
+  docker: (config, service, name) => {
+    if (service !== "core" || name !== "SANDBOX_BACKEND") return undefined;
+    return sandboxBackend(config);
+  },
+  fly: (config, service, name) => {
+    if (service === "core" && name === "SANDBOX_BACKEND") return sandboxBackend(config);
+    return FLY_TEMPLATE_ENV_DEFAULTS[service]?.[name];
+  },
   aws: (config, service, name) => {
     const rendered = AWS_RENDER_ENV_DEFAULTS[service]?.[name];
     if (rendered === undefined) return undefined;
-    if (name === "SANDBOX_BACKEND") return config.sandbox?.backend ?? rendered;
+    if (name === "SANDBOX_BACKEND") return sandboxBackend(config);
     return rendered;
   },
 };

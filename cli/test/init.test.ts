@@ -1,7 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runInit } from "../src/commands/init.ts";
@@ -42,6 +56,26 @@ function captureInit(opts: Parameters<typeof runInit>[0]): string {
   }
 }
 
+function withProcessEnv(values: Record<string, string>, fn: () => void): void {
+  const previous = new Map(Object.keys(values).map((name) => [name, process.env[name]]));
+  try {
+    Object.assign(process.env, values);
+    fn();
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+function assertNoScaffoldFiles(dir: string): void {
+  assert.deepEqual(
+    readdirSync(dir).filter((name) => name !== ".git"),
+    [],
+  );
+}
+
 test("init scaffolds a loadable config, generated local secrets, and a valid sandbox/ layer", () => {
   const base = mkdtempSync(join(tmpdir(), "qm-init-"));
   try {
@@ -59,7 +93,7 @@ test("init scaffolds a loadable config, generated local secrets, and a valid san
     assert.equal(config.publicUrl, "http://localhost:8082");
     assert.equal(config.env.core?.HARNESS, "pi");
     assert.equal(config.modelProvider, "anthropic", "init names a base model provider by default");
-    assert.deepEqual(config.sandbox, { app: "acme-sandboxes" });
+    assert.deepEqual(config.sandbox, { backend: "local" });
 
     const env = readFileSync(join(dir, ".env.example"), "utf8");
     assert.equal(env, renderEnvExample(config), ".env.example is exactly renderEnvExample output");
@@ -73,12 +107,8 @@ test("init scaffolds a loadable config, generated local secrets, and a valid san
     }
     // OPENAI_API_KEY answers to two independent rules; the catalog lists both so neither
     // route to requiring it is hidden behind the other.
-    for (const line of [
-      '# Needed when env.core.HARNESS is "codex" or modelProvider is "openai".',
-      "# OPENAI_API_KEY=",
-    ]) {
-      assert.ok(env.split("\n").includes(line), `.env.example should defer ${line}`);
-    }
+    assert.match(env, /# Needed when env\.core\.HARNESS is "codex" or modelProvider is "openai"/);
+    assert.ok(env.split("\n").includes("# OPENAI_API_KEY="));
     assert.ok(env.includes("# Generate with: openssl rand -hex 32"), "mintable secrets carry their generation command");
     const localEnv = readFileSync(join(dir, ".env"), "utf8");
     const coreSecret = localEnv.match(/^CORE_SIGNING_SECRET=([a-f0-9]{64})$/m)?.[1];
@@ -95,7 +125,13 @@ test("init scaffolds a loadable config, generated local secrets, and a valid san
     assert.ok(gitignore.includes(".env"), ".gitignore should cover .env");
 
     const agentsMd = readFileSync(join(dir, "AGENTS.md"), "utf8");
-    for (const piece of [CONFIG_FILENAME, ".env.example", "sandbox/", "npm exec qm -- check", "npm exec qm -- up"]) {
+    for (const piece of [
+      CONFIG_FILENAME,
+      ".env.example",
+      "sandbox/",
+      "npm exec --yes=false -- qm check",
+      "npm exec --yes=false -- qm up",
+    ]) {
       assert.ok(agentsMd.includes(piece), `AGENTS.md should mention ${piece}`);
     }
     assert.doesNotMatch(env, /ORG_ID=|PORT=|HARNESS=/);
@@ -103,7 +139,6 @@ test("init scaffolds a loadable config, generated local secrets, and a valid san
     assert.match(manifest, /^ {2}name: qm$/m);
     assert.match(manifest, /^ {4}display_name: qm$/m);
     assert.equal(existsSync(join(dir, "slack-sso-manifest.yml")), false);
-    assert.equal(existsSync(join(dir, ".github", "workflows", "qm-update.yml")), false);
 
     const skill = readFileSync(join(dir, "sandbox", "skills", "greet", "SKILL.md"), "utf8");
     assert.match(skill, /name: greet/);
@@ -176,25 +211,7 @@ test("init --target fly scaffolds the full hosted topology and both Slack apps",
       assert.ok(env.split("\n").includes(line), `.env.example should offer ${line}`);
     }
     assert.ok(existsSync(join(dir, "slack-app-manifest.yml")), "Slack manifest is scaffolded on fly too");
-    const updater = readFileSync(join(dir, ".github", "workflows", "qm-update.yml"), "utf8");
-    assert.match(updater, /workflow_dispatch/);
-    assert.match(updater, /update --version "\$VERSION"/);
-    assert.match(updater, /VERSION: \$\{\{ inputs\.version \}\}/);
-    assert.match(updater, /--version "\$VERSION"/);
-    assert.doesNotMatch(updater, /run:.*\$\{\{ inputs\./);
-    assert.match(updater, /git fetch origin/);
-    assert.match(updater, /git rebase "origin\/\$GITHUB_REF_NAME"/);
-    assert.match(updater, /for attempt in 1 2 3 4 5/);
-    assert.ok(updater.indexOf("Record the pinned release") < updater.indexOf("Install and deploy QM"));
-    assert.match(
-      updater,
-      /if: steps\.deployment\.outputs\.target == 'fly'\n\s+uses: superfly\/flyctl-actions\/setup-flyctl@[0-9a-f]{40}/,
-    );
-    assert.ok(updater.indexOf("setup-flyctl") < updater.indexOf("Install and deploy QM"));
-    assert.match(updater, /cancel-in-progress: false/);
-    assert.match(updater, /contents: write/);
-    assert.match(updater, /Docker browser updates require a self-hosted deployment workflow\./);
-    assert.ok(updater.indexOf('update --version "$VERSION"') < updater.indexOf("npm install --save-exact"));
+    assert.equal(existsSync(join(dir, ".github")), false);
     assert.equal(existsSync(join(dir, "slack-sso-manifest.yml")), false);
     for (const line of ["# OIDC_CLIENT_ID=", "# OIDC_CLIENT_SECRET=", "# PORTAL_EXPECTED_TEAM_ID="]) {
       assert.ok(env.split("\n").includes(line), `external-IdP secret ${line} stays documented but unrequired`);
@@ -239,11 +256,11 @@ test("init keeps stable qm Slack branding for long org ids", () => {
   }
 });
 
-test("init derives sandbox.app from --org", () => {
+test("init defaults Docker to the local sandbox", () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-init-"));
   try {
     quiet(() => runInit({ dir, org: "globex" }));
-    assert.deepEqual(loadConfigInDir(dir).config.sandbox, { app: "globex-sandboxes" });
+    assert.deepEqual(loadConfigInDir(dir).config.sandbox, { backend: "local" });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -303,19 +320,20 @@ test("init --target aws scaffolds the full hosted topology, Terraform, and the o
     assert.equal(existsSync(join(dir, "slack-sso-manifest.yml")), false);
     const agents = readFileSync(join(dir, "AGENTS.md"), "utf8");
     assert.match(agents, /CloudFront/);
-    assert.match(agents, /Lambda MicroVM/);
+    assert.match(agents, /AWS_DEPLOY_IMAGE.*always-required Lambda MicroVM image for the AWS deployment\s+publisher/);
+    assert.match(agents, /Agent computers reuse the same image when the sandbox backend is `aws`/);
     for (const command of [
       "aws iam get-open-id-connect-provider",
       "aws iam create-open-id-connect-provider",
       "cloudfront_hostname",
       "alb_hostname",
-      "npm exec qm -- infra render",
+      "npm exec --yes=false -- qm infra render",
       "terraform -chdir=infra apply",
-      "npm exec qm -- infra build-image",
-      "npm exec qm -- secrets push",
-      "npm exec qm -- up --yes",
-      "npm exec qm -- check --live",
-      "npm exec qm -- infra delete-task-definitions --yes",
+      "npm exec --yes=false -- qm infra build-image",
+      "npm exec --yes=false -- qm secrets push",
+      "npm exec --yes=false -- qm up --yes",
+      "npm exec --yes=false -- qm check --live",
+      "npm exec --yes=false -- qm infra delete-task-definitions --yes",
       "secret_recovery_window_days=0",
     ]) {
       assert.match(agents, new RegExp(command.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -324,7 +342,7 @@ test("init --target aws scaffolds the full hosted topology, Terraform, and the o
     const destructiveApply = agents.indexOf("terraform -chdir=infra apply\n-var='ecr_force_delete=true'");
     const destructiveDestroy = agents.indexOf("terraform -chdir=infra destroy\n-var='ecr_force_delete=true'");
     assert.ok(destructiveApply >= 0, "destructive lifecycle settings are applied before teardown");
-    const taskDefinitionCleanup = agents.indexOf("npm exec qm -- infra delete-task-definitions --yes");
+    const taskDefinitionCleanup = agents.indexOf("npm exec --yes=false -- qm infra delete-task-definitions --yes");
     assert.ok(
       taskDefinitionCleanup > destructiveApply,
       "task definitions are cleaned after the lifecycle apply recreates its bootstrap revision",
@@ -388,6 +406,287 @@ test("init refuses to clobber an existing config, and leaves present scaffold fi
   }
 });
 
+test("init rejects symlink and hardlink aliases for every root scaffold file", () => {
+  for (const name of [CONFIG_FILENAME, ".env", "package.json", ".gitignore"]) {
+    for (const kind of ["symlink", "hardlink"] as const) {
+      const base = mkdtempSync(join(tmpdir(), "qm-init-alias-"));
+      const dir = join(base, "deployment");
+      const external = join(base, "external");
+      const target = join(dir, name);
+      mkdirSync(dir);
+      try {
+        if (kind === "symlink") {
+          symlinkSync(external, target);
+        } else {
+          writeFileSync(external, name === "package.json" ? '{"external":true}\n' : "external\n");
+          linkSync(external, target);
+        }
+        assert.throws(
+          () => quiet(() => runInit({ dir, org: "acme" })),
+          /not a safe regular file owned by the current user/,
+          `${kind} ${name}`,
+        );
+        if (kind === "symlink") assert.equal(existsSync(external), false, `${name} symlink target stays absent`);
+        else {
+          assert.equal(
+            readFileSync(external, "utf8"),
+            name === "package.json" ? '{"external":true}\n' : "external\n",
+            `${name} hardlink target stays unchanged`,
+          );
+        }
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("init preflights late root and nested scaffold aliases before writing any files", () => {
+  for (const [segments, target] of [
+    [[".env.example"], "docker"],
+    [["AGENTS.md"], "docker"],
+    [["CLAUDE.md"], "docker"],
+    [["sandbox", "skills", "greet", "SKILL.md"], "docker"],
+    [["infra", "main.tf"], "aws"],
+  ] as const) {
+    const base = mkdtempSync(join(tmpdir(), "qm-init-late-alias-"));
+    const dir = join(base, "deployment");
+    const external = join(base, "external");
+    const path = join(dir, ...segments);
+    mkdirSync(join(path, ".."), { recursive: true });
+    symlinkSync(external, path);
+    try {
+      assert.throws(() => quiet(() => runInit({ dir, org: "acme", target })), /safe regular file/);
+      assert.equal(existsSync(external), false);
+      for (const name of [CONFIG_FILENAME, ".env", ".env.example", ".gitignore", "package.json"]) {
+        if (segments.length === 1 && segments[0] === name) continue;
+        assert.equal(existsSync(join(dir, name)), false, `${segments.join("/")} must fail before creating ${name}`);
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  }
+});
+
+test("init rejects a symlink used as its requested root", () => {
+  const base = mkdtempSync(join(tmpdir(), "qm-init-root-alias-"));
+  const victim = join(base, "victim");
+  const requested = join(base, "requested");
+  mkdirSync(victim);
+  symlinkSync(victim, requested);
+  try {
+    assert.throws(() => quiet(() => runInit({ dir: requested, org: "acme" })), /init directory/);
+    assert.deepEqual(readdirSync(victim), []);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("init rejects writable lexical ancestors hidden by an intermediate symlink", () => {
+  const base = mkdtempSync(join(tmpdir(), "qm-init-lexical-alias-"));
+  const untrusted = join(base, "untrusted");
+  const victim = join(base, "victim");
+  const alias = join(untrusted, "alias");
+  const requested = join(alias, "deployment");
+  mkdirSync(untrusted);
+  mkdirSync(victim);
+  chmodSync(untrusted, 0o777);
+  symlinkSync(victim, alias);
+  try {
+    assert.throws(() => quiet(() => runInit({ dir: requested, org: "acme" })), /trusted init directory ancestor/);
+    assert.deepEqual(readdirSync(victim), []);
+  } finally {
+    chmodSync(untrusted, 0o700);
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("init rejects group-writable roots, nested directories, and mutable files", () => {
+  const root = mkdtempSync(join(tmpdir(), "qm-init-writable-root-"));
+  try {
+    chmodSync(root, 0o777);
+    assert.throws(() => quiet(() => runInit({ dir: root, org: "acme" })), /not a trusted init directory ancestor/);
+    assert.equal(existsSync(join(root, CONFIG_FILENAME)), false);
+  } finally {
+    chmodSync(root, 0o700);
+    rmSync(root, { recursive: true, force: true });
+  }
+
+  const outer = mkdtempSync(join(tmpdir(), "qm-init-writable-ancestor-"));
+  const controlling = join(outer, "controlling");
+  const requested = join(controlling, "deployment");
+  try {
+    mkdirSync(controlling);
+    chmodSync(controlling, 0o777);
+    assert.throws(() => quiet(() => runInit({ dir: requested, org: "acme" })), /trusted init directory ancestor/);
+    assert.equal(existsSync(join(requested, CONFIG_FILENAME)), false);
+  } finally {
+    chmodSync(controlling, 0o700);
+    rmSync(outer, { recursive: true, force: true });
+  }
+
+  const nested = mkdtempSync(join(tmpdir(), "qm-init-writable-parent-"));
+  try {
+    mkdirSync(join(nested, "sandbox"), { mode: 0o777 });
+    chmodSync(join(nested, "sandbox"), 0o777);
+    assert.throws(() => quiet(() => runInit({ dir: nested, org: "acme" })), /unsafe parent directory/);
+  } finally {
+    chmodSync(join(nested, "sandbox"), 0o700);
+    rmSync(nested, { recursive: true, force: true });
+  }
+
+  for (const name of ["package.json", ".gitignore"]) {
+    const dir = mkdtempSync(join(tmpdir(), "qm-init-writable-file-"));
+    const path = join(dir, name);
+    const content = name === "package.json" ? "{}\n" : "external\n";
+    try {
+      writeFileSync(path, content);
+      chmodSync(path, 0o666);
+      assert.throws(
+        () => quiet(() => runInit({ dir, org: "acme" })),
+        /not a safe regular file owned by the current user/,
+      );
+      assert.equal(readFileSync(path, "utf8"), content);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("init rejects read-only mutable files before writing the scaffold", () => {
+  for (const name of ["package.json", ".gitignore"]) {
+    const dir = mkdtempSync(join(tmpdir(), "qm-init-readonly-file-"));
+    const path = join(dir, name);
+    const content = name === "package.json" ? "{}\n" : "node_modules/\n";
+    try {
+      writeFileSync(path, content, { mode: 0o444 });
+      assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /safe regular file/);
+      assert.equal(readFileSync(path, "utf8"), content);
+      assert.equal(existsSync(join(dir, CONFIG_FILENAME)), false);
+      assert.equal(existsSync(join(dir, ".env")), false);
+    } finally {
+      chmodSync(path, 0o600);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("init rejects oversized sparse mutable files before reading or writing", () => {
+  for (const name of ["package.json", ".gitignore"]) {
+    const dir = mkdtempSync(join(tmpdir(), "qm-init-oversized-file-"));
+    const path = join(dir, name);
+    try {
+      writeFileSync(path, name === "package.json" ? "{}\n" : ".env\n");
+      truncateSync(path, 2 * 1024 * 1024);
+      assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /exceeds the .* init limit/);
+      assert.equal(statSync(path).size, 2 * 1024 * 1024);
+      assert.equal(existsSync(join(dir, CONFIG_FILENAME)), false);
+      assert.equal(existsSync(join(dir, ".env")), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("init creates safe modes even under a permissive umask", () => {
+  const base = mkdtempSync(join(tmpdir(), "qm-init-umask-"));
+  const dir = join(base, "deployment");
+  const previous = process.umask(0);
+  try {
+    try {
+      quiet(() => runInit({ dir, org: "acme" }));
+    } finally {
+      process.umask(previous);
+    }
+    assert.equal(statSync(dir).mode & 0o022, 0);
+    assert.equal(statSync(join(dir, CONFIG_FILENAME)).mode & 0o022, 0);
+    assert.equal(statSync(join(dir, ".gitignore")).mode & 0o022, 0);
+    assert.equal(statSync(join(dir, ".env")).mode & 0o777, 0o600);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("init rejects permission-granting directory ACLs and strips file ACLs on macOS", (t) => {
+  if (process.platform !== "darwin") return t.skip("macOS ACL semantics");
+  const inherited = mkdtempSync(join(tmpdir(), "qm-init-inherited-acl-"));
+  try {
+    execFileSync("/bin/chmod", ["+a", "everyone allow read,file_inherit", inherited]);
+    assert.throws(() => quiet(() => runInit({ dir: inherited, org: "acme" })), /permission-granting ACLs/);
+    assert.equal(existsSync(join(inherited, CONFIG_FILENAME)), false);
+  } finally {
+    execFileSync("/bin/chmod", ["-N", inherited]);
+    rmSync(inherited, { recursive: true, force: true });
+  }
+
+  const existing = mkdtempSync(join(tmpdir(), "qm-init-file-acl-"));
+  const packagePath = join(existing, "package.json");
+  try {
+    writeFileSync(packagePath, "{}\n");
+    execFileSync("/bin/chmod", ["+a", "everyone allow read", packagePath]);
+    quiet(() => runInit({ dir: existing, org: "acme" }));
+    assert.doesNotMatch(execFileSync("/bin/ls", ["-lde", packagePath], { encoding: "utf8" }), / allow /);
+  } finally {
+    rmSync(existing, { recursive: true, force: true });
+  }
+
+  for (const name of ["package.json", ".gitignore"]) {
+    const unsafe = mkdtempSync(join(tmpdir(), "qm-init-unsafe-file-acl-"));
+    const path = join(unsafe, name);
+    const content = name === "package.json" ? '{"scripts":{"postinstall":"external"}}\n' : ".env\n";
+    try {
+      writeFileSync(path, content);
+      execFileSync("/bin/chmod", ["+a", "everyone allow write", path]);
+      assert.throws(() => quiet(() => runInit({ dir: unsafe, org: "acme" })), /mutation-granting ACL/);
+      assert.equal(readFileSync(path, "utf8"), content);
+      assert.equal(existsSync(join(unsafe, CONFIG_FILENAME)), false);
+      assert.equal(existsSync(join(unsafe, ".env")), false);
+    } finally {
+      if (existsSync(path)) execFileSync("/bin/chmod", ["-N", path]);
+      rmSync(unsafe, { recursive: true, force: true });
+    }
+  }
+
+  const repository = mkdtempSync(join(tmpdir(), "qm-init-unsafe-git-acl-"));
+  const indexPath = join(repository, ".git", "index");
+  try {
+    execFileSync("git", ["init"], { cwd: repository, stdio: "ignore" });
+    writeFileSync(join(repository, "seed"), "seed\n");
+    execFileSync("git", ["add", "seed"], { cwd: repository, stdio: "ignore" });
+    rmSync(join(repository, "seed"));
+    execFileSync("/bin/chmod", ["+a", "everyone allow write", indexPath]);
+    assert.throws(() => quiet(() => runInit({ dir: repository, org: "acme" })), /mutation-granting ACL/);
+    assertNoScaffoldFiles(repository);
+  } finally {
+    if (existsSync(indexPath)) execFileSync("/bin/chmod", ["-N", indexPath]);
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("init rejects symlinked scaffold ancestor directories without escaping its root", () => {
+  for (const [ancestor, target] of [
+    ["sandbox", "docker"],
+    [".codex", "docker"],
+    ["infra", "aws"],
+  ] as const) {
+    const base = mkdtempSync(join(tmpdir(), "qm-init-parent-alias-"));
+    const dir = join(base, "deployment");
+    const external = join(base, "external");
+    mkdirSync(dir);
+    mkdirSync(external);
+    symlinkSync(external, join(dir, ancestor));
+    try {
+      assert.throws(() => quiet(() => runInit({ dir, org: "acme", target })), /unsafe parent directory/, ancestor);
+      assert.deepEqual(readdirSync(external), [], `${ancestor} cannot redirect scaffold writes outside the root`);
+      assert.equal(existsSync(join(dir, CONFIG_FILENAME)), false);
+      assert.equal(existsSync(join(dir, ".env")), false);
+      assert.equal(existsSync(join(dir, "package.json")), false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  }
+});
+
 test("init makes .env the final matching gitignore rule before generating signing keys", () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-init-existing-ignore-"));
   try {
@@ -395,6 +694,23 @@ test("init makes .env the final matching gitignore rule before generating signin
     quiet(() => runInit({ dir, org: "acme" }));
     assert.equal(readFileSync(join(dir, ".gitignore"), "utf8"), "node_modules/\n.env\n!.env\n.generated/\n.env\n");
     assert.match(readFileSync(join(dir, ".env"), "utf8"), /^CORE_SIGNING_SECRET=[a-f0-9]{64}$/m);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("init does not mistake a leading-space gitignore pattern for .env", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-init-leading-space-ignore-"));
+  try {
+    execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+    writeFileSync(join(dir, ".gitignore"), "node_modules/\n.generated/\n .env\n");
+    quiet(() => runInit({ dir, org: "acme" }));
+    assert.equal(readFileSync(join(dir, ".gitignore"), "utf8"), "node_modules/\n.generated/\n .env\n.env\n");
+    assert.equal(execFileSync("git", ["check-ignore", ".env"], { cwd: dir, encoding: "utf8" }).trim(), ".env");
+    assert.doesNotMatch(
+      execFileSync("git", ["status", "--short", "--untracked-files=all"], { cwd: dir, encoding: "utf8" }),
+      /^\?\? \.env$/m,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -422,6 +738,412 @@ test("init refuses a present tracked .env before writing the scaffold", () => {
     execFileSync("git", ["add", ".env"], { cwd: dir, stdio: "ignore" });
     assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /tracked by Git/);
     assert.ok(!existsSync(join(dir, CONFIG_FILENAME)), "init refuses before writing the scaffold");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("init ignores hostile Git routing variables when checking an absent tracked .env", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-init-hostile-git-env-"));
+  const decoy = mkdtempSync(join(tmpdir(), "qm-init-hostile-git-decoy-"));
+  try {
+    execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+    execFileSync("git", ["init"], { cwd: decoy, stdio: "ignore" });
+    writeFileSync(join(dir, ".env"), "previous=value\n");
+    execFileSync("git", ["add", "-f", ".env"], { cwd: dir, stdio: "ignore" });
+    rmSync(join(dir, ".env"));
+    withProcessEnv(
+      {
+        GIT_DIR: join(decoy, ".git"),
+        GIT_INDEX_FILE: join(decoy, ".git", "index"),
+        GIT_WORK_TREE: decoy,
+      },
+      () => assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /tracked by Git/),
+    );
+    assertNoScaffoldFiles(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(decoy, { recursive: true, force: true });
+  }
+});
+
+test("init rejects writable Git directories and indexes before writing the scaffold", () => {
+  for (const [relative, mode] of [
+    [[".git"], 0o777],
+    [[".git", "index"], 0o666],
+  ] as const) {
+    const dir = mkdtempSync(join(tmpdir(), "qm-init-writable-git-metadata-"));
+    const path = join(dir, ...relative);
+    try {
+      execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+      writeFileSync(join(dir, "seed"), "seed\n");
+      execFileSync("git", ["add", "seed"], { cwd: dir, stdio: "ignore" });
+      rmSync(join(dir, "seed"));
+      chmodSync(path, mode);
+      assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /trusted/);
+      assertNoScaffoldFiles(dir);
+    } finally {
+      if (existsSync(path)) chmodSync(path, relative.length === 1 ? 0o700 : 0o600);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("init refuses an existing Git index lock before writing the scaffold", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-init-busy-git-index-"));
+  const lock = join(dir, ".git", "index.lock");
+  try {
+    execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+    writeFileSync(lock, "active\n", { mode: 0o600 });
+    assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /busy or unsafe/);
+    assert.equal(readFileSync(lock, "utf8"), "active\n");
+    assertNoScaffoldFiles(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("init holds the Git index lock while installing generated secrets", () => {
+  const base = mkdtempSync(join(tmpdir(), "qm-init-git-race-"));
+  const dir = join(base, "deployment");
+  const bin = join(base, "bin");
+  const wrapper = join(bin, "git");
+  const counter = join(base, "ls-files-counter");
+  const result = join(base, "git-add-result");
+  const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  mkdirSync(dir);
+  mkdirSync(bin);
+  try {
+    execFileSync(realGit, ["init"], { cwd: dir, stdio: "ignore" });
+    writeFileSync(
+      wrapper,
+      `#!/bin/sh
+is_ls_files=
+for argument in "$@"; do
+  if [ "$argument" = "ls-files" ]; then is_ls_files=1; fi
+done
+if [ "$is_ls_files" = "1" ]; then
+  if [ -e "$QM_INIT_GIT_RACE_COUNTER" ]; then
+    if "$QM_INIT_REAL_GIT" -C "$QM_INIT_GIT_RACE_REPO" add -f .env >/dev/null 2>&1; then
+      echo staged > "$QM_INIT_GIT_RACE_RESULT"
+    else
+      echo blocked > "$QM_INIT_GIT_RACE_RESULT"
+    fi
+  else
+    : > "$QM_INIT_GIT_RACE_COUNTER"
+  fi
+fi
+exec "$QM_INIT_REAL_GIT" "$@"
+`,
+      { mode: 0o755 },
+    );
+    withProcessEnv(
+      {
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        QM_INIT_GIT_RACE_COUNTER: counter,
+        QM_INIT_GIT_RACE_REPO: dir,
+        QM_INIT_GIT_RACE_RESULT: result,
+        QM_INIT_REAL_GIT: realGit,
+      },
+      () => quiet(() => runInit({ dir, org: "acme" })),
+    );
+    assert.equal(readFileSync(result, "utf8").trim(), "blocked");
+    assert.match(readFileSync(join(dir, ".env"), "utf8"), /^CORE_SIGNING_SECRET=[a-f0-9]{64}$/m);
+    assert.ok(existsSync(join(dir, CONFIG_FILENAME)));
+    assert.equal(execFileSync(realGit, ["ls-files", ".env"], { cwd: dir, encoding: "utf8" }).trim(), "");
+    assert.throws(() => execFileSync(realGit, ["show", ":.env"], { cwd: dir, stdio: "ignore" }));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("init releases every enclosing Git index lock after a cleanup failure", () => {
+  const base = mkdtempSync(join(tmpdir(), "qm-init-git-lock-cleanup-"));
+  const dir = join(base, "deployment");
+  const bin = join(base, "bin");
+  const wrapper = join(bin, "git");
+  const outerLock = join(base, ".git", "index.lock");
+  const innerLock = join(dir, ".git", "index.lock");
+  const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  mkdirSync(dir);
+  mkdirSync(bin);
+  try {
+    execFileSync(realGit, ["init"], { cwd: base, stdio: "ignore" });
+    execFileSync(realGit, ["init"], { cwd: dir, stdio: "ignore" });
+    writeFileSync(
+      wrapper,
+      `#!/bin/sh
+is_ls_files=
+for argument in "$@"; do
+  if [ "$argument" = "ls-files" ]; then is_ls_files=1; fi
+done
+if [ "$is_ls_files" = "1" ] && [ -e "$QM_INIT_OUTER_LOCK" ] && [ -e "$QM_INIT_INNER_LOCK" ]; then
+  rm -f -- "$QM_INIT_INNER_LOCK"
+fi
+exec "$QM_INIT_REAL_GIT" "$@"
+`,
+      { mode: 0o755 },
+    );
+    assert.throws(
+      () =>
+        withProcessEnv(
+          {
+            PATH: `${bin}:${process.env.PATH ?? ""}`,
+            QM_INIT_INNER_LOCK: innerLock,
+            QM_INIT_OUTER_LOCK: outerLock,
+            QM_INIT_REAL_GIT: realGit,
+          },
+          () => quiet(() => runInit({ dir, org: "acme" })),
+        ),
+      /index\.lock/,
+    );
+    assert.equal(existsSync(innerLock), false);
+    assert.equal(existsSync(outerLock), false);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("init does not execute a repository fsmonitor while checking .env", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-init-fsmonitor-"));
+  const hook = join(dir, "fsmonitor");
+  const marker = join(dir, "fsmonitor-ran");
+  try {
+    execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+    writeFileSync(hook, '#!/bin/sh\n: > "$QM_INIT_FSMONITOR_MARKER"\n', { mode: 0o755 });
+    execFileSync("git", ["config", "core.fsmonitor", hook], { cwd: dir, stdio: "ignore" });
+    withProcessEnv({ QM_INIT_FSMONITOR_MARKER: marker }, () => quiet(() => runInit({ dir, org: "acme" })));
+    assert.equal(existsSync(marker), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("init fails closed before writing when Git cannot execute", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-init-git-unavailable-"));
+  try {
+    execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+    writeFileSync(join(dir, ".env"), "previous=value\n");
+    execFileSync("git", ["add", "-f", ".env"], { cwd: dir, stdio: "ignore" });
+    rmSync(join(dir, ".env"));
+    withProcessEnv({ PATH: join(dir, "missing-bin") }, () => {
+      assert.throws(
+        () => quiet(() => runInit({ dir, org: "acme" })),
+        /could not determine whether \.env is tracked by Git/,
+      );
+    });
+    assertNoScaffoldFiles(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("init treats case-folded .env index entries as tracked", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-init-casefolded-env-"));
+  try {
+    execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+    writeFileSync(join(dir, ".ENV"), "previous=value\n");
+    execFileSync("git", ["add", "-f", ".ENV"], { cwd: dir, stdio: "ignore" });
+    rmSync(join(dir, ".ENV"));
+    assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /tracked by Git/);
+    assertNoScaffoldFiles(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("init treats Unicode-case-folded ancestor components of a tracked .env as equivalent", (t) => {
+  const repo = mkdtempSync(join(tmpdir(), "qm-init-casefolded-ancestors-"));
+  const requested = join(repo, "déploy", "äcme");
+  const indexed = join(repo, "DÉPLOY", "ÄCME");
+  try {
+    execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+    mkdirSync(requested, { recursive: true });
+    if (!existsSync(indexed)) return t.skip("case-sensitive filesystem");
+    writeFileSync(join(requested, ".env"), "previous=value\n");
+    execFileSync("git", ["add", "-f", "DÉPLOY/ÄCME/.env"], { cwd: repo, stdio: "ignore" });
+    assert.equal(
+      execFileSync("git", ["ls-files", "-z"], { cwd: repo, encoding: "utf8" }).replace(/\0$/u, "").normalize("NFC"),
+      "DÉPLOY/ÄCME/.env".normalize("NFC"),
+    );
+    rmSync(join(requested, ".env"));
+    assert.throws(() => quiet(() => runInit({ dir: requested, org: "acme" })), /tracked by Git/);
+    assert.equal(existsSync(join(requested, CONFIG_FILENAME)), false);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("init rejects an .env tracked by an enclosing repository", () => {
+  const repo = mkdtempSync(join(tmpdir(), "qm-init-enclosing-repo-"));
+  const dir = join(repo, "deploy");
+  try {
+    execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+    mkdirSync(dir);
+    writeFileSync(join(dir, ".env"), "previous=value\n");
+    execFileSync("git", ["add", "-f", "deploy/.env"], { cwd: repo, stdio: "ignore" });
+    rmSync(join(dir, ".env"));
+    execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+    assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /tracked by Git/);
+    assertNoScaffoldFiles(dir);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("init discovers bare repositories and fails closed on an unreadable bare index", () => {
+  const repo = mkdtempSync(join(tmpdir(), "qm-init-bare-repo-"));
+  const dir = join(repo, "deploy");
+  const indexPath = join(repo, "index");
+  try {
+    execFileSync("git", ["init", "--bare"], { cwd: repo, stdio: "ignore" });
+    mkdirSync(dir);
+    const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+      cwd: repo,
+      encoding: "utf8",
+      input: "previous=value\n",
+    }).trim();
+    execFileSync("git", ["update-index", "--add", "--cacheinfo", `100644,${blob},deploy/.env`], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+    assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /tracked by Git/);
+    assertNoScaffoldFiles(dir);
+
+    rmSync(join(repo, "config"));
+    assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /tracked by Git/);
+    assertNoScaffoldFiles(dir);
+
+    rmSync(join(repo, "HEAD"), { recursive: true });
+    symlinkSync("refs/heads/main", join(repo, "HEAD"));
+    assert.equal(
+      execFileSync("git", ["rev-parse", "--is-bare-repository"], { cwd: repo, encoding: "utf8" }).trim(),
+      "true",
+    );
+    assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /tracked by Git/);
+    assertNoScaffoldFiles(dir);
+
+    writeFileSync(join(repo, "config"), "[core\n", { mode: 0o644 });
+    assert.throws(
+      () => quiet(() => runInit({ dir, org: "acme" })),
+      /could not determine whether an init ancestor is a bare Git repository/,
+    );
+    assertNoScaffoldFiles(dir);
+    rmSync(join(repo, "config"));
+
+    rmSync(join(repo, "HEAD"));
+    writeFileSync(join(repo, "HEAD"), "not a repository\n", { mode: 0o644 });
+    assert.throws(
+      () => quiet(() => runInit({ dir, org: "acme" })),
+      /could not determine whether an init ancestor is a bare Git repository/,
+    );
+    assertNoScaffoldFiles(dir);
+    rmSync(join(repo, "HEAD"));
+
+    mkdirSync(join(repo, "HEAD"));
+    assert.throws(
+      () => quiet(() => runInit({ dir, org: "acme" })),
+      /could not determine whether an init ancestor is a bare Git repository/,
+    );
+    assertNoScaffoldFiles(dir);
+    rmSync(join(repo, "HEAD"), { recursive: true });
+    symlinkSync("refs/heads/main", join(repo, "HEAD"));
+
+    execFileSync("git", ["--git-dir", repo, "config", "core.bare", "false"], { stdio: "ignore" });
+    execFileSync("git", ["--git-dir", repo, "config", "core.worktree", repo], { stdio: "ignore" });
+    assert.equal(
+      execFileSync("git", ["rev-parse", "--is-bare-repository"], { cwd: repo, encoding: "utf8" }).trim(),
+      "false",
+    );
+    assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /tracked by Git/);
+    assertNoScaffoldFiles(dir);
+    rmSync(join(repo, "config"));
+
+    rmSync(join(repo, "refs"), { recursive: true });
+    assert.throws(
+      () => quiet(() => runInit({ dir, org: "acme" })),
+      /could not determine whether an init ancestor is a bare Git repository/,
+    );
+    assertNoScaffoldFiles(dir);
+    mkdirSync(join(repo, "refs", "heads"), { recursive: true });
+
+    const index = readFileSync(indexPath);
+    writeFileSync(indexPath, index.subarray(0, 8));
+    assert.throws(
+      () => quiet(() => runInit({ dir, org: "acme" })),
+      /could not determine whether \.env is tracked by Git/,
+    );
+    assertNoScaffoldFiles(dir);
+    writeFileSync(indexPath, index);
+    assert.equal(execFileSync("git", ["ls-files"], { cwd: repo, encoding: "utf8" }).trim(), "deploy/.env");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("init fails closed on aliased bare repository metadata", () => {
+  const base = mkdtempSync(join(tmpdir(), "qm-init-aliased-bare-repo-"));
+  const repo = join(base, "repo");
+  const dir = join(repo, "deploy");
+  const objects = join(base, "objects");
+  try {
+    execFileSync("git", ["init", "--bare", repo], { stdio: "ignore" });
+    mkdirSync(dir);
+    const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+      cwd: repo,
+      encoding: "utf8",
+      input: "previous=value\n",
+    }).trim();
+    execFileSync("git", ["update-index", "--add", "--cacheinfo", `100644,${blob},deploy/.env`], {
+      cwd: repo,
+      stdio: "ignore",
+    });
+    renameSync(join(repo, "objects"), objects);
+    symlinkSync("../objects", join(repo, "objects"));
+    assert.equal(
+      execFileSync("git", ["rev-parse", "--is-bare-repository"], { cwd: repo, encoding: "utf8" }).trim(),
+      "true",
+    );
+    assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /trusted/);
+    assertNoScaffoldFiles(dir);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("init does not mistake an ordinary Git-shaped ancestor for a bare repository", () => {
+  const base = mkdtempSync(join(tmpdir(), "qm-init-git-lookalike-"));
+  const dir = join(base, "deploy");
+  try {
+    writeFileSync(join(base, "HEAD"), "not a repository\n");
+    mkdirSync(join(base, "objects"));
+    mkdirSync(join(base, "refs"));
+    mkdirSync(dir);
+    quiet(() => runInit({ dir, org: "acme" }));
+    assert.ok(existsSync(join(dir, CONFIG_FILENAME)));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("init checks .env without enumerating a large unrelated Git index", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-init-large-index-"));
+  try {
+    execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+    const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+      cwd: dir,
+      encoding: "utf8",
+      input: "",
+    }).trim();
+    const entries = Array.from(
+      { length: 240_000 },
+      (_, index) => `100644 ${blob}\t${"indexed-path-".repeat(6)}${index.toString().padStart(5, "0")}\n`,
+    ).join("");
+    execFileSync("git", ["update-index", "--index-info"], { cwd: dir, input: entries });
+    const listing = execFileSync("git", ["ls-files", "-z"], { cwd: dir, maxBuffer: 32 * 1024 * 1024 });
+    assert.ok(listing.byteLength > 16 * 1024 * 1024);
+    quiet(() => runInit({ dir, org: "acme" }));
+    assert.ok(existsSync(join(dir, CONFIG_FILENAME)));
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -485,6 +1207,40 @@ test("init preflights package.json and completes an install-first package manife
   }
 });
 
+test("init rejects malformed UTF-8 in mutable files without changing them", () => {
+  for (const [name, content] of [
+    ["package.json", Buffer.concat([Buffer.from('{"description":"'), Buffer.from([0xc3, 0x28]), Buffer.from('"}\n')])],
+    [".gitignore", Buffer.concat([Buffer.from("node_modules/\n"), Buffer.from([0xc3, 0x28]), Buffer.from("\n")])],
+  ] as const) {
+    const dir = mkdtempSync(join(tmpdir(), "qm-init-malformed-utf8-"));
+    const path = join(dir, name);
+    try {
+      writeFileSync(path, content);
+      assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /valid UTF-8 text/);
+      assert.deepEqual(readFileSync(path), content);
+      assert.equal(existsSync(join(dir, CONFIG_FILENAME)), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("init preserves an existing package if its atomic replacement cannot be prepared", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-init-atomic-package-"));
+  const path = join(dir, "package.json");
+  const content = `${JSON.stringify({ description: "x".repeat(1_048_500) })}\n`;
+  try {
+    assert.ok(Buffer.byteLength(content) < 1024 * 1024);
+    writeFileSync(path, content);
+    assert.throws(() => quiet(() => runInit({ dir, org: "acme" })), /rendered file limit/);
+    assert.equal(readFileSync(path, "utf8"), content);
+    assert.equal(existsSync(join(dir, CONFIG_FILENAME)), false);
+    assert.equal(existsSync(join(dir, ".env")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("init preserves an installed local package artifact", () => {
   const dir = mkdtempSync(join(tmpdir(), "qm-init-local-package-"));
   try {
@@ -545,9 +1301,7 @@ test("init --target aws vendors a contract-valid Terraform deployment", () => {
     const tfvars = readFileSync(tfvarsPath, "utf8");
     assert.match(tfvars, /public_url\s*= "https:\/\/agents\.globex\.example"/);
     assert.match(tfvars, /github_repository\s*= "globex\/deploy"/);
-    const updater = readFileSync(join(dir, ".github", "workflows", "qm-update.yml"), "utf8");
-    assert.match(updater, /aws-actions\/configure-aws-credentials@[0-9a-f]{40}/);
-    assert.doesNotMatch(updater, /globex\/deploy/);
+    assert.equal(existsSync(join(dir, ".github")), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -7,7 +7,7 @@ import { dirname, extname, join, normalize } from "node:path";
 import { randomBytes } from "node:crypto";
 import { LRUCache } from "lru-cache";
 import {
-  signedHeaders,
+  signedCoreFetch,
   withSourceAuthNonce,
   CAPABILITY_HEADER,
   type HttpMethod,
@@ -392,9 +392,7 @@ async function runStateFeed(): Promise<void> {
   for (;;) {
     try {
       const signedPath = withSourceAuthNonce("/v1/session-state/events", CORE_SIGNING_SECRET);
-      const r = await fetch(`${CORE}${signedPath}`, {
-        headers: signedHeaders(CORE_SIGNING_SECRET, "GET", signedPath, ""),
-      });
+      const r = await signedCoreFetch(CORE, CORE_SIGNING_SECRET, "GET", signedPath);
       if (r.status === 200 && r.body) {
         if (dropped) {
           dropped = false;
@@ -441,15 +439,10 @@ async function coreFetch(
 ): Promise<{ status: number; text: string }> {
   const signedPath = withSourceAuthNonce(pathWithQuery, CORE_SIGNING_SECRET);
   const portalTok = portalTokenStore.getStore();
-  const r = await fetch(`${CORE}${signedPath}`, {
-    method,
-    headers: {
-      ...signedHeaders(CORE_SIGNING_SECRET, method, signedPath, rawBody),
-      ...(portalTok ? { [PORTAL_IDENTITY_HEADER]: portalTok } : {}),
-    },
+  const r = await signedCoreFetch(CORE, CORE_SIGNING_SECRET, method, signedPath, {
+    headers: portalTok ? { [PORTAL_IDENTITY_HEADER]: portalTok } : undefined,
     ...(rawBody ? { body: rawBody } : {}),
     ...(timeoutMs ? { signal: AbortSignal.timeout(timeoutMs) } : {}),
-    redirect: "manual",
   });
   return { status: r.status, text: await r.text() };
 }
@@ -630,17 +623,12 @@ function uploadFileName(url: URL): string {
 
 async function stageUploadStream(req: IncomingMessage, sha256: string): Promise<Response> {
   const corePath = withSourceAuthNonce("/v1/blobs", CORE_SIGNING_SECRET);
-  const headers = {
-    ...signedHeaders(CORE_SIGNING_SECRET, "POST", corePath, "", sha256),
-    "content-type": "application/octet-stream",
-    "x-content-sha256": sha256,
-  };
-  return fetch(`${CORE}${corePath}`, {
-    method: "POST",
-    headers,
+  return signedCoreFetch(CORE, CORE_SIGNING_SECRET, "POST", corePath, {
+    headers: { "content-type": "application/octet-stream", "x-content-sha256": sha256 },
     body: req as unknown as RequestInit["body"],
     duplex: "half",
-  } as RequestInit & { duplex: "half" });
+    signatureTail: sha256,
+  });
 }
 
 function declaredSha(url: URL): string {
@@ -820,12 +808,8 @@ async function streamFileArtifact(c: WebCtx, playground = false): Promise<unknow
     CORE_SIGNING_SECRET,
   );
   const portalTok = portalTokenStore.getStore();
-  const r = await fetch(`${CORE}${corePath}`, {
-    headers: {
-      ...signedHeaders(CORE_SIGNING_SECRET, "GET", corePath, ""),
-      ...(portalTok ? { [PORTAL_IDENTITY_HEADER]: portalTok } : {}),
-    },
-    redirect: "manual",
+  const r = await signedCoreFetch(CORE, CORE_SIGNING_SECRET, "GET", corePath, {
+    headers: portalTok ? { [PORTAL_IDENTITY_HEADER]: portalTok } : undefined,
   });
   if (!r.ok || !r.body) {
     res.writeHead(r.status === 404 ? 404 : 502, { "content-type": "application/json" });
@@ -2461,12 +2445,19 @@ const routeRequest = async (req: IncomingMessage, res: ServerResponse) => {
     const corePath = `/d/${encodeURIComponent(id)}${subPath}${url.search}`;
     const portalTok = portalTokenStore.getStore();
     const headers: Record<string, string> = {
-      ...signedHeaders(CORE_SIGNING_SECRET, method, corePath, "", user),
       "x-as-principal": user,
       ...(portalTok ? { [PORTAL_IDENTITY_HEADER]: portalTok } : {}),
     };
-    delete headers["content-type"];
-    const up = await fetch(`${CORE}${corePath}`, { method, headers, redirect: "manual" });
+    let up: Response;
+    try {
+      up = await signedCoreFetch(CORE, CORE_SIGNING_SECRET, method, corePath, {
+        headers,
+        jsonContentType: false,
+        signatureTail: user,
+      });
+    } catch {
+      return json(res, 502, { error: "bad_gateway", message: "upstream error" });
+    }
     const outHeaders = Object.fromEntries(up.headers.entries());
     delete outHeaders["content-encoding"];
     delete outHeaders["content-length"];

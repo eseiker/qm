@@ -15,7 +15,7 @@ import { mintCapabilityToken, EGRESS_PROXY_AUD, CONTROL_PLANE_AUD } from "../src
 import type { EgressAuditRecord } from "../src/admin/egress-audit-sink.ts";
 import { scopeId, type EgressPolicy } from "../src/types.ts";
 
-const CAPABILITY_SECRET = "test-egress-capability-secret";
+const CAPABILITY_SECRET = "test-egress-capability-secret-0000";
 const SOURCE_SECRET = "test-egress-source-secret";
 const listen = (s: Server): Promise<number> =>
   new Promise((r) => s.listen(0, () => r((s.address() as AddressInfo).port)));
@@ -94,6 +94,17 @@ function boot(deps: Partial<EgressAuthzDeps> = {}) {
   });
   return { server, records };
 }
+
+test("the egress capability secret is measured in UTF-8 bytes at boot", () => {
+  const audit = recordingSink().sink;
+  assert.throws(() => buildEgressAuthzServer({ capabilitySecret: "x".repeat(31), audit }), /at least 32 UTF-8 bytes/);
+  assert.throws(
+    () => buildEgressAuthzServer({ capabilitySecret: `${"é".repeat(15)}x`, audit }),
+    /at least 32 UTF-8 bytes/,
+  );
+  assert.ok(buildEgressAuthzServer({ capabilitySecret: "x".repeat(32), audit }));
+  assert.ok(buildEgressAuthzServer({ capabilitySecret: "é".repeat(16), audit }));
+});
 
 test("tokenFromRequest parses Proxy-Authorization Bearer/Basic; ignores Authorization", () => {
   const basic = Buffer.from("agent:tok-123").toString("base64");

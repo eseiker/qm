@@ -1,21 +1,34 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   CONFIG_FILENAME,
+  SECRET_SELECTOR_ENVIRONMENT_CONTRACTS,
+  effectiveCoreEnvironment,
+  effectiveDeployAppsDomain,
+  effectiveModelProvider,
+  effectivePortalPublicUrl,
   loadConfigAt,
   loadConfigInDir,
   mockHarnessWarning,
   sandboxCoreEnv,
-  sandboxImagePinErrors,
-  sandboxPinPending,
   updateConfigImageOverrides,
-  updateConfigSandbox,
+  validatePortalTrust,
 } from "../src/config.ts";
+import { secretConditionSelectors } from "../src/secrets.ts";
+import { isVirtualService } from "../src/services.ts";
+import { usesSlackOidc } from "../src/slack-manifests.ts";
 
-const BASE = { contract: 1, orgId: "acme", publicUrl: "http://localhost:8080", target: "docker", services: ["core"] };
+const BASE = {
+  contract: 1,
+  orgId: "acme",
+  publicUrl: "https://agent.acme.example",
+  target: "docker",
+  services: ["core"],
+};
 
 function writeConfig(extra: Record<string, unknown>): { dir: string; path: string } {
   const dir = mkdtempSync(join(tmpdir(), "qm-cfg-"));
@@ -40,6 +53,17 @@ function withConfig(extra: Record<string, unknown>, fn: (r: { dir: string; path:
     fn(r);
   } finally {
     rmSync(r.dir, { recursive: true, force: true });
+  }
+}
+
+function withRawConfig(raw: string, fn: (r: { dir: string; path: string }) => void): void {
+  const dir = mkdtempSync(join(tmpdir(), "qm-cfg-raw-"));
+  const path = join(dir, CONFIG_FILENAME);
+  writeFileSync(path, raw);
+  try {
+    fn({ dir, path });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
@@ -73,8 +97,294 @@ test("required fields: orgId, target, services (must include core), valid servic
   });
 });
 
+test("config parsing rejects duplicate object keys at every nesting level", () => {
+  for (const raw of [
+    '{"contract":1,"contract":1}',
+    '{"env":{"core":{"TOKEN":"first","TOKEN":"second"}}}',
+    '{"plugins":[{"env":{"TOKEN":"first","\\u0054OKEN":"second"}}]}',
+    '{"env":{},"\\u0065nv":{}}',
+  ]) {
+    withRawConfig(raw, ({ path }) => assert.throws(() => loadConfigAt(path), /duplicate object key/));
+  }
+});
+
+test("config parsing rejects NUL in every string key and value", () => {
+  for (const raw of [
+    '{"value":"left\\u0000right"}',
+    '{"left\\u0000right":"value"}',
+    '{"nested":[{"value":"left\\u0000right"}]}',
+  ]) {
+    withRawConfig(raw, ({ path }) => assert.throws(() => loadConfigAt(path), /configuration must not contain NUL/));
+  }
+});
+
+test("config parsing rejects malformed UTF-8 before validation", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-cfg-bytes-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const path = join(dir, CONFIG_FILENAME);
+  writeFileSync(
+    path,
+    Buffer.concat([
+      Buffer.from(
+        '{"contract":1,"orgId":"acme","publicUrl":"http://localhost:8080","target":"docker","services":["core"],"env":{"core":{"X":"',
+      ),
+      Buffer.from([0xc3, 0x28]),
+      Buffer.from('"}}}'),
+    ]),
+  );
+  assert.throws(() => loadConfigAt(path), /valid UTF-8 text/);
+});
+
+test("config loading accepts file symlinks and rejects non-regular inputs", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-cfg-input-"));
+  const file = join(dir, CONFIG_FILENAME);
+  const link = join(dir, "linked.jsonc");
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(file, JSON.stringify(BASE));
+  symlinkSync(file, link);
+  assert.equal(loadConfigAt(link).config.orgId, "acme");
+  assert.throws(() => loadConfigAt(dir), /regular file/);
+  if (process.platform !== "win32") {
+    const fifo = join(dir, "config.fifo");
+    execFileSync("mkfifo", [fifo]);
+    assert.throws(() => loadConfigAt(fifo), /regular file/);
+    assert.throws(() => loadConfigAt("/dev/null"), /regular file/);
+  }
+});
+
+test("string-map keys are valid environment names without losing __proto__", () => {
+  withRawConfig(
+    '{"contract":1,"orgId":"acme","publicUrl":"http://localhost:8080","target":"docker","services":["core"],"env":{"core":{"__proto__":"kept"}}}',
+    ({ path }) => {
+      const env = loadConfigAt(path).config.env.core!;
+      assert.equal(Object.hasOwn(env, "__proto__"), true);
+      assert.equal(env["__proto__"], "kept");
+    },
+  );
+  withConfig({ env: { core: { "BAD KEY": "value" } } }, ({ path }) =>
+    assert.throws(() => loadConfigAt(path), /env\.core.*not a valid env var name/),
+  );
+  withConfig({ plugins: [{ name: "linear", env: { "BAD KEY": "value" } }] }, ({ path }) =>
+    assert.throws(() => loadConfigAt(path), /plugins\[0\]\.env.*not a valid env var name/),
+  );
+  withConfig(
+    {
+      target: "aws",
+      publicUrl: "https://acme.example.com",
+      aws: {
+        accountId: "123456789012",
+        region: "us-east-1",
+        cluster: "acme",
+        deployRoleArn: "arn:aws:iam::123456789012:role/deploy",
+        secretsPrefix: "acme/",
+        imageLabel: "release",
+        networking: { cloudMapNamespace: "acme.internal" },
+        services: {
+          core: {
+            ecrRepository: "core",
+            ecsService: "acme-core",
+            cpu: 512,
+            memory: 1024,
+            buildArgs: { "BAD KEY": "value" },
+          },
+        },
+      },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /buildArgs.*not a valid env var name/),
+  );
+});
+
+test("portal and broker allowlists use the auth runtime email grammar", () => {
+  withConfig(
+    {
+      services: ["core", "portal"],
+      env: { portal: { OIDC_CLIENT_ID: "client", OIDC_ALLOWED_EMAILS: "bad<name@example.com" } },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /OIDC_ALLOWED_EMAILS.*valid/),
+  );
+  withConfig(
+    {
+      services: ["core", "portal"],
+      env: { portal: { OIDC_CLIENT_ID: "client", OIDC_ALLOWED_EMAILS: "operator@sub-domain.example.com" } },
+    },
+    ({ path }) =>
+      assert.equal(loadConfigAt(path).config.env.portal?.OIDC_ALLOWED_EMAILS, "operator@sub-domain.example.com"),
+  );
+  withConfig(
+    {
+      services: ["core", "portal", "auth"],
+      env: { auth: { AUTH_EMAIL_TRANSPORT: "resend" } },
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.throws(
+        () => validatePortalTrust(config, path, new Map([["AUTH_ALLOWED_EMAILS", "bad<name@example.com"]])),
+        /valid AUTH_ALLOWED_EMAILS/,
+      );
+      assert.doesNotThrow(() =>
+        validatePortalTrust(config, path, new Map([["AUTH_ALLOWED_EMAILS", "operator@sub-domain.example.com"]])),
+      );
+    },
+  );
+});
+
+test("built-in broker wiring cannot be overridden through env or secretEnv", () => {
+  const managed = {
+    portal: [
+      "AUTH_BROKER_UPSTREAM",
+      "AUTH_BROKER_PREFIX",
+      "OIDC_CLIENT_ID",
+      "OIDC_ISSUER",
+      "OIDC_AUTH_ENDPOINT",
+      "OIDC_TOKEN_ENDPOINT",
+      "OIDC_USERINFO_ENDPOINT",
+      "OIDC_JWKS_URI",
+      "OIDC_SCOPES",
+      "OIDC_PRINCIPAL_CLAIM",
+      "OIDC_ALLOWED_EMAIL_DOMAIN",
+      "PORTAL_EXPECTED_TEAM_ID",
+    ],
+    auth: ["AUTH_ISSUER", "AUTH_CLIENT_ID", "AUTH_REDIRECT_URI"],
+  } as const;
+  for (const source of ["env", "secretEnv"] as const) {
+    for (const [service, names] of Object.entries(managed)) {
+      for (const name of names) {
+        withConfig(
+          {
+            services: ["core", "portal", "auth"],
+            env: { auth: { AUTH_EMAIL_TRANSPORT: "resend", AUTH_ALLOWED_EMAIL_DOMAIN: "example.com" } },
+            [source]: {
+              ...(source === "env"
+                ? { auth: { AUTH_EMAIL_TRANSPORT: "resend", AUTH_ALLOWED_EMAIL_DOMAIN: "example.com" } }
+                : {}),
+              [service]: { [name]: source === "env" ? "configured" : "CONFIGURED_STORE_NAME" },
+            },
+          },
+          ({ path }) =>
+            assert.throws(
+              () => loadConfigAt(path),
+              /built-in auth broker|derived from publicUrl|Slack sign-in|managed outside the deployment secret store/,
+            ),
+        );
+      }
+    }
+  }
+});
+
+test("portal public origins are canonical and bound to publicUrl", () => {
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal", "auth"],
+      env: {
+        portal: { PORTAL_PUBLIC_URL: "HTTPS://PORTAL.EXAMPLE.COM:443/" },
+        auth: { AUTH_EMAIL_TRANSPORT: "resend", AUTH_ALLOWED_EMAIL_DOMAIN: "example.com" },
+      },
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.equal(config.env.portal?.PORTAL_PUBLIC_URL, "https://portal.example.com");
+      assert.equal(effectivePortalPublicUrl(config), "https://portal.example.com");
+    },
+  );
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: { portal: { PORTAL_PUBLIC_URL: "https://other.example.com" } },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /PORTAL_PUBLIC_URL must match publicUrl/),
+  );
+});
+
+test("Slack OIDC manifest selectors cannot be secret-backed", () => {
+  for (const name of ["OIDC_ISSUER", "OIDC_AUTH_ENDPOINT", "OIDC_TOKEN_ENDPOINT", "OIDC_USERINFO_ENDPOINT"]) {
+    withConfig(
+      {
+        publicUrl: "https://portal.example.com",
+        services: ["core", "portal"],
+        env: { portal: { OIDC_CLIENT_ID: "client", OIDC_ALLOWED_EMAILS: "admin@example.com" } },
+        secretEnv: { portal: { [name]: `${name}_STORE` } },
+      },
+      ({ path }) =>
+        assert.throws(
+          () => loadConfigAt(path),
+          /controls Slack SSO manifest selection.*non-secret|managed outside the deployment secret store/,
+        ),
+    );
+  }
+});
+
+test("external OIDC topology uses canonical HTTPS URLs before manifest selection", () => {
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: {
+        portal: {
+          OIDC_CLIENT_ID: "client",
+          OIDC_ALLOWED_EMAILS: "admin@example.com",
+          OIDC_ISSUER: "HTTPS://SLACK.COM:443/",
+          OIDC_AUTH_ENDPOINT: "HTTPS://SLACK.COM:443/openid/connect/authorize?team=T1",
+          OIDC_TOKEN_ENDPOINT: "HTTPS://SLACK.COM:443/api/openid.connect.token",
+          OIDC_USERINFO_ENDPOINT: "HTTPS://SLACK.COM:443/api/openid.connect.userInfo",
+        },
+      },
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.equal(config.env.portal?.OIDC_ISSUER, "https://slack.com");
+      assert.equal(config.env.portal?.OIDC_AUTH_ENDPOINT, "https://slack.com/openid/connect/authorize?team=T1");
+      assert.equal(usesSlackOidc(config), true);
+    },
+  );
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: {
+        portal: {
+          OIDC_CLIENT_ID: "client",
+          OIDC_ALLOWED_EMAILS: "admin@example.com",
+          OIDC_ISSUER: "HTTPS://AUTH.EXAMPLE.COM:443/tenant/",
+          OIDC_JWKS_URI: "https://auth.example.com/tenant/jwks.json",
+        },
+      },
+    },
+    ({ path }) => assert.equal(loadConfigAt(path).config.env.portal?.OIDC_ISSUER, "https://auth.example.com/tenant/"),
+  );
+  for (const name of ["OIDC_ISSUER", "OIDC_AUTH_ENDPOINT", "OIDC_TOKEN_ENDPOINT", "OIDC_USERINFO_ENDPOINT"]) {
+    for (const value of [
+      "slack.com",
+      "http://slack.com/path",
+      "https:///slack.com/path",
+      "https://user@slack.com/path",
+      "https://slack.com/path#fragment",
+      "https://slack.com/path#",
+      "https://slack.com/path?",
+      "https://slack.com\\path",
+      ...(name === "OIDC_ISSUER" ? ["https://slack.com/not-the-token-issuer"] : []),
+    ]) {
+      withConfig(
+        {
+          publicUrl: "https://portal.example.com",
+          services: ["core", "portal"],
+          env: {
+            portal: {
+              OIDC_CLIENT_ID: "client",
+              OIDC_ALLOWED_EMAILS: "admin@example.com",
+              [name]: value,
+            },
+          },
+        },
+        ({ path }) => assert.throws(() => loadConfigAt(path), /must be an absolute HTTPS URL/),
+      );
+    }
+  }
+});
+
 test("apiUrl must be an http(s) origin URL; the trailing slash is stripped", () => {
-  withConfig({ apiUrl: "https://api.acme.example/" }, ({ path }) =>
+  withConfig({ apiUrl: "HTTPS://API.ACME.EXAMPLE:443/" }, ({ path }) =>
     assert.equal(loadConfigAt(path).config.apiUrl, "https://api.acme.example"),
   );
   withConfig({}, ({ path }) => assert.equal(loadConfigAt(path).config.apiUrl, undefined));
@@ -84,6 +394,12 @@ test("apiUrl must be an http(s) origin URL; the trailing slash is stripped", () 
     "ftp://api.acme.example",
     "https://api.acme.example/v1",
     "https://api.acme.example?x=1",
+    "https://api.acme.example?",
+    "https://api.acme.example#",
+    "https:///api.acme.example",
+    "https://api.acme.example\\",
+    "https://@api.acme.example",
+    "https://:@api.acme.example",
     "https://user:pw@api.acme.example",
     "https://api.acme.example.",
   ]) {
@@ -93,8 +409,27 @@ test("apiUrl must be an http(s) origin URL; the trailing slash is stripped", () 
   }
 });
 
+test("real harness public coordinates require HTTPS or loopback on every target", () => {
+  for (const coordinates of [
+    { publicUrl: "http://agent.acme.example" },
+    { publicUrl: "https://agent.acme.example", apiUrl: "http://api.agent.acme.example" },
+  ]) {
+    withConfig({ ...coordinates, env: { core: { HARNESS: "pi" } } }, ({ path }) =>
+      assert.throws(() => loadConfigAt(path), /HARNESS=pi requires an HTTPS publicUrl and apiUrl, or loopback origins/),
+    );
+  }
+  for (const coordinates of [
+    { publicUrl: "http://localhost:8080" },
+    { publicUrl: "http://127.0.0.2:8080", apiUrl: "http://[::1]:8788" },
+  ]) {
+    withConfig({ ...coordinates, env: { core: { HARNESS: "pi" } } }, ({ path }) =>
+      assert.doesNotThrow(() => loadConfigAt(path)),
+    );
+  }
+});
+
 test("publicUrl must be an http(s) origin URL on every target", () => {
-  withConfig({ publicUrl: "https://acme.example/" }, ({ path }) =>
+  withConfig({ publicUrl: "HTTPS://ACME.EXAMPLE:443/" }, ({ path }) =>
     assert.equal(loadConfigAt(path).config.publicUrl, "https://acme.example"),
   );
   for (const publicUrl of [
@@ -103,6 +438,12 @@ test("publicUrl must be an http(s) origin URL on every target", () => {
     "ftp://acme.example",
     "https://acme.example/subpath",
     "https://acme.example?x=1",
+    "https://acme.example?",
+    "https://acme.example#",
+    "https:///acme.example",
+    "https://acme.example\\",
+    "https://@acme.example",
+    "https://:@acme.example",
     "https://user:pw@acme.example",
     "https://acme.example.",
   ]) {
@@ -161,11 +502,21 @@ test("plugins: image is OPTIONAL (source plugins); env attaches to either; bad i
 });
 
 test("env (per-service) and imageOverrides validate by service name", () => {
-  withConfig({ env: { core: { PUBLIC_WEB_URL: "http://x" } }, imageOverrides: { core: "ghcr.io/x:1" } }, ({ path }) => {
-    const { config } = loadConfigAt(path);
-    assert.deepEqual(config.env.core, { PUBLIC_WEB_URL: "http://x" });
-    assert.equal(config.imageOverrides.core, "ghcr.io/x:1");
-  });
+  withConfig(
+    {
+      publicUrl: "http://example.com",
+      env: { core: { PUBLIC_WEB_URL: "HTTP://EXAMPLE.COM:80/" } },
+      imageOverrides: { core: "ghcr.io/x:1" },
+    },
+    ({ path }) => {
+      const { config } = loadConfigAt(path);
+      assert.deepEqual(config.env.core, { PUBLIC_WEB_URL: "http://example.com" });
+      assert.equal(config.imageOverrides.core, "ghcr.io/x:1");
+    },
+  );
+  withConfig({ env: { core: { PUBLIC_WEB_URL: "http://x" } } }, ({ path }) =>
+    assert.throws(() => loadConfigAt(path), /PUBLIC_WEB_URL must match publicUrl/),
+  );
   withConfig({ env: { nope: {} } }, ({ path }) => assert.throws(() => loadConfigAt(path), /unknown service/));
   withConfig({ env: { core: { S3_PREFIX: "core/" } } }, ({ path }) => {
     assert.equal(loadConfigAt(path).config.env.core?.S3_PREFIX, "core/");
@@ -181,12 +532,77 @@ test("listen ports are managed consistently across deployment targets", () => {
   });
 });
 
-test("the admin release version is managed by QM", () => {
+test("the admin release version comes from its image", () => {
   withConfig({ env: { admin: { QM_VERSION: "9.9.9" } } }, ({ path }) => {
-    assert.throws(() => loadConfigAt(path), /env\.admin\.QM_VERSION.*managed/);
+    assert.throws(() => loadConfigAt(path), /env\.admin\.QM_VERSION.*baked into the Admin image/);
   });
   withConfig({ secretEnv: { admin: { QM_VERSION: "QM_VERSION_SECRET" } } }, ({ path }) => {
-    assert.throws(() => loadConfigAt(path), /secretEnv\.admin\.QM_VERSION.*managed/);
+    assert.throws(() => loadConfigAt(path), /secretEnv\.admin\.QM_VERSION.*baked into the Admin image/);
+  });
+  withConfig(
+    {
+      target: "aws",
+      services: ["core", "admin"],
+      aws: {
+        accountId: "123456789012",
+        region: "us-west-2",
+        cluster: "acme",
+        deployRoleArn: "arn:aws:iam::123456789012:role/deploy",
+        secretsPrefix: "acme/",
+        imageLabel: "release",
+        networking: { cloudMapNamespace: "acme.internal" },
+        services: {
+          core: { ecrRepository: "core", ecsService: "acme-core", cpu: 512, memory: 1024 },
+          admin: {
+            ecrRepository: "admin",
+            ecsService: "acme-admin",
+            cpu: 512,
+            memory: 1024,
+            buildArgs: { QM_VERSION: "9.9.9" },
+          },
+        },
+      },
+    },
+    ({ path }) => {
+      assert.throws(() => loadConfigAt(path), /aws\.services\.admin\.buildArgs\.QM_VERSION.*reserved/);
+    },
+  );
+});
+
+test("retired browser updater config requires a drained workflow and revoked token", () => {
+  for (const name of [
+    "QM_UPDATE_GITHUB_REPOSITORY",
+    "QM_UPDATE_GITHUB_WORKFLOW",
+    "QM_UPDATE_GITHUB_REF",
+    "QM_UPDATE_GITHUB_TOKEN",
+    "QM_UPDATE_GITHUB_API_URL",
+  ] as const) {
+    withConfig({ env: { admin: { [name]: "retired" } } }, ({ path }) => {
+      assert.throws(
+        () => loadConfigAt(path),
+        new RegExp(
+          `env\\.admin\\.${name}.*retired browser updater.*drain every queued or running update job.*remove its workflows.*QM_UPDATE_GITHUB_\\* config.*QM_DEPLOY_ENV.*every resident QM_UPDATE_GITHUB_TOKEN.*FLY_SANDBOX_API_TOKEN.*FLY_API_TOKEN`,
+        ),
+      );
+    });
+  }
+  withConfig(
+    {
+      env: {
+        admin: {
+          QM_UPDATE_GITHUB_REPOSITORY: "yc-software/qm",
+          QM_UPDATE_GITHUB_WORKFLOW: ".github/workflows/custom-update.yaml",
+        },
+      },
+    },
+    ({ path }) =>
+      assert.throws(() => loadConfigAt(path), /drain every queued or running update job.*remove its workflows/),
+  );
+  withConfig({ secretEnv: { admin: { QM_UPDATE_GITHUB_TOKEN: "RETIRED_TOKEN" } } }, ({ path }) => {
+    assert.throws(
+      () => loadConfigAt(path),
+      /secretEnv\.admin\.QM_UPDATE_GITHUB_TOKEN.*retired browser updater.*QM_DEPLOY_ENV.*every resident QM_UPDATE_GITHUB_TOKEN.*FLY_SANDBOX_API_TOKEN.*FLY_API_TOKEN/,
+    );
   });
 });
 
@@ -212,7 +628,15 @@ test("model, skills, and the fly keys parse onto the config", () => {
     assert.deepEqual(config.skills, ["./skills/support"]);
   });
   withConfig(
-    { target: "fly", appPrefix: "qm", region: "sjc", flyOrg: "personal", imageFrom: "qm", deployAppPrefix: "qm-d" },
+    {
+      target: "fly",
+      appPrefix: "qm",
+      region: "sjc",
+      flyOrg: "personal",
+      imageFrom: "qm",
+      deployAppPrefix: "qm-d",
+      sandbox: { backend: "sprites", namePrefix: "qm-sandboxes" },
+    },
     ({ path }) => {
       const { config } = loadConfigAt(path);
       assert.equal(config.appPrefix, "qm");
@@ -230,6 +654,7 @@ test("custom portal issuers require an HTTPS JWKS URI on Fly", () => {
       target: "fly",
       services: ["core", "portal"],
       env: { portal: { OIDC_ISSUER: "https://auth.example.com" } },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
     },
     ({ path }) => assert.throws(() => loadConfigAt(path), /OIDC_JWKS_URI/),
   );
@@ -375,7 +800,7 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         },
         aws: aws(["core", "web-ui", "portal"]),
       },
-      error: /non-placeholder HTTPS URL/,
+      error: /absolute HTTPS URL/,
     },
     {
       label: "real harness over HTTP",
@@ -384,6 +809,17 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
         publicUrl: "http://agent.acme.example",
         services: ["core"],
         env: { core: { HARNESS: "pi" } },
+        aws: aws(["core"]),
+      },
+      error: /HARNESS=pi requires an HTTPS publicUrl/,
+    },
+    {
+      label: "virtual service real harness over HTTP",
+      config: {
+        target: "aws",
+        publicUrl: "http://agent.acme.example",
+        services: ["core", "slack"],
+        env: { slack: { HARNESS: "pi" } },
         aws: aws(["core"]),
       },
       error: /HARNESS=pi requires an HTTPS publicUrl/,
@@ -497,6 +933,39 @@ test("AWS config rejects public surfaces without the HTTPS portal and real harne
     ({ path }) => {
       assert.equal(loadConfigAt(path).config.env.portal?.OIDC_CLIENT_ID, undefined);
     },
+  );
+});
+
+test("AWS conditions cannot select a deployment provider that the renderer replaces", () => {
+  const aws = {
+    accountId: "123456789012",
+    region: "us-west-2",
+    cluster: "acme",
+    deployRoleArn: "arn:aws:iam::123456789012:role/deploy",
+    secretsPrefix: "acme/",
+    imageLabel: "release",
+    networking: { cloudMapNamespace: "acme.internal" },
+    services: { core: { ecrRepository: "core", ecsService: "acme-core", cpu: 512, memory: 1024 } },
+  };
+  withConfig(
+    {
+      target: "aws",
+      publicUrl: "https://acme.example.com",
+      services: ["core", "slack"],
+      aws,
+      env: { slack: { DEPLOY_PROVIDER: "fly" } },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /DEPLOY_PROVIDER must be "aws" or unset/),
+  );
+  withConfig(
+    {
+      target: "aws",
+      publicUrl: "https://acme.example.com",
+      services: ["core", "slack"],
+      aws,
+      env: { slack: { DEPLOY_PROVIDER: "fly" }, core: { DEPLOY_PROVIDER: "aws" } },
+    },
+    ({ path }) => assert.equal(effectiveCoreEnvironment(loadConfigAt(path).config).DEPLOY_PROVIDER?.trim(), "aws"),
   );
 });
 
@@ -729,187 +1198,156 @@ test("AWS rejects coordinates that its Terraform-derived resources cannot accept
   );
 });
 
-test("sandbox.app drives FLY_SANDBOX_APP_NAME and the digest-pinned FLY_BASE_IMAGE", () => {
+test("Fly Sprites config reaches core as a backend and name prefix without OCI fields", () => {
   withConfig(
-    {
-      sandbox: {
-        app: "acme-sandboxes",
-        image: "registry.fly.io/acme-sandboxes@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
-      },
-    },
+    { target: "fly", region: "sjc", flyOrg: "acme", sandbox: { backend: "sprites", namePrefix: "acme" } },
     ({ path }) => {
-      const { config } = loadConfigAt(path);
-      assert.deepEqual(config.sandbox, {
-        app: "acme-sandboxes",
-        image: "registry.fly.io/acme-sandboxes@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
-      });
-      assert.deepEqual(sandboxCoreEnv(config), {
-        env: {
-          FLY_SANDBOX_APP_NAME: "acme-sandboxes",
-          FLY_BASE_IMAGE:
-            "registry.fly.io/acme-sandboxes@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
-        },
+      assert.deepEqual(sandboxCoreEnv(loadConfigAt(path).config), {
+        env: { SANDBOX_BACKEND: "sprites", SPRITES_NAME_PREFIX: "acme" },
         missingSecrets: [],
       });
     },
   );
-});
-
-test("a sandbox.app with no pinned image fails closed instead of fabricating a mutable tag", () => {
-  withConfig({ sandbox: { app: "acme-sandboxes" } }, ({ path }) => {
-    const { config } = loadConfigAt(path);
-    assert.throws(() => sandboxCoreEnv(config), /no sandbox layer image is pinned.*qm sandbox publish/s);
-  });
-});
-
-test("a tag-pinned sandbox.image is refused: staleness compares image references", () => {
-  withConfig({ sandbox: { app: "acme-sandboxes", image: "registry.fly.io/shared-sandboxes:latest" } }, ({ path }) => {
-    const { config } = loadConfigAt(path);
-    assert.throws(() => sandboxCoreEnv(config), /must be pinned by digest/);
-  });
-});
-
-test("a mutable sandbox tag fails check, while an unpublished deployment is only pending", () => {
-  withConfig({ target: "fly", region: "sjc", flyOrg: "acme", sandbox: { app: "acme-sandboxes" } }, ({ path }) => {
-    const { config } = loadConfigAt(path);
-    assert.deepEqual(sandboxImagePinErrors(config), [], "check cannot demand a pin only `sandbox publish` can write");
-    assert.equal(sandboxPinPending(config), true);
-    assert.throws(
-      () => sandboxCoreEnv(config),
-      /no sandbox layer image is pinned/,
-      "rendering core still fails closed",
-    );
-  });
-  withConfig(
-    {
-      target: "fly",
-      region: "sjc",
-      flyOrg: "acme",
-      sandbox: { app: "acme-sandboxes", image: "registry.fly.io/acme-sandboxes:latest" },
-    },
-    ({ path }) => {
-      const { config } = loadConfigAt(path);
-      const errors = sandboxImagePinErrors(config);
-      assert.equal(errors.length, 1);
-      assert.equal(errors[0]!.clause, "config.v1");
-      assert.match(errors[0]!.message, /must be pinned by digest/);
-    },
-  );
-  withConfig(
-    {
-      target: "fly",
-      region: "sjc",
-      flyOrg: "acme",
-      sandbox: { app: "acme-sandboxes", image: `registry.fly.io/acme-sandboxes@sha256:${"1a".repeat(32)}` },
-    },
-    ({ path }) => {
-      assert.deepEqual(sandboxImagePinErrors(loadConfigAt(path).config), []);
-    },
-  );
-});
-
-test("sandbox.image requires sandbox.app and must be non-empty", () => {
-  withConfig(
-    {
-      sandbox: {
-        image:
-          "registry.fly.io/shared-sandboxes@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+  for (const target of [{}, { target: "fly", region: "sjc", flyOrg: "acme" }]) {
+    withConfig(
+      {
+        ...target,
+        sandbox: {
+          app: "legacy",
+          namePrefix: "new",
+          image: `registry.fly.io/legacy@sha256:${"a".repeat(64)}`,
+          baseImage: `ghcr.io/yc-software/qm-sandbox-base@sha256:${"b".repeat(64)}`,
+        },
       },
-    },
-    ({ path }) => {
-      assert.throws(() => loadConfigAt(path), /"sandbox\.image" requires "sandbox\.app"/);
-    },
-  );
-  withConfig({ sandbox: { app: "acme-sandboxes", image: "" } }, ({ path }) => {
-    assert.throws(() => loadConfigAt(path), /"sandbox\.image" must be a non-empty string/);
-  });
-});
-
-test("sandbox.env (literals) + sandbox.secretEnv (resolved) become FLY_RESIDENT_ENV_<KEY>", () => {
-  withConfig(
-    {
-      sandbox: {
-        app: "acme-sandboxes",
-        image: "registry.fly.io/acme-sandboxes@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
-        env: { TZ: "America/Los_Angeles" },
-        secretEnv: ["COMPANY_API_TOKEN"],
+      ({ path }) => {
+        const config = loadConfigAt(path).config;
+        assert.deepEqual(config.sandbox, { app: "legacy", namePrefix: "new" });
+        assert.deepEqual(sandboxCoreEnv(config).env, {
+          SANDBOX_BACKEND: "sprites",
+          SPRITES_NAME_PREFIX: "new",
+        });
       },
-    },
-    ({ path }) => {
-      const { config } = loadConfigAt(path);
-      const resolved = sandboxCoreEnv(config, (n) => (n === "COMPANY_API_TOKEN" ? "sek-ret" : undefined));
-      assert.equal(resolved.env.FLY_RESIDENT_ENV_TZ, "America/Los_Angeles");
-      assert.equal(resolved.env.FLY_RESIDENT_ENV_COMPANY_API_TOKEN, "sek-ret");
-      assert.deepEqual(resolved.missingSecrets, []);
-      const missing = sandboxCoreEnv(config);
-      assert.deepEqual(missing.missingSecrets, ["COMPANY_API_TOKEN"]);
-      assert.equal(missing.env.FLY_RESIDENT_ENV_COMPANY_API_TOKEN, undefined);
-      assert.equal(missing.env.FLY_RESIDENT_ENV_TZ, "America/Los_Angeles");
-    },
-  );
-});
-
-test("no sandbox block → no injected env, lenient undefined app", () => {
-  withConfig({}, ({ path }) => {
-    const { config } = loadConfigAt(path);
-    assert.equal(config.sandbox, undefined);
-    assert.deepEqual(sandboxCoreEnv(config), { env: {}, missingSecrets: [] });
-  });
-});
-
-test("sandbox shape errors: object, app non-empty string, env string-map, secretEnv valid names", () => {
-  const cases: Array<{ sandbox: unknown; rx: RegExp }> = [
-    { sandbox: "x", rx: /"sandbox" must be an object/ },
-    { sandbox: ["x"], rx: /"sandbox" must be an object/ },
-    { sandbox: { app: "" }, rx: /"sandbox.app" must be a non-empty string/ },
-    { sandbox: { app: 5 }, rx: /"sandbox.app" must be a non-empty string/ },
-    { sandbox: { env: { TZ: 5 } }, rx: /"sandbox.env.TZ" must be a string/ },
-    { sandbox: { env: { "1BAD": "x" } }, rx: /"sandbox.env" key .* is not a valid env var name/ },
-    { sandbox: { secretEnv: "X" }, rx: /"sandbox.secretEnv" must be an array of strings/ },
-    { sandbox: { secretEnv: ["1BAD"] }, rx: /not a valid env var name/ },
-    {
-      sandbox: { backend: "k8s", app: "acme-sandboxes" },
-      rx: /"sandbox.backend" must be "local".*"sprites".*or "aws"/,
-    },
-    {
-      sandbox: { backend: "fly", app: "acme-sandboxes" },
-      rx: /"sandbox.backend" must be "local".*"sprites".*or "aws"/,
-    },
-    { sandbox: { backend: "sprites" }, rx: /"sandbox.backend": "sprites" requires "sandbox.app"/ },
-    {
-      sandbox: { backend: "aws", app: "acme-sandboxes" },
-      rx: /"sandbox.backend": "aws" \(Lambda MicroVM sandboxes\) requires target "aws"/,
-    },
-  ];
-  for (const { sandbox, rx } of cases) {
-    withConfig({ sandbox }, ({ path }) =>
-      assert.throws(() => loadConfigAt(path), rx, `expected ${JSON.stringify(sandbox)} rejected`),
     );
   }
 });
 
-test("docker accepts an explicit local sandbox image without Fly coordinates", () => {
+test("Docker defaults to the local sandbox and accepts only its runnable image", () => {
+  withConfig({}, ({ path }) => {
+    assert.deepEqual(sandboxCoreEnv(loadConfigAt(path).config), {
+      env: { SANDBOX_BACKEND: "local" },
+      missingSecrets: [],
+    });
+  });
   withConfig({ sandbox: { backend: "local", image: "qm-sandbox-local:latest" } }, ({ path }) => {
-    const { config } = loadConfigAt(path);
-    assert.deepEqual(sandboxCoreEnv(config), {
+    assert.deepEqual(sandboxCoreEnv(loadConfigAt(path).config), {
       env: { SANDBOX_BACKEND: "local", LOCAL_SANDBOX_IMAGE: "qm-sandbox-local:latest" },
       missingSecrets: [],
     });
-    assert.equal(sandboxPinPending(config), false);
-    assert.deepEqual(sandboxImagePinErrors(config), []);
   });
 });
 
-test("local sandbox config is docker-only and rejects unused Fly settings", () => {
-  withConfig({ target: "fly", sandbox: { backend: "local" } }, ({ path }) => {
-    assert.throws(() => loadConfigAt(path), /"sandbox.backend": "local" requires target "docker"/);
+test("Sprites name prefixes are explicit and cannot select OCI images", () => {
+  withConfig(
+    {
+      target: "fly",
+      region: "sjc",
+      flyOrg: "acme",
+      sandbox: { backend: "sprites", namePrefix: "acme", image: "example.invalid/sandbox:latest" },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /sprites.*cannot consume/i),
+  );
+  withConfig({ target: "fly", region: "sjc", flyOrg: "acme", sandbox: { backend: "sprites" } }, ({ path }) => {
+    assert.deepEqual(sandboxCoreEnv(loadConfigAt(path).config).env, { SANDBOX_BACKEND: "sprites" });
   });
-  withConfig({ sandbox: { backend: "local", app: "acme-sandboxes" } }, ({ path }) => {
-    assert.throws(() => loadConfigAt(path), /"sandbox.backend": "local" ignores "sandbox.app"/);
-  });
+  withConfig(
+    { target: "fly", region: "sjc", flyOrg: "acme", sandbox: { backend: "sprites", namePrefix: " acme " } },
+    ({ path }) => assert.equal(loadConfigAt(path).config.sandbox?.namePrefix, "acme"),
+  );
+  const longPrefix = "a".repeat(256);
+  withConfig(
+    { target: "fly", region: "sjc", flyOrg: "acme", sandbox: { backend: "sprites", namePrefix: longPrefix } },
+    ({ path }) => assert.equal(loadConfigAt(path).config.sandbox?.namePrefix, longPrefix),
+  );
+  for (const namePrefix of ["", "UPPER", "has_space", "-leading", "trailing-"]) {
+    withConfig(
+      { target: "fly", region: "sjc", flyOrg: "acme", sandbox: { backend: "sprites", namePrefix } },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /sandbox.namePrefix.*lowercase letters, digits/),
+    );
+  }
+  withConfig(
+    {
+      target: "fly",
+      region: "sjc",
+      flyOrg: "acme",
+      sandbox: {
+        backend: "sprites",
+        app: "legacy",
+        namePrefix: "new",
+        image: `registry.fly.io/legacy@sha256:${"a".repeat(64)}`,
+        baseImage: `ghcr.io/yc-software/qm-sandbox-base@sha256:${"b".repeat(64)}`,
+      },
+    },
+    ({ path }) => {
+      assert.deepEqual(loadConfigAt(path).config.sandbox, {
+        backend: "sprites",
+        app: "legacy",
+        namePrefix: "new",
+      });
+    },
+  );
 });
 
-test("aws target makes the sandbox substrate explicit: backend required with a sandbox block, sprites needs app, aws forbids fly-image settings", () => {
+test("v0.1.6 sandbox shapes preserve the historical Sprite name prefix", () => {
+  const image = `registry.fly.io/acme-sandboxes@sha256:${"a".repeat(64)}`;
+  const baseImage = `ghcr.io/yc-software/qm-sandbox-base@sha256:${"b".repeat(64)}`;
+  const legacySandbox = {
+    app: "acme-sandboxes",
+    image,
+    baseImage,
+  };
+  withConfig(
+    {
+      target: "fly",
+      region: "sjc",
+      flyOrg: "personal",
+      appPrefix: "qm",
+      deployAppPrefix: "qm-d",
+      sandbox: legacySandbox,
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.deepEqual(config.sandbox, { app: "acme-sandboxes" });
+      assert.deepEqual(sandboxCoreEnv(config).env, { SANDBOX_BACKEND: "sprites" });
+    },
+  );
+  withConfig(
+    {
+      target: "fly",
+      region: "sjc",
+      flyOrg: "personal",
+      sandbox: { backend: "sprites", ...legacySandbox },
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.deepEqual(config.sandbox, { backend: "sprites", app: "acme-sandboxes" });
+      assert.deepEqual(sandboxCoreEnv(config).env, { SANDBOX_BACKEND: "sprites" });
+    },
+  );
+  withConfig({ target: "fly", region: "sjc", flyOrg: "personal" }, ({ path }) => {
+    assert.deepEqual(sandboxCoreEnv(loadConfigAt(path).config).env, { SANDBOX_BACKEND: "sprites" });
+  });
+  withConfig(
+    {
+      sandbox: legacySandbox,
+      env: { core: { SANDBOX_BACKEND: "sprites" } },
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.deepEqual(config.sandbox, { backend: "sprites", app: "acme-sandboxes" });
+      assert.equal(config.env.core?.SANDBOX_BACKEND, undefined);
+      assert.deepEqual(sandboxCoreEnv(config).env, { SANDBOX_BACKEND: "sprites" });
+    },
+  );
   const aws = {
     accountId: "123456789012",
     region: "us-west-2",
@@ -920,40 +1358,874 @@ test("aws target makes the sandbox substrate explicit: backend required with a s
     networking: { cloudMapNamespace: "acme.internal" },
     services: { core: { ecrRepository: "core", ecsService: "acme-core", cpu: 512, memory: 1024 } },
   };
-  withConfig({ target: "aws", aws, sandbox: { app: "acme-sandboxes" } }, ({ path }) => {
+  withConfig({ target: "aws", aws }, ({ path }) => {
+    assert.deepEqual(sandboxCoreEnv(loadConfigAt(path).config).env, { SANDBOX_BACKEND: "aws" });
+  });
+  withConfig({ target: "aws", aws, sandbox: { backend: "sprites", ...legacySandbox } }, ({ path }) => {
+    const config = loadConfigAt(path).config;
+    assert.deepEqual(config.sandbox, { backend: "sprites", app: "acme-sandboxes" });
+    assert.deepEqual(sandboxCoreEnv(config).env, { SANDBOX_BACKEND: "sprites" });
+  });
+  withConfig({ target: "aws", aws, sandbox: legacySandbox }, ({ path }) => {
     assert.throws(() => loadConfigAt(path), /target "aws" requires an explicit "sandbox.backend"/);
   });
-  withConfig({ target: "aws", aws, sandbox: { backend: "sprites", app: "acme-sandboxes" } }, ({ path }) => {
-    assert.equal(loadConfigAt(path).config.sandbox?.backend, "sprites");
+});
+
+test("legacy sandbox fields either migrate safely or fail with an actionable boundary", () => {
+  const digestBase = `ghcr.io/yc-software/qm-sandbox-base@sha256:${"b".repeat(64)}`;
+  const aws = {
+    accountId: "123456789012",
+    region: "us-west-2",
+    cluster: "acme",
+    deployRoleArn: "arn:aws:iam::123456789012:role/deploy",
+    secretsPrefix: "acme/",
+    imageLabel: "release",
+    networking: { cloudMapNamespace: "acme.internal" },
+    services: { core: { ecrRepository: "core", ecsService: "acme-core", cpu: 512, memory: 1024 } },
+  };
+  for (const sandbox of [
+    { env: {} },
+    { secretEnv: [] },
+    { baseImage: digestBase },
+    { env: {}, secretEnv: [], baseImage: digestBase },
+  ]) {
+    withConfig({ sandbox }, ({ path }) => {
+      assert.equal(loadConfigAt(path).config.sandbox, undefined);
+    });
+  }
+  withConfig(
+    { target: "fly", region: "sjc", flyOrg: "personal", sandbox: { backend: "sprites", env: {}, secretEnv: [] } },
+    ({ path }) => {
+      assert.deepEqual(loadConfigAt(path).config.sandbox, { backend: "sprites" });
+    },
+  );
+  withConfig({ target: "aws", aws, sandbox: { env: {}, secretEnv: [], baseImage: digestBase } }, ({ path }) => {
+    assert.equal(loadConfigAt(path).config.sandbox, undefined);
   });
-  withConfig({ target: "aws", aws, sandbox: { backend: "aws" } }, ({ path }) => {
-    assert.equal(loadConfigAt(path).config.sandbox?.backend, "aws");
+  withConfig({ sandbox: { baseImage: "base" } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /baseImage.*inert v0.1.6 metadata.*sandbox.app/);
   });
-  withConfig({ target: "aws", aws, sandbox: { backend: "sprites", app: "acme-sandboxes" } }, ({ path }) => {
-    assert.equal(loadConfigAt(path).config.sandbox?.backend, "sprites");
-  });
-  withConfig({ target: "aws", aws, sandbox: { backend: "aws", app: "acme-sandboxes" } }, ({ path }) => {
+  withConfig({ sandbox: { app: "legacy", env: { TZ: "UTC" } } }, ({ path }) => {
     assert.throws(
       () => loadConfigAt(path),
-      /"sandbox.backend": "aws" runs Lambda MicroVM sandboxes, which ignore "sandbox.app"/,
+      /sandbox.env from v0.1.6 cannot be migrated automatically.*stage each value.*verify the replacement.*remove sandbox.env.*roll the deployment.*confirm no live references/,
     );
+  });
+  const legacySecretEnv = { backend: "sprites", app: "legacy", secretEnv: ["TOKEN", "COMPANY_TOKEN"] };
+  withConfig({ sandbox: legacySecretEnv }, ({ path }) => {
+    assert.throws(
+      () => loadConfigAt(path),
+      /sandbox.secretEnv from v0.1.6 cannot be migrated automatically \(TOKEN, COMPANY_TOKEN\).*connector, keychain, or tool path.*verify the replacement.*remove sandbox.secretEnv.*roll the deployment.*confirm no live references.*delete \.env or environment entries TOKEN, COMPANY_TOKEN/,
+    );
+  });
+  withConfig({ target: "fly", region: "sjc", flyOrg: "personal", sandbox: legacySecretEnv }, ({ path }) => {
+    assert.throws(
+      () => loadConfigAt(path),
+      /remove sandbox.secretEnv.*roll the deployment.*confirm no live references.*delete Fly secrets FLY_RESIDENT_ENV_TOKEN, FLY_RESIDENT_ENV_COMPANY_TOKEN/,
+    );
+  });
+  withConfig({ target: "aws", aws, sandbox: legacySecretEnv }, ({ path }) => {
+    assert.throws(
+      () => loadConfigAt(path),
+      /remove sandbox.secretEnv.*roll the deployment.*confirm no live references.*delete AWS Secrets Manager entries acme\/TOKEN, acme\/COMPANY_TOKEN/,
+    );
+  });
+  withConfig({ sandbox: { app: "legacy", secretEnv: ["not-valid"] } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /sandbox.secretEnv.*not a valid env var name/);
+  });
+});
+
+test("legacy Sprites environment selection preserves an explicit namespace byte-for-byte", () => {
+  const prefix = `legacy-${"a".repeat(96)}`;
+  withConfig(
+    {
+      target: "fly",
+      region: "sjc",
+      flyOrg: "personal",
+      sandbox: {
+        app: "retired-app",
+        image: `registry.fly.io/retired-app@sha256:${"a".repeat(64)}`,
+        baseImage: `ghcr.io/yc-software/qm-sandbox-base@sha256:${"b".repeat(64)}`,
+      },
+      env: { core: { SANDBOX_BACKEND: "sprites", SPRITES_NAME_PREFIX: prefix } },
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.deepEqual(config.sandbox, { backend: "sprites", app: "retired-app", namePrefix: prefix });
+      assert.deepEqual(sandboxCoreEnv(config).env, {
+        SANDBOX_BACKEND: "sprites",
+        SPRITES_NAME_PREFIX: prefix,
+      });
+      assert.equal(config.env.core?.SANDBOX_BACKEND, undefined);
+      assert.equal(config.env.core?.SPRITES_NAME_PREFIX, undefined);
+    },
+  );
+  withConfig(
+    {
+      target: "fly",
+      region: "sjc",
+      flyOrg: "personal",
+      sandbox: { app: "retired-app" },
+      env: { core: { SANDBOX_BACKEND: "sprites", SPRITES_NAME_PREFIX: "" } },
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.deepEqual(config.sandbox, { backend: "sprites", app: "retired-app" });
+      assert.deepEqual(sandboxCoreEnv(config).env, { SANDBOX_BACKEND: "sprites" });
+      assert.equal(config.env.core?.SPRITES_NAME_PREFIX, undefined);
+    },
+  );
+  for (const configured of [" spaced ", "UPPER", "bad_value"]) {
+    withConfig(
+      {
+        target: "fly",
+        region: "sjc",
+        flyOrg: "personal",
+        env: { core: { SANDBOX_BACKEND: "sprites", SPRITES_NAME_PREFIX: configured } },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /env.core.SPRITES_NAME_PREFIX.*lowercase letters/),
+    );
+  }
+  withConfig(
+    {
+      target: "fly",
+      region: "sjc",
+      flyOrg: "personal",
+      sandbox: { backend: "sprites", namePrefix: "new" },
+      env: { core: { SPRITES_NAME_PREFIX: "old" } },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /SPRITES_NAME_PREFIX conflicts with sandbox.namePrefix/),
+  );
+});
+
+test("Porter and smolmachines remain valid runtime sandbox selections", () => {
+  const legacySandbox = {
+    backend: "sprites",
+    app: "retired-app",
+    image: `registry.fly.io/retired-app@sha256:${"a".repeat(64)}`,
+    baseImage: `ghcr.io/yc-software/qm-sandbox-base@sha256:${"b".repeat(64)}`,
+  };
+  const aws = {
+    accountId: "123456789012",
+    region: "us-west-2",
+    cluster: "acme",
+    deployRoleArn: "arn:aws:iam::123456789012:role/deploy",
+    secretsPrefix: "acme/",
+    imageLabel: "release",
+    networking: { cloudMapNamespace: "acme.internal" },
+    services: { core: { ecrRepository: "core", ecsService: "acme-core", cpu: 512, memory: 1024 } },
+  };
+  for (const backend of ["porter", "smolmachines"] as const) {
+    for (const target of [
+      { sandbox: legacySandbox },
+      { target: "fly", region: "sjc", flyOrg: "personal", sandbox: legacySandbox },
+      { target: "aws", aws, sandbox: legacySandbox },
+    ]) {
+      withConfig({ ...target, env: { core: { SANDBOX_BACKEND: backend, SPRITES_NAME_PREFIX: "" } } }, ({ path }) => {
+        const config = loadConfigAt(path).config;
+        assert.equal(config.env.core?.SANDBOX_BACKEND, backend);
+        assert.equal(config.sandbox, undefined);
+        assert.deepEqual(sandboxCoreEnv(config).env, { SANDBOX_BACKEND: backend });
+      });
+    }
+    withConfig(
+      {
+        sandbox: { image: `registry.fly.io/retired-app@sha256:${"a".repeat(64)}` },
+        env: { core: { SANDBOX_BACKEND: backend } },
+      },
+      ({ path }) => {
+        const config = loadConfigAt(path).config;
+        assert.equal(config.sandbox, undefined);
+        assert.deepEqual(sandboxCoreEnv(config).env, { SANDBOX_BACKEND: backend });
+      },
+    );
+  }
+  withConfig({ sandbox: { backend: "local" }, env: { core: { SANDBOX_BACKEND: "porter" } } }, ({ path }) =>
+    assert.throws(() => loadConfigAt(path), /SANDBOX_BACKEND conflicts with the sandbox block/),
+  );
+  withConfig(
+    {
+      sandbox: { backend: "sprites", app: "legacy", namePrefix: "current" },
+      env: { core: { SANDBOX_BACKEND: "smolmachines" } },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /SANDBOX_BACKEND conflicts with the sandbox block/),
+  );
+});
+
+test("v0.1.6 local and AWS environment selections normalize into the sandbox block", () => {
+  withConfig(
+    {
+      sandbox: {
+        app: "retired-app",
+        image: `registry.fly.io/retired-app@sha256:${"a".repeat(64)}`,
+        baseImage: `ghcr.io/yc-software/qm-sandbox-base@sha256:${"b".repeat(64)}`,
+      },
+      env: { core: { SANDBOX_BACKEND: "local" } },
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.deepEqual(config.sandbox, { backend: "local" });
+      assert.deepEqual(sandboxCoreEnv(config).env, { SANDBOX_BACKEND: "local" });
+    },
+  );
+  const aws = {
+    accountId: "123456789012",
+    region: "us-west-2",
+    cluster: "acme",
+    deployRoleArn: "arn:aws:iam::123456789012:role/deploy",
+    secretsPrefix: "acme/",
+    imageLabel: "release",
+    networking: { cloudMapNamespace: "acme.internal" },
+    services: { core: { ecrRepository: "core", ecsService: "acme-core", cpu: 512, memory: 1024 } },
+  };
+  withConfig({ target: "aws", aws, env: { core: { SANDBOX_BACKEND: "aws" } } }, ({ path }) => {
+    const config = loadConfigAt(path).config;
+    assert.deepEqual(config.sandbox, { backend: "aws" });
+    assert.deepEqual(sandboxCoreEnv(config).env, { SANDBOX_BACKEND: "aws" });
+  });
+  withConfig(
+    { target: "fly", region: "sjc", flyOrg: "personal", env: { core: { SANDBOX_BACKEND: "local" } } },
+    ({ path }) => {
+      assert.throws(() => loadConfigAt(path), /sandbox.backend.*local.*requires target "docker"/);
+    },
+  );
+  withConfig({ env: { core: { SANDBOX_BACKEND: "aws" } } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /sandbox.backend.*aws.*requires target "aws"/);
+  });
+});
+
+test("AWS distinguishes Sprites from Lambda MicroVM sandbox coordinates", () => {
+  const aws = {
+    accountId: "123456789012",
+    region: "us-west-2",
+    cluster: "acme",
+    deployRoleArn: "arn:aws:iam::123456789012:role/deploy",
+    secretsPrefix: "acme/",
+    imageLabel: "release",
+    networking: { cloudMapNamespace: "acme.internal" },
+    services: { core: { ecrRepository: "core", ecsService: "acme-core", cpu: 512, memory: 1024 } },
+  };
+  withConfig(
+    { target: "aws", aws, sandbox: { backend: "sprites", namePrefix: "acme" }, env: { core: {} } },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.deepEqual(sandboxCoreEnv(config).env, {
+        SANDBOX_BACKEND: "sprites",
+        SPRITES_NAME_PREFIX: "acme",
+      });
+    },
+  );
+  withConfig({ target: "aws", aws, sandbox: { backend: "aws" } }, ({ path }) => {
+    assert.equal(sandboxCoreEnv(loadConfigAt(path).config).env.SANDBOX_BACKEND, "aws");
   });
   withConfig(
     {
       target: "aws",
       aws,
-      sandbox: { backend: "aws", image: `registry.fly.io/acme-sandboxes@sha256:${"a".repeat(64)}` },
+      sandbox: { backend: "sprites", namePrefix: "acme" },
+      env: { core: { AWS_DEPLOY_IMAGE: "" } },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /deployment publisher MicroVM image/),
+  );
+});
+
+test("sandbox runtime environment coordinates reject invalid or secret overrides", () => {
+  for (const name of ["LOCAL_SANDBOX_IMAGE", "AWS_SANDBOX_REGION"]) {
+    withConfig({ env: { core: { [name]: "spoofed" } } }, ({ path }) => {
+      assert.throws(() => loadConfigAt(path), new RegExp(`${name}.*derived.*cannot be overridden`));
+    });
+  }
+  withConfig({ env: { core: { SANDBOX_BACKEND: "invalid" } } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /SANDBOX_BACKEND must be one of/);
+  });
+  for (const name of ["SANDBOX_BACKEND", "SPRITES_NAME_PREFIX"]) {
+    withConfig({ secretEnv: { core: { [name]: "SECRET_NAME" } } }, ({ path }) => {
+      assert.throws(() => loadConfigAt(path), new RegExp(`${name}.*non-secret`));
+    });
+  }
+});
+
+test("virtual services cannot own core sandbox topology across deployment targets", () => {
+  const aws = {
+    accountId: "123456789012",
+    region: "us-west-2",
+    cluster: "acme",
+    deployRoleArn: "arn:aws:iam::123456789012:role/deploy",
+    secretsPrefix: "acme/",
+    imageLabel: "release",
+    networking: { cloudMapNamespace: "acme.internal" },
+    services: { core: { ecrRepository: "core", ecsService: "acme-core", cpu: 512, memory: 1024 } },
+  };
+  const targets = [
+    {},
+    { target: "fly", region: "sjc", flyOrg: "personal", sandbox: { backend: "sprites", namePrefix: "acme" } },
+    { target: "aws", publicUrl: "https://acme.example.com", aws },
+  ];
+  for (const target of targets) {
+    for (const source of ["env", "secretEnv"] as const) {
+      for (const [name, value] of [
+        ["SANDBOX_BACKEND", "sprites"],
+        ["SANDBOX_SECONDARY_BACKEND", "porter"],
+        ["SPRITES_NAME_PREFIX", "acme"],
+      ] as const) {
+        withConfig({ ...target, services: ["core", "slack"], [source]: { slack: { [name]: value } } }, ({ path }) =>
+          assert.throws(() => loadConfigAt(path), /controls the core sandbox/),
+        );
+      }
+    }
+  }
+  for (const source of ["env", "secretEnv"] as const) {
+    for (const name of ["AWS_DEPLOY_APPS_DOMAIN", "DEPLOY_APPS_DOMAIN", "PORTER_DEPLOY_APPS_DOMAIN"]) {
+      withConfig(
+        {
+          services: ["core", "slack"],
+          [source]: { slack: { [name]: source === "env" ? "apps.example.com" : "STORE_NAME" } },
+        },
+        ({ path }) => assert.throws(() => loadConfigAt(path), /controls deployment routing/),
+      );
+    }
+  }
+});
+
+test("virtual services cannot override target-managed core runtime coordinates", () => {
+  for (const source of ["env", "secretEnv"] as const) {
+    for (const name of [
+      "PORT",
+      "LOCAL_SANDBOX_IMAGE",
+      "AWS_SANDBOX_REGION",
+      "AWS_SANDBOX_IMAGE",
+      "AWS_SANDBOX_IMAGE_VERSION",
+      "AWS_SANDBOX_EXEC_ROLE_ARN",
+      "AWS_SANDBOX_S3_BUCKET",
+    ]) {
+      withConfig({ services: ["core", "slack"], [source]: { slack: { [name]: "ATTACKER_VALUE" } } }, ({ path }) =>
+        assert.throws(() => loadConfigAt(path), /managed by the deployment target|derived from the sandbox/),
+      );
+    }
+  }
+});
+
+test("sandbox secondary backend uses the core runtime selection rules", () => {
+  withConfig({ env: { core: { SANDBOX_SECONDARY_BACKEND: "invalid" } } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /SANDBOX_SECONDARY_BACKEND must be one of/);
+  });
+  withConfig({ env: { core: { SANDBOX_SECONDARY_BACKEND: "local" } } }, ({ path }) => {
+    assert.throws(() => loadConfigAt(path), /SANDBOX_SECONDARY_BACKEND must differ/);
+  });
+  withConfig({ env: { core: { SANDBOX_SECONDARY_BACKEND: "porter" } } }, ({ path }) => {
+    assert.equal(loadConfigAt(path).config.env.core?.SANDBOX_SECONDARY_BACKEND, "porter");
+  });
+});
+
+test("value-inspected secret selectors must be configured as non-secret environment values", () => {
+  for (const { service, name } of secretConditionSelectors().filter(
+    (selector) => selector.mode === "value-inspected",
+  )) {
+    withConfig(
+      {
+        services: ["core", "portal", "auth", "slack"],
+        secretEnv: { [service]: { [name]: "SHARED_STORE_NAME" } },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /non-secret/),
+    );
+  }
+  withConfig({ secretEnv: { core: { UNRELATED_DESTINATION: "MODEL_PROVIDER" } } }, ({ path }) => {
+    assert.equal(loadConfigAt(path).config.secretEnv?.core?.UNRELATED_DESTINATION, "MODEL_PROVIDER");
+  });
+  for (const [service, name] of [
+    ["auth", "AUTH_ALLOWED_EMAIL_DOMAIN"],
+    ["core", "AWS_DEPLOY_APPS_DOMAIN"],
+    ["core", "DEPLOY_APPS_DOMAIN"],
+    ["slack", "AWS_DEPLOY_APPS_DOMAIN"],
+    ["slack", "DEPLOY_APPS_DOMAIN"],
+    ["slack", "PORTER_DEPLOY_APPS_DOMAIN"],
+  ] as const) {
+    withConfig(
+      { services: ["core", "portal", "auth", "slack"], secretEnv: { [service]: { [name]: "STORE_NAME" } } },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /non-secret environment value|controls deployment routing/),
+    );
+  }
+});
+
+test("deployment apps domain follows the core runtime provider precedence", () => {
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: {
+        core: {
+          AWS_DEPLOY_APPS_DOMAIN: "apps.aws.portal.example.com",
+          PORTER_DEPLOY_APPS_DOMAIN: "apps.porter.example.com",
+          DEPLOY_APPS_DOMAIN: "Apps.Common.Portal.Example.Com.",
+        },
+      },
+    },
+    ({ path }) => assert.equal(effectiveDeployAppsDomain(loadConfigAt(path).config), "apps.common.portal.example.com"),
+  );
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: { core: { AWS_DEPLOY_APPS_DOMAIN: "apps.aws.portal.example.com" } },
     },
     ({ path }) => {
-      assert.throws(
-        () => loadConfigAt(path),
-        /"sandbox.backend": "aws" runs Lambda MicroVM sandboxes, which ignore "sandbox.image"/,
-      );
+      assert.equal(effectiveDeployAppsDomain(loadConfigAt(path).config), "apps.aws.portal.example.com");
     },
   );
-  withConfig({ target: "aws", aws }, ({ path }) => {
-    assert.equal(loadConfigAt(path).config.sandbox, undefined);
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: {
+        core: {
+          DEPLOY_PROVIDER: "porter",
+          AWS_DEPLOY_APPS_DOMAIN: "apps.aws.portal.example.com",
+        },
+      },
+    },
+    ({ path }) => assert.equal(effectiveDeployAppsDomain(loadConfigAt(path).config), "apps.aws.portal.example.com"),
+  );
+  withConfig({ env: { core: { PORTER_DEPLOY_APPS_DOMAIN: "apps.porter.example.com" } } }, ({ path }) => {
+    assert.equal(effectiveDeployAppsDomain(loadConfigAt(path).config), undefined);
   });
+});
+
+test("gated deployment apps domains require the portal service", () => {
+  for (const name of ["DEPLOY_APPS_DOMAIN", "AWS_DEPLOY_APPS_DOMAIN"] as const) {
+    withConfig({ env: { core: { [name]: "apps.example.com" } } }, ({ path }) => {
+      assert.throws(() => loadConfigAt(path), /gated deployment apps domain requires the portal service/);
+    });
+  }
+  withConfig({ env: { core: { PORTER_DEPLOY_APPS_DOMAIN: "apps.porter.example.com" } } }, ({ path }) => {
+    assert.equal(effectiveDeployAppsDomain(loadConfigAt(path).config), undefined);
+  });
+});
+
+test("deployment apps domains are canonical controlled DNS names", () => {
+  for (const name of ["DEPLOY_APPS_DOMAIN", "AWS_DEPLOY_APPS_DOMAIN"] as const) {
+    withConfig(
+      {
+        publicUrl: "https://portal.example.com",
+        services: ["core", "portal"],
+        env: { core: { [name]: "Apps.Portal.Example.Com." } },
+      },
+      ({ path }) => {
+        const config = loadConfigAt(path).config;
+        assert.equal(config.env.core?.[name], "apps.portal.example.com");
+        assert.equal(effectiveDeployAppsDomain(config), "apps.portal.example.com");
+      },
+    );
+    for (const value of [
+      "https://apps.example.com",
+      "apps.example.com:443",
+      "apps.example.com/path",
+      "*.example.com",
+      "single-label",
+      "apps..example.com",
+      "apps.fly.dev",
+    ]) {
+      withConfig({ env: { core: { [name]: value } } }, ({ path }) =>
+        assert.throws(() => loadConfigAt(path), /bare DNS name|shared platform domain/),
+      );
+    }
+  }
+  const boundary = ["a".repeat(63), "b".repeat(43), "portal", "example", "com"].join(".");
+  const oversized = ["a".repeat(63), "b".repeat(44), "portal", "example", "com"].join(".");
+  assert.equal(boundary.length, 126);
+  assert.equal(oversized.length, 127);
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: { core: { DEPLOY_APPS_DOMAIN: boundary } },
+    },
+    ({ path }) => assert.equal(effectiveDeployAppsDomain(loadConfigAt(path).config), boundary),
+  );
+  withConfig({ env: { core: { DEPLOY_APPS_DOMAIN: oversized } } }, ({ path }) =>
+    assert.throws(() => loadConfigAt(path), /bare DNS name/),
+  );
+});
+
+test("Porter direct deployment domains are canonical bounded DNS names", () => {
+  const boundary = ["a".repeat(63), "b".repeat(63), "c".repeat(61)].join(".");
+  const oversized = ["a".repeat(63), "b".repeat(63), "c".repeat(62)].join(".");
+  assert.equal(boundary.length, 189);
+  assert.equal(oversized.length, 190);
+  for (const value of [
+    "",
+    " ",
+    " apps.example.com",
+    "apps.example.com ",
+    "https://apps.example.com",
+    "apps.example.com/path",
+    "*.apps.example.com",
+    "apps.example.com:443",
+    "apps.example.com\0",
+    "127.0.0.1",
+    "apps.127.0.0.1",
+    oversized,
+  ]) {
+    withConfig({ env: { core: { PORTER_DEPLOY_APPS_DOMAIN: value } } }, ({ path }) =>
+      assert.throws(
+        () => loadConfigAt(path),
+        /PORTER_DEPLOY_APPS_DOMAIN must be a bare DNS name|configuration must not contain NUL bytes/,
+      ),
+    );
+  }
+  for (const [value, expected] of [
+    ["APPS.DIRECT.EXAMPLE.COM.", "apps.direct.example.com"],
+    ["team.onporter.run", "team.onporter.run"],
+    [boundary, boundary],
+  ]) {
+    withConfig({ env: { core: { PORTER_DEPLOY_APPS_DOMAIN: value } } }, ({ path }) =>
+      assert.equal(loadConfigAt(path).config.env.core?.PORTER_DEPLOY_APPS_DOMAIN, expected),
+    );
+  }
+});
+
+test("Porter routing cannot ambiguously select gated and direct domains", () => {
+  withConfig(
+    {
+      env: {
+        core: {
+          DEPLOY_PROVIDER: "porter",
+          AWS_DEPLOY_APPS_DOMAIN: "apps.gated.example.com",
+          PORTER_DEPLOY_APPS_DOMAIN: "apps.direct.example.com",
+        },
+      },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /are ambiguous when DEPLOY_PROVIDER is porter/),
+  );
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: {
+        core: {
+          DEPLOY_PROVIDER: "porter",
+          DEPLOY_APPS_DOMAIN: "apps.portal.example.com",
+          PORTER_DEPLOY_APPS_DOMAIN: "apps.direct.example.com",
+        },
+      },
+    },
+    ({ path }) => assert.equal(effectiveDeployAppsDomain(loadConfigAt(path).config), "apps.portal.example.com"),
+  );
+  for (const [name, gated, direct] of [
+    ["DEPLOY_APPS_DOMAIN", "apps.portal.example.com", "apps.portal.example.com"],
+    ["DEPLOY_APPS_DOMAIN", "Apps.Portal.Example.Com.", "APPS.PORTAL.EXAMPLE.COM."],
+    ["AWS_DEPLOY_APPS_DOMAIN", "apps.portal.example.com", "APPS.PORTAL.EXAMPLE.COM."],
+  ] as const) {
+    withConfig(
+      {
+        publicUrl: "https://portal.example.com",
+        services: ["core", "portal"],
+        env: {
+          core: {
+            DEPLOY_PROVIDER: "porter",
+            [name]: gated,
+            PORTER_DEPLOY_APPS_DOMAIN: direct,
+          },
+        },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /must use distinct gated and direct domains/),
+    );
+  }
+  withConfig(
+    { env: { core: { DEPLOY_PROVIDER: "porter", PORTER_DEPLOY_APPS_DOMAIN: "apps.direct.example.com" } } },
+    ({ path }) => assert.doesNotThrow(() => loadConfigAt(path)),
+  );
+});
+
+test("portal cannot override the core-derived deployment apps domain", () => {
+  for (const source of ["env", "secretEnv"] as const) {
+    for (const name of ["DEPLOY_APPS_DOMAIN", "PORTAL_APPS_DOMAIN"]) {
+      withConfig(
+        {
+          services: ["core", "portal"],
+          [source]: { portal: { [name]: source === "env" ? "apps.example.com" : "STORE_NAME" } },
+        },
+        ({ path }) => assert.throws(() => loadConfigAt(path), /derived from the core deployment routing domain/),
+      );
+    }
+  }
+});
+
+test("portal apps domains require a compatible browser cookie scope", () => {
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: { core: { DEPLOY_APPS_DOMAIN: "apps.portal.example.com" } },
+    },
+    ({ path }) => assert.equal(effectiveDeployAppsDomain(loadConfigAt(path).config), "apps.portal.example.com"),
+  );
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: {
+        core: { DEPLOY_APPS_DOMAIN: "apps.example.com" },
+        portal: { PORTAL_COOKIE_DOMAIN: ".Example.Com." },
+      },
+    },
+    ({ path }) => assert.equal(loadConfigAt(path).config.env.portal?.PORTAL_COOKIE_DOMAIN, "example.com"),
+  );
+  for (const env of [
+    { core: { DEPLOY_APPS_DOMAIN: "apps.unrelated.net" } },
+    {
+      core: { DEPLOY_APPS_DOMAIN: "apps.example.com" },
+      portal: { PORTAL_COOKIE_DOMAIN: "other.example.com" },
+    },
+  ]) {
+    withConfig({ publicUrl: "https://portal.example.com", services: ["core", "portal"], env }, ({ path }) =>
+      assert.throws(() => loadConfigAt(path), /apps domain must be under|cookie scope|must cover/),
+    );
+  }
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      secretEnv: { portal: { PORTAL_COOKIE_DOMAIN: "COOKIE_DOMAIN_STORE" } },
+    },
+    ({ path }) =>
+      assert.throws(
+        () => loadConfigAt(path),
+        /cookie scope.*non-secret environment value|managed outside the deployment secret store/,
+      ),
+  );
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      secretEnv: { portal: { PORTAL_PUBLIC_URL: "PORTAL_URL_STORE" } },
+    },
+    ({ path }) =>
+      assert.throws(
+        () => loadConfigAt(path),
+        /portal public origin.*non-secret environment value|managed outside the deployment secret store/,
+      ),
+  );
+  for (const [publicUrl, cookie] of [
+    ["https://tenant.fly.dev", "fly.dev"],
+    ["https://tenant.github.io", "github.io"],
+    ["https://tenant.onporter.run", "onporter.run"],
+  ]) {
+    withConfig(
+      { publicUrl, services: ["core", "portal"], env: { portal: { PORTAL_COOKIE_DOMAIN: cookie } } },
+      ({ path }) =>
+        assert.throws(() => loadConfigAt(path), /PORTAL_COOKIE_DOMAIN must not be a shared platform domain/),
+    );
+  }
+});
+
+test("gated deployment login and portal origins must match", () => {
+  const base = {
+    publicUrl: "https://portal.example.com",
+    services: ["core", "portal"],
+  };
+  withConfig({ ...base, env: { core: { DEPLOY_APPS_LOGIN_URL: "https://portal.example.com" } } }, ({ path }) =>
+    assert.throws(() => loadConfigAt(path), /DEPLOY_APPS_LOGIN_URL requires a gated deployment apps domain/),
+  );
+  for (const core of [
+    { DEPLOY_APPS_DOMAIN: "apps.example.com", DEPLOY_APPS_LOGIN_URL: "https://evil.example.com" },
+    { DEPLOY_APPS_DOMAIN: "apps.example.com", PUBLIC_WEB_URL: "https://evil.example.com" },
+  ]) {
+    withConfig({ ...base, env: { core, portal: { PORTAL_COOKIE_DOMAIN: "example.com" } } }, ({ path }) =>
+      assert.throws(
+        () => loadConfigAt(path),
+        /core deployment login origin must match|PUBLIC_WEB_URL must match publicUrl/,
+      ),
+    );
+  }
+  withConfig(
+    {
+      ...base,
+      env: {
+        core: { DEPLOY_APPS_DOMAIN: "apps.example.com" },
+        portal: { PORTAL_COOKIE_DOMAIN: "example.com", PORTAL_PUBLIC_URL: "https://other.example.com" },
+      },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /PORTAL_PUBLIC_URL must match publicUrl/),
+  );
+  withConfig(
+    {
+      ...base,
+      publicUrl: "https://other.example.com",
+      env: {
+        core: {
+          DEPLOY_APPS_DOMAIN: "apps.example.com",
+          DEPLOY_APPS_LOGIN_URL: "HTTPS://OTHER.EXAMPLE.COM:443/",
+        },
+        portal: { PORTAL_COOKIE_DOMAIN: "example.com", PORTAL_PUBLIC_URL: "HTTPS://OTHER.EXAMPLE.COM:443/" },
+      },
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.equal(effectiveDeployAppsDomain(config), "apps.example.com");
+      assert.equal(config.env.core?.DEPLOY_APPS_LOGIN_URL, "https://other.example.com");
+      assert.equal(config.env.portal?.PORTAL_PUBLIC_URL, "https://other.example.com");
+    },
+  );
+  withConfig(
+    {
+      publicUrl: "https://localhost:8080",
+      services: ["core", "portal"],
+      env: { core: { DEPLOY_APPS_DOMAIN: "apps.localhost" } },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /requires a valid DNS portal host/),
+  );
+  for (const name of ["DEPLOY_APPS_DOMAIN", "AWS_DEPLOY_APPS_DOMAIN"] as const) {
+    withConfig(
+      {
+        publicUrl: "http://portal.example.com",
+        services: ["core", "portal"],
+        env: { core: { [name]: "apps.portal.example.com" } },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /gated deployment apps require HTTPS/),
+    );
+  }
+  withConfig(
+    {
+      publicUrl: "https://127.0.0.1",
+      services: ["core", "portal"],
+      env: {
+        core: { DEPLOY_APPS_DOMAIN: "apps.example.com" },
+        portal: { PORTAL_COOKIE_DOMAIN: "example.com" },
+      },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /requires a valid DNS portal host/),
+  );
+  withConfig(
+    {
+      publicUrl: "https://portal.example.com",
+      services: ["core", "portal"],
+      env: { core: { DEPLOY_APPS_DOMAIN: "apps.127.0.0.1" } },
+    },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /DEPLOY_APPS_DOMAIN must be a bare DNS name/),
+  );
+  for (const publicHost of [
+    `${"a".repeat(64)}.example.com`,
+    `${Array.from({ length: 32 }, () => "abcdefgh").join(".")}.example.com`,
+    "bad_host.example.com",
+    "-bad.example.com",
+    "bad-.example.com",
+  ]) {
+    withConfig(
+      {
+        publicUrl: `https://${publicHost}`,
+        services: ["core", "portal"],
+        env: {
+          core: { DEPLOY_APPS_DOMAIN: "apps.example.com" },
+          portal: { PORTAL_COOKIE_DOMAIN: "example.com" },
+        },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /requires a valid DNS portal host/),
+    );
+  }
+  for (const name of ["PUBLIC_WEB_URL", "DEPLOY_APPS_LOGIN_URL"]) {
+    withConfig({ ...base, secretEnv: { core: { [name]: "URL_STORE" } } }, ({ path }) =>
+      assert.throws(() => loadConfigAt(path), /gated deployment login origin.*non-secret/),
+    );
+  }
+  for (const value of [
+    "https://portal.example.com?",
+    "https://portal.example.com#",
+    "https:///portal.example.com",
+    "https://portal.example.com\\",
+    "https://@portal.example.com",
+    "https://:@portal.example.com",
+  ]) {
+    for (const name of ["DEPLOY_APPS_LOGIN_URL", "PUBLIC_WEB_URL"]) {
+      withConfig(
+        { ...base, env: { core: { DEPLOY_APPS_DOMAIN: "apps.portal.example.com", [name]: value } } },
+        ({ path }) => assert.throws(() => loadConfigAt(path), /must be a non-empty http\(s\) origin/),
+      );
+    }
+    withConfig(
+      {
+        ...base,
+        env: {
+          core: { DEPLOY_APPS_DOMAIN: "apps.portal.example.com" },
+          portal: { PORTAL_PUBLIC_URL: value },
+        },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /PORTAL_PUBLIC_URL must be a non-empty http\(s\) origin/),
+    );
+  }
+});
+
+test("deployment app session keys cannot be configured as plaintext", () => {
+  for (const name of ["DEPLOY_APPS_SESSION_SECRET", "PORTAL_SESSION_SECRET"]) {
+    for (const service of ["core", "slack"] as const) {
+      withConfig(
+        {
+          services: ["core", "slack"],
+          env: { [service]: { [name]: "plaintext" } },
+        },
+        ({ path }) =>
+          assert.throws(() => loadConfigAt(path), /managed secret destination.*cannot be configured as plaintext/),
+      );
+    }
+  }
+});
+
+test("plaintext and secret environment sources cannot target the same runtime destination", () => {
+  for (const [envService, secretService] of [
+    ["core", "core"],
+    ["core", "slack"],
+    ["slack", "core"],
+    ["slack", "slack"],
+    ["portal", "portal"],
+  ] as const) {
+    withConfig(
+      {
+        services: ["core", "portal", "slack"],
+        env: { [envService]: { SHARED_DESTINATION: "plaintext" } },
+        secretEnv: { [secretService]: { SHARED_DESTINATION: "STORE_NAME" } },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /conflicts with a plaintext/),
+    );
+  }
+  withConfig(
+    {
+      services: ["core", "portal"],
+      env: { core: { SHARED_DESTINATION: "core" } },
+      secretEnv: { portal: { SHARED_DESTINATION: "PORTAL_STORE" } },
+    },
+    ({ path }) => assert.equal(loadConfigAt(path).config.secretEnv?.portal?.SHARED_DESTINATION, "PORTAL_STORE"),
+  );
+});
+
+test("plaintext selector contracts cover every conditional secret input", () => {
+  const selectors = secretConditionSelectors()
+    .map(({ service, name, mode }) => `${isVirtualService(service) ? "core" : service}\0${name}\0${mode}`)
+    .sort();
+  const contracts = Object.entries(SECRET_SELECTOR_ENVIRONMENT_CONTRACTS)
+    .flatMap(([service, entries]) =>
+      Object.entries(entries).map(
+        ([name, contract]) =>
+          `${service}\0${name}\0${contract.kind === "enumerated" ? "value-inspected" : "presence-only"}`,
+      ),
+    )
+    .sort();
+  assert.deepEqual(
+    selectors.filter((selector) => !contracts.includes(selector)),
+    [],
+  );
+  for (const [service, entries] of Object.entries(SECRET_SELECTOR_ENVIRONMENT_CONTRACTS)) {
+    for (const [name, contract] of Object.entries(entries)) {
+      for (const value of ["", " ", ` ${contract.kind === "enumerated" ? contract.values[0] : "configured"} `]) {
+        withConfig({ env: { [service]: { [name]: value } } }, ({ path }) => {
+          assert.throws(() => loadConfigAt(path), /nonblank value without surrounding whitespace/);
+        });
+      }
+      if (contract.kind === "enumerated") {
+        withConfig({ env: { [service]: { [name]: "not-allowed" } } }, ({ path }) => {
+          assert.throws(() => loadConfigAt(path), /must be one of/);
+        });
+      }
+    }
+  }
 });
 
 test("loadConfigInDir reads qm.config.jsonc from the deployment dir (no walk-up)", () => {
@@ -989,56 +2261,15 @@ test("config JSONC accepts comments and trailing commas like tsconfig.json", () 
   }
 });
 
-test("updateConfigSandbox splices pins into a commented JSONC config without touching anything else", () => {
-  const raw = `{
-  // The deployment contract major this directory conforms to.
-  "contract": 1,
-  "orgId": "acme", // inline comment with a "quote
-  "publicUrl": "http://localhost:8080",
-  "target": "docker",
-  "services": ["core"],
-  /* block comment
-     spanning lines */
-  "sandbox": { "app": "acme-sandboxes" }
-}
-`;
-  const image = "registry.fly.io/acme-sandboxes@sha256:" + "e".repeat(64);
-  const base = "ghcr.io/base@sha256:" + "d".repeat(64);
-  const updated = updateConfigSandbox(raw, { image, baseImage: base });
-  assert.match(updated, /\/\/ The deployment contract major/, "line comments survive");
-  assert.match(updated, /\/\* block comment/, "block comments survive");
-  assert.match(updated, /inline comment with a "quote/, "comments after values survive");
-  const dir = mkdtempSync(join(tmpdir(), "qm-cfg-"));
+test("config nesting fails with a controlled error before recursive validation can overflow", () => {
+  const dir = mkdtempSync(join(tmpdir(), "qm-json-depth-"));
   const path = join(dir, CONFIG_FILENAME);
   try {
-    writeFileSync(path, updated);
-    const { config } = loadConfigAt(path);
-    assert.equal(config.sandbox?.app, "acme-sandboxes");
-    assert.equal(config.sandbox?.image, image);
-    assert.equal(config.sandbox?.baseImage, base);
-
-    const image2 = "registry.fly.io/acme-sandboxes@sha256:" + "f".repeat(64);
-    writeFileSync(path, updateConfigSandbox(updated, { image: image2 }));
-    const again = loadConfigAt(path).config;
-    assert.equal(again.sandbox?.image, image2);
-    assert.equal(again.sandbox?.baseImage, base);
+    writeFileSync(path, `{"//":${"[".repeat(300)}0${"]".repeat(300)}}`);
+    assert.throws(() => loadConfigAt(path), /nesting exceeds 256 levels/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test("updateConfigSandbox adds a sandbox block when the config has none", () => {
-  const image = "registry.fly.io/acme-sandboxes@sha256:" + "e".repeat(64);
-  const updated = updateConfigSandbox(`{\n  "contract": 1,\n  "orgId": "acme"\n}\n`, { image });
-  const parsed = JSON.parse(updated) as { orgId: string; sandbox: { image: string } };
-  assert.equal(parsed.orgId, "acme");
-  assert.equal(parsed.sandbox.image, image);
-});
-
-test("updateConfigSandbox fills an empty sandbox object", () => {
-  const image = "registry.fly.io/a@sha256:" + "e".repeat(64);
-  const parsed = JSON.parse(updateConfigSandbox(`{ "sandbox": {} }`, { image })) as { sandbox: { image: string } };
-  assert.equal(parsed.sandbox.image, image);
 });
 
 test("updateConfigImageOverrides preserves JSONC while recording immutable service pins", () => {
@@ -1059,12 +2290,25 @@ test("updateConfigImageOverrides preserves JSONC while recording immutable servi
   );
 });
 
+test("updateConfigImageOverrides preserves a trailing comma on the preceding root property", () => {
+  const digest = `registry.fly.io/acme-core@sha256:${"a".repeat(64)}`;
+  const updated = updateConfigImageOverrides(`{\n  "contract": 1,\n}\n`, { core: digest });
+  assert.equal(
+    (JSON.parse(updated.replace(/,\s*}/g, "}")) as { imageOverrides: { core: string } }).imageOverrides.core,
+    digest,
+  );
+  assert.doesNotMatch(updated, /,\s*,/);
+});
+
 test("secretEnv (per-service) validates service keys, env-var names, and managed ports", () => {
   withConfig(
     { secretEnv: { core: { OPENAI_API_KEY: "OPENAI_API_KEY", DEPLOY_APPS_SESSION_SECRET: "PORTAL_SESSION_SECRET" } } },
     ({ path }) => {
-      assert.deepEqual(loadConfigAt(path).config.secretEnv, {
-        core: { OPENAI_API_KEY: "OPENAI_API_KEY", DEPLOY_APPS_SESSION_SECRET: "PORTAL_SESSION_SECRET" },
+      const secretEnv = loadConfigAt(path).config.secretEnv;
+      assert.equal(Object.getPrototypeOf(secretEnv!), null);
+      assert.deepEqual(secretEnv?.core, {
+        OPENAI_API_KEY: "OPENAI_API_KEY",
+        DEPLOY_APPS_SESSION_SECRET: "PORTAL_SESSION_SECRET",
       });
     },
   );
@@ -1141,7 +2385,10 @@ test("securityScreen owns its derived environment and keeps its token on core", 
       env: { core: { SECURITY_SCREEN_PROXY_TOKEN: "plaintext-token" } },
     },
     ({ path }) =>
-      assert.throws(() => loadConfigAt(path), /env\.core\.SECURITY_SCREEN_PROXY_TOKEN.*managed by securityScreen/),
+      assert.throws(
+        () => loadConfigAt(path),
+        /env\.core\.SECURITY_SCREEN_PROXY_TOKEN.*managed by securityScreen|conflicts with a plaintext/,
+      ),
   );
   withConfig(
     {
@@ -1262,6 +2509,48 @@ test("env.core.MODEL_PROVIDER is validated as the provider core will actually us
   withConfig({ env: { core: { HARNESS: "pi", MODEL_PROVIDER: "bedrock" } } }, ({ path }) => {
     assert.throws(() => loadConfigAt(path), /env.core.MODEL_PROVIDER must be one of/);
   });
+  withConfig(
+    {
+      services: ["core", "slack"],
+      modelProvider: "openrouter",
+      env: { slack: { HARNESS: "codex", MODEL_PROVIDER: "anthropic" }, core: { MODEL_PROVIDER: "openai" } },
+    },
+    ({ path }) => {
+      const config = loadConfigAt(path).config;
+      assert.deepEqual(effectiveCoreEnvironment(config), { HARNESS: "codex", MODEL_PROVIDER: "openai" });
+      assert.equal(effectiveModelProvider(config), "openai");
+    },
+  );
+  withConfig(
+    { services: ["core", "slack"], env: { slack: { HARNESS: "pi", MODEL_PROVIDER: " openai " } } },
+    ({ path }) => assert.throws(() => loadConfigAt(path), /env.slack.MODEL_PROVIDER.*surrounding whitespace/),
+  );
+});
+
+test("Slack HTTP events require an effective integer port", () => {
+  for (const port of [undefined, "", "0", "-1", "1.5", "65536", "not-a-number"]) {
+    withConfig(
+      {
+        services: ["core", "slack"],
+        env: { slack: { SLACK_EVENTS_MODE: "http", ...(port === undefined ? {} : { SLACK_EVENTS_PORT: port }) } },
+      },
+      ({ path }) => assert.throws(() => loadConfigAt(path), /SLACK_EVENTS_PORT to be an integer from 1 to 65535/),
+    );
+  }
+  withConfig(
+    { services: ["core", "slack"], env: { slack: { SLACK_EVENTS_MODE: "http", SLACK_EVENTS_PORT: "3001" } } },
+    ({ path }) => assert.equal(effectiveCoreEnvironment(loadConfigAt(path).config).SLACK_EVENTS_PORT, "3001"),
+  );
+  withConfig(
+    {
+      services: ["core", "slack"],
+      env: {
+        slack: { SLACK_EVENTS_MODE: "http", SLACK_EVENTS_PORT: "not-a-number" },
+        core: { SLACK_EVENTS_MODE: "socket" },
+      },
+    },
+    ({ path }) => assert.equal(effectiveCoreEnvironment(loadConfigAt(path).config).SLACK_EVENTS_MODE, "socket"),
+  );
 });
 
 test("a mock deployment is named as one, and a real harness draws no warning", () => {
@@ -1271,10 +2560,21 @@ test("a mock deployment is named as one, and a real harness draws no warning", (
   withConfig({ env: { core: { HARNESS: "mock" } } }, ({ path }) => {
     assert.match(mockHarnessWarning(loadConfigAt(path).config)!, /set to "mock"/);
   });
+  withConfig({ services: ["core", "slack"], env: { slack: { HARNESS: "mock" } } }, ({ path }) => {
+    assert.match(mockHarnessWarning(loadConfigAt(path).config)!, /set to "mock"/);
+  });
   withConfig({ env: { core: { HARNESS: "pi" } } }, ({ path }) => {
     assert.equal(mockHarnessWarning(loadConfigAt(path).config), undefined);
   });
-  withConfig({ target: "fly", appPrefix: "acme", env: { core: {} } }, ({ path }) => {
-    assert.equal(mockHarnessWarning(loadConfigAt(path).config), undefined, "the fly template renders HARNESS=pi");
-  });
+  withConfig(
+    {
+      target: "fly",
+      appPrefix: "acme",
+      env: { core: {} },
+      sandbox: { backend: "sprites", namePrefix: "acme-sandboxes" },
+    },
+    ({ path }) => {
+      assert.equal(mockHarnessWarning(loadConfigAt(path).config), undefined, "the fly template renders HARNESS=pi");
+    },
+  );
 });

@@ -2,23 +2,53 @@ name: Build signed QM images
 
 on:
   workflow_call:
-  workflow_dispatch:
+    inputs:
+      resume:
+        description: Reuse the image manifest from this run's published package
+        required: true
+        type: boolean
+      origin_run_id:
+        description: Workflow run recorded by image signatures
+        required: true
+        type: string
+      sha:
+        description: Commit that produced the release package
+        required: true
+        type: string
+      version:
+        description: Version baked into release images
+        required: true
+        type: string
+    outputs:
+      manifest:
+        description: Digest-pinned images signed by this workflow run
+        value: ${{ jobs.descriptor.outputs.manifest }}
 
 permissions:
   contents: read
-  packages: write
-  id-token: write
+
+env:
+  NPM_CONFIG_DRY_RUN: "false"
+  NPM_CONFIG_GLOBALCONFIG: /dev/null
+  NPM_CONFIG_PREFER_ONLINE: "true"
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+  NPM_CONFIG_WORKSPACES: "false"
 
 jobs:
   image:
-    if: github.ref == 'refs/heads/main'
+    if: ${{ !inputs.resume }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: core
             dockerfile: deploy/core/Dockerfile
+            build-args: GIT_SHA=${{ github.sha }}
           - name: web-ui
             dockerfile: deploy/web-ui/Dockerfile
           - name: admin
@@ -34,7 +64,89 @@ jobs:
             build-args: INSTALL_BROWSER_ENGINE=1
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.sha }}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          scope: "@yc-software"
+      - name: Validate release identity
+        env:
+          ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+          RELEASE_SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          npm_registry() {
+            npm --registry="$NPM_CONFIG_REGISTRY" \
+              --@yc-software:registry="$NPM_CONFIG_REGISTRY" \
+              --workspaces=false "$@"
+          }
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "images must be published from main; this run is on $GITHUB_REF" >&2
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "version must be stable semver, got $VERSION" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release sha must be a full commit, got $RELEASE_SHA" >&2
+            exit 1
+          fi
+          if [ "$RELEASE_SHA" != "$GITHUB_SHA" ]; then
+            echo "new release images must be built from the dispatch commit $GITHUB_SHA, not $RELEASE_SHA" >&2
+            exit 1
+          fi
+          if [ "$ORIGIN_RUN_ID" != "$GITHUB_RUN_ID" ]; then
+            echo "new release images must be built by workflow run $GITHUB_RUN_ID, not $ORIGIN_RUN_ID" >&2
+            exit 1
+          fi
+          source_version=$(jq -r .version cli/package.json)
+          if [ "$VERSION" != "$source_version" ]; then
+            echo "release version $VERSION does not match cli/package.json $source_version" >&2
+            exit 1
+          fi
+          tag_error=$(mktemp)
+          set +e
+          git ls-remote --exit-code origin "refs/tags/v$VERSION" > /dev/null 2> "$tag_error"
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "v$VERSION already exists; refusing to replace release image tags" >&2
+            exit 1
+          fi
+          if [ "$tag_status" -ne 2 ]; then
+            cat "$tag_error" >&2
+            exit "$tag_status"
+          fi
+          exact_error=$(mktemp)
+          set +e
+          published=$(npm_registry view "@yc-software/qm@$VERSION" version --json \
+            --min-release-age=0 2> "$exact_error")
+          lookup_status=$?
+          set -e
+          if [ "$lookup_status" -eq 0 ]; then
+            published_version=$(printf '%s' "$published" | jq -er 'strings')
+            if [ "$published_version" != "$VERSION" ]; then
+              echo "npm resolved @yc-software/qm@$VERSION to unexpected version $published_version" >&2
+              exit 1
+            fi
+            echo "@yc-software/qm@$VERSION is already published; refusing to replace release image tags" >&2
+            exit 1
+          elif ! printf '%s' "$published" | jq -e '.error.code == "E404"' > /dev/null; then
+            cat "$exact_error" >&2
+            printf '%s\n' "$published" >&2
+            exit "$lookup_status"
+          fi
       - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad
+        with:
+          cosign-release: v3.1.3
+      - uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392
+        with:
+          image: tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
@@ -46,24 +158,229 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           provenance: false
           push: true
           build-args: ${{ matrix.build-args }}
-          tags: ghcr.io/yc-software/qm/${{ matrix.name }}:${{ github.sha }}
+          tags: ghcr.io/yc-software/qm/${{ matrix.name }}:release-${{ inputs.version }}-${{ github.run_id }}
           cache-from: type=gha,scope=qm-${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=qm-${{ matrix.name }}
-      - name: Sign exact image
+      - name: Verify image platforms
+        env:
+          IMAGE: ghcr.io/yc-software/qm/${{ matrix.name }}@${{ steps.build.outputs.digest }}
         run: |
+          set -euo pipefail
+          manifest=$(docker buildx imagetools inspect --raw "$IMAGE")
+          for architecture in amd64 arm64; do
+            printf '%s' "$manifest" | jq -e --arg architecture "$architecture" \
+              'any(.manifests[]; .platform.os == "linux" and .platform.architecture == $architecture)' > /dev/null
+          done
+      - name: Sign exact image
+        env:
+          ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+          RELEASE_SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
           image='ghcr.io/yc-software/qm/${{ matrix.name }}@${{ steps.build.outputs.digest }}'
-          cosign sign --yes "$image"
+          cosign sign --yes \
+            -a origin_run_id="$ORIGIN_RUN_ID" \
+            -a service='${{ matrix.name }}' \
+            -a version="$VERSION" \
+            "$image"
           cosign verify "$image" \
+            -a origin_run_id="$ORIGIN_RUN_ID" \
+            -a service='${{ matrix.name }}' \
+            -a version="$VERSION" \
             --certificate-identity='https://github.com/${{ github.repository }}/.github/workflows/release-package.yml@refs/heads/main' \
-            --certificate-oidc-issuer=https://token.actions.githubusercontent.com
-          printf '%s\n' "$image" > qm-${{ matrix.name }}.image
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository="$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-sha="$RELEASE_SHA"
+
+  descriptor:
+    needs: image
+    if: ${{ always() && (inputs.resume || needs.image.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      manifest: ${{ steps.manifest.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
-          name: qm-${{ matrix.name }}-${{ github.sha }}
-          path: qm-${{ matrix.name }}.image
-          if-no-files-found: error
-          retention-days: 30
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          scope: "@yc-software"
+      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad
+        with:
+          cosign-release: v3.1.3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Validate release identity
+        env:
+          ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+          RELEASE_SHA: ${{ inputs.sha }}
+          RESUME: ${{ inputs.resume }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "images must be resolved from main; this run is on $GITHUB_REF" >&2
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "version must be stable semver, got $VERSION" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release sha must be a full commit, got $RELEASE_SHA" >&2
+            exit 1
+          fi
+          if [[ ! "$ORIGIN_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "release origin must be a workflow run, got $ORIGIN_RUN_ID" >&2
+            exit 1
+          fi
+          source_version=$(jq -r .version cli/package.json)
+          if [ "$RESUME" != true ] && [ "$VERSION" != "$source_version" ]; then
+            echo "release version $VERSION does not match cli/package.json $source_version" >&2
+            exit 1
+          fi
+      - if: ${{ !inputs.resume }}
+        name: Resolve this run's published images
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          out=$(jq -n '{sandboxBase: "", services: {}}')
+          for service in core web-ui admin portal auth egress-proxy sandbox-base; do
+            repository="ghcr.io/yc-software/qm/$service"
+            tag="$repository:release-$VERSION-$GITHUB_RUN_ID"
+            digest=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -er '.digest | strings')
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "invalid published image digest for $service: $digest" >&2
+              exit 1
+            fi
+            ref="$repository@$digest"
+            if [ "$service" = sandbox-base ]; then
+              out=$(printf '%s' "$out" | jq --arg ref "$ref" '.sandboxBase = $ref')
+            else
+              out=$(printf '%s' "$out" | jq --arg service "$service" --arg ref "$ref" '.services[$service] = $ref')
+            fi
+          done
+          printf '%s\n' "$out" | jq -c . > images.json
+      - if: ${{ inputs.resume }}
+        name: Recover the published image manifest
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          npm_registry() {
+            npm --registry="$NPM_CONFIG_REGISTRY" \
+              --@yc-software:registry="$NPM_CONFIG_REGISTRY" \
+              --workspaces=false "$@"
+          }
+          package_dir=$(mktemp -d)
+          package_json=$(npm_registry pack \
+            "@yc-software/qm@$VERSION" \
+            --json \
+            --pack-destination "$package_dir" \
+            --min-release-age=0)
+          package_tarball="$package_dir/$(printf '%s' "$package_json" | jq -er '.[0].filename | strings')"
+          tar -xOzf "$package_tarball" package/manifest.json | jq -c . > images.json
+          jq -e -s '
+            def service_name:
+              type == "string" and test("^[a-z0-9]+(-[a-z0-9]+)*$");
+            def digest:
+              type == "string"
+              and test("^sha256:[0-9a-f]{64}$")
+              and (test("^sha256:(.)\\1{63}$") | not);
+            def image_ref($service):
+              type == "string"
+              and (split("@") as $parts
+                | ($parts | length) == 2
+                and $parts[0] == ("ghcr.io/yc-software/qm/" + $service)
+                and ($parts[1] | digest));
+            length == 1
+            and (.[0]
+              | type == "object"
+              and keys == ["sandboxBase", "services"]
+              and (.sandboxBase | image_ref("sandbox-base"))
+              and (.services | type == "object" and length > 0 and (has("sandbox-base") | not))
+              and all(.services | to_entries[];
+                . as $entry
+                | ($entry.key | service_name)
+                  and ($entry.value | image_ref($entry.key))))' \
+            images.json > /dev/null
+      - id: manifest
+        name: Assemble signed image manifest
+        env:
+          ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+          RELEASE_SHA: ${{ inputs.sha }}
+          RESUME: ${{ inputs.resume }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          jq -e -s '
+            def service_name:
+              type == "string" and test("^[a-z0-9]+(-[a-z0-9]+)*$");
+            def digest:
+              type == "string"
+              and test("^sha256:[0-9a-f]{64}$")
+              and (test("^sha256:(.)\\1{63}$") | not);
+            def image_ref($service):
+              type == "string"
+              and (split("@") as $parts
+                | ($parts | length) == 2
+                and $parts[0] == ("ghcr.io/yc-software/qm/" + $service)
+                and ($parts[1] | digest));
+            length == 1
+            and (.[0]
+              | type == "object"
+              and keys == ["sandboxBase", "services"]
+              and (.sandboxBase | image_ref("sandbox-base"))
+              and (.services | type == "object" and length > 0 and (has("sandbox-base") | not))
+              and all(.services | to_entries[];
+                . as $entry
+                | ($entry.key | service_name)
+                  and ($entry.value | image_ref($entry.key))))' \
+            images.json > /dev/null
+          if [ "$RESUME" != true ]; then
+            jq -e '.services | keys == ["admin", "auth", "core", "egress-proxy", "portal", "web-ui"]' \
+              images.json > /dev/null
+          fi
+          mapfile -t services < <(jq -er '.services | keys[]' images.json)
+          services+=(sandbox-base)
+          for service in "${services[@]}"; do
+            if [ "$service" = sandbox-base ]; then
+              ref=$(jq -er '.sandboxBase | strings' images.json)
+            else
+              ref=$(jq -er --arg service "$service" '.services[$service] | strings' images.json)
+            fi
+            platform_manifest=$(docker buildx imagetools inspect --raw "$ref")
+            for architecture in amd64 arm64; do
+              printf '%s' "$platform_manifest" | jq -e --arg architecture "$architecture" \
+                'any(.manifests[]; .platform.os == "linux" and .platform.architecture == $architecture)' > /dev/null
+            done
+            cosign verify "$ref" \
+              -a origin_run_id="$ORIGIN_RUN_ID" \
+              -a service="$service" \
+              -a version="$VERSION" \
+              --certificate-identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/release-package.yml@refs/heads/main" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              --certificate-github-workflow-repository="$GITHUB_REPOSITORY" \
+              --certificate-github-workflow-sha="$RELEASE_SHA" > /dev/null
+          done
+          printf 'manifest=%s\n' "$(< images.json)" >> "$GITHUB_OUTPUT"
+      - name: Reject conflicting release image aliases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: scripts/release-image-aliases.sh check images.json "$VERSION"

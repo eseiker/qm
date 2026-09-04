@@ -109,6 +109,52 @@ body`,
   assert.equal(r.manifest.description, "does things");
 });
 
+test("normalization maps and retains prototype-like frontmatter without pollution or key loss", () => {
+  const fieldOverrides = Object.fromEntries([
+    ["__proto__", "name"],
+    ["constructor", "description"],
+  ]);
+  const r = ok(
+    normalizeSkill(
+      `---
+__proto__: mapped-name
+constructor: mapped description
+prototype: metadata-value
+---
+body`,
+      "skills/fallback/SKILL.md",
+      { fieldOverrides },
+    ),
+  );
+  assert.equal(r.manifest.name, "mapped-name");
+  assert.equal(r.manifest.description, "mapped description");
+  assert.deepEqual(Object.keys(r.meta), ["__proto__", "constructor", "prototype"]);
+  assert.equal(Object.getPrototypeOf(r.meta), Object.prototype);
+  assert.equal(Object.hasOwn(r.meta, "__proto__"), true);
+  assert.equal(r.meta.__proto__, "mapped-name");
+  assert.equal(r.meta.constructor, "mapped description");
+  assert.equal(r.meta.prototype, "metadata-value");
+  assert.deepEqual(Object.keys(JSON.parse(JSON.stringify(r.meta)) as Record<string, unknown>), Object.keys(r.meta));
+  assert.equal((Object.prototype as { polluted?: unknown }).polluted, undefined);
+
+  const chained = ok(
+    normalizeSkill(
+      `---
+alias: mapped-through-proto
+---
+body`,
+      "skills/fallback/SKILL.md",
+      {
+        fieldOverrides: Object.fromEntries([
+          ["alias", "__proto__"],
+          ["__proto__", "name"],
+        ]),
+      },
+    ),
+  );
+  assert.equal(chained.manifest.name, "mapped-through-proto");
+});
+
 test("malformed (no frontmatter fence / empty body) → skip", () => {
   assert.deepEqual(normalizeSkill("no frontmatter", "p/a/SKILL.md"), { skip: true, reason: "malformed" });
   assert.deepEqual(

@@ -163,7 +163,7 @@ export function createGitFetcher(opts: GitFetcherOptions = {}): SkillPackFetcher
 
   function gitEnv(cwd: string, auth: GitAuth | undefined, config: Array<[string, string]>): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...globalThis.process.env };
-    for (const k of Object.keys(env)) if (/^(GIT_|SSH_)/.test(k)) delete env[k];
+    for (const k of Object.keys(env)) if (/^(?:GIT|SSH)_/iu.test(k)) delete env[k];
     env.HOME = cwd;
     env.GIT_TERMINAL_PROMPT = "0";
     env.GIT_CONFIG_NOSYSTEM = "1";

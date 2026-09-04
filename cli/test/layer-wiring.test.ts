@@ -17,9 +17,8 @@ function makeDeployment(config: Record<string, unknown>, setup: (dir: string) =>
       target: "docker",
       services: ["core"],
       sandbox: {
-        app: "wiretest-sandboxes",
-        image:
-          "registry.fly.io/wiretest-sandboxes@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+        backend: "local",
+        image: "qm-sandbox-local:test",
       },
       ...config,
     }),
@@ -47,8 +46,12 @@ async function plan(configDir: string, opts: { sandboxDir?: string } = {}): Prom
   console.log = (...a: unknown[]): void => void lines.push(a.join(" "));
   console.warn = (...a: unknown[]): void => void lines.push(a.join(" "));
   try {
-    const { config } = loadConfigAt(join(configDir, CONFIG_FILENAME));
-    await dockerUp(config, configDir, { dryRun: true, ...(opts.sandboxDir ? { sandboxDir: opts.sandboxDir } : {}) });
+    const loaded = loadConfigAt(join(configDir, CONFIG_FILENAME));
+    await dockerUp(
+      loaded.config,
+      { configDir, configPath: loaded.path, configIdentity: loaded.configIdentity },
+      { dryRun: true, ...(opts.sandboxDir ? { sandboxDir: opts.sandboxDir } : {}) },
+    );
   } finally {
     console.log = log;
     console.warn = warn;
@@ -107,45 +110,6 @@ test("--sandbox-dir sources the layer from a shared dir while config stays in th
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(shared, { recursive: true, force: true });
-  }
-});
-
-test("sandbox.app/env/secretEnv become the core's FLY_* + FLY_RESIDENT_ENV_* env", async () => {
-  const dir = makeDeployment(
-    {
-      sandbox: {
-        app: "wire-sandboxes",
-        image: "registry.fly.io/wire-sandboxes@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
-        env: { TZ: "UTC" },
-        secretEnv: ["COMPANY_API_TOKEN"],
-      },
-    },
-    (d) => writeFileSync(join(d, ".env"), "COMPANY_API_TOKEN=sek-ret\n"),
-  );
-  try {
-    const out = await plan(dir);
-    assert.match(out, /FLY_SANDBOX_APP_NAME/);
-    assert.match(out, /FLY_BASE_IMAGE/);
-    assert.match(out, /FLY_RESIDENT_ENV_TZ/);
-    assert.match(out, /FLY_RESIDENT_ENV_COMPANY_API_TOKEN/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("a missing secretEnv value is warned, not invented", async () => {
-  const dir = makeDeployment({
-    sandbox: {
-      app: "s",
-      image: "registry.fly.io/s@sha256:1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
-      secretEnv: ["NOPE_TOKEN"],
-    },
-  });
-  try {
-    const out = await plan(dir);
-    assert.match(out, /sandbox.secretEnv "NOPE_TOKEN" has no value/);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
   }
 });
 

@@ -1,5 +1,6 @@
 import { request as httpRequest, type IncomingMessage, type ServerResponse } from "node:http";
-import { signedHeaders } from "../../chassis/src/core-client.ts";
+import { Readable } from "node:stream";
+import { signedCoreFetch } from "../../chassis/src/core-client.ts";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
 
 const IDENTITY_TTL_MS = 60_000;
@@ -163,12 +164,54 @@ export interface DeploymentTarget {
   identitySecret?: string;
 }
 
-export function proxyToDeployment(req: IncomingMessage, res: ServerResponse, t: DeploymentTarget): void {
+function relaySignedCore(
+  req: IncomingMessage,
+  res: ServerResponse,
+  target: { coreBase: string; path: string; headers: Record<string, string>; signingSecret: string | undefined },
+  signatureTail: string,
+): void {
   const method = req.method ?? "GET";
+  const streamsBody = method !== "GET" && method !== "HEAD";
+  const controller = new AbortController();
+  req.on("error", () => controller.abort());
+  res.on("close", () => {
+    if (!res.writableFinished) controller.abort();
+  });
+  if (!streamsBody) req.resume();
+  void signedCoreFetch(target.coreBase, target.signingSecret, method, target.path, {
+    headers: target.headers,
+    jsonContentType: false,
+    signal: controller.signal,
+    signatureTail,
+    ...(streamsBody ? { body: req, duplex: "half" as const } : {}),
+  })
+    .then((upRes) => {
+      const out: Record<string, string> = {};
+      for (const [k, v] of upRes.headers) {
+        if (DROP_RESPONSE_HEADERS.has(k.toLowerCase())) continue;
+        if (k.toLowerCase() === "content-encoding" || k.toLowerCase() === "content-length") continue;
+        out[k] = v;
+      }
+      res.writeHead(upRes.status, out);
+      if (!upRes.body) return void res.end();
+      const stream = Readable.fromWeb(upRes.body as Parameters<typeof Readable.fromWeb>[0]);
+      stream.on("error", () => res.destroy());
+      stream.pipe(res);
+    })
+    .catch(() => {
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "bad_gateway", message: "upstream unreachable" }));
+      } else {
+        res.end();
+      }
+    });
+}
+
+export function proxyToDeployment(req: IncomingMessage, res: ServerResponse, t: DeploymentTarget): void {
   const corePath = `/d/${encodeURIComponent(t.id)}${t.subPath}${t.search}`;
   const core = new URL(t.coreBase);
-  const signed = signedHeaders(t.signingSecret, method, corePath, "", t.principal);
-  const base: Record<string, string> = { host: core.host, "x-as-principal": t.principal, ...signed };
+  const base: Record<string, string> = { host: core.host, "x-as-principal": t.principal };
   if (t.identitySecret)
     base[PORTAL_IDENTITY_HEADER] = mintPortalIdentity(
       { p: t.principal, exp: Date.now() + IDENTITY_TTL_MS },
@@ -178,13 +221,17 @@ export function proxyToDeployment(req: IncomingMessage, res: ServerResponse, t: 
   delete headers["content-type"];
   const ct = req.headers["content-type"];
   if (typeof ct === "string") headers["content-type"] = ct;
-  relay(req, res, {
-    protocol: core.protocol,
-    hostname: core.hostname,
-    port: requestPort(core),
-    path: corePath,
-    headers,
-  });
+  relaySignedCore(
+    req,
+    res,
+    {
+      coreBase: t.coreBase,
+      path: corePath,
+      headers,
+      signingSecret: t.signingSecret,
+    },
+    t.principal,
+  );
 }
 
 export interface UpstreamTarget {

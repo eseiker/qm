@@ -1,11 +1,11 @@
 import { existsSync, statSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { assertNodeEngine, emailTransportPreflight, flySandboxTokenPreflight } from "../preflight.ts";
-import { readEnvFile } from "../util.ts";
+import { assertNodeEngine, emailTransportPreflight } from "../preflight.ts";
+import { readEnvFile, type FileIdentity } from "../util.ts";
 import { CliError, errMessage, header, note, ok, step, warn } from "../log.ts";
 import { validateSandboxLayer, type SandboxValidation } from "../sandbox-layer.ts";
 import { discoverPlugins, type ResolvedPlugin } from "../plugins.ts";
-import { localSandboxActive, mockHarnessWarning, sandboxPinPending, type QmConfig } from "../config.ts";
+import { mockHarnessWarning, type QmConfig } from "../config.ts";
 import { computedSecrets, runtimeSecretNames, type ComputedSecret } from "../secrets.ts";
 import { isVirtualService, runnableServices } from "../services.ts";
 import { serviceEnvironment } from "../backends/aws.ts";
@@ -30,9 +30,6 @@ export function runChecks(
   const configError = (message: string, clause = "config.v1"): void => void configErrors.push({ clause, message });
   const provider = hostingProvider(config.target);
   configErrors.push(...provider.validateConfig(config, plugins));
-  if (provider.requiresSandboxApp && !localSandboxActive(config) && !config.sandbox?.app?.trim()) {
-    configError("contract sandbox.app: a Fly agent-computer app is required for docker and fly targets");
-  }
   for (const skill of config.skills) {
     const path = resolve(configDir, skill);
     let isDirectory: boolean;
@@ -49,21 +46,6 @@ export function runChecks(
     secrets.flatMap((secret) => [secret.name, ...(secret.aliases ?? []).map((alias) => alias.name)]),
   );
   const pluginNames = plugins.map((plugin) => plugin.name);
-  for (const workload of [...runnableServices(config.services), ...pluginNames]) {
-    const delivered = new Map<string, string>();
-    for (const secret of secrets) {
-      for (const name of runtimeSecretNames(workload, secret, pluginNames)) {
-        const prior = delivered.get(name);
-        if (prior !== undefined && prior !== secret.name) {
-          configError(
-            `contract config.secretEnv: ${workload} would receive env ${name} from both ${prior} and ${secret.name}`,
-            "config.secretEnv",
-          );
-        }
-        delivered.set(name, secret.name);
-      }
-    }
-  }
   if (config.target === "aws" && config.aws) {
     for (const workload of runnableServices(config.services)) {
       if (!config.aws.services[workload]) continue;
@@ -109,7 +91,6 @@ export function runChecks(
   };
   for (const [service, env] of Object.entries(config.env)) flagSecretValue(service, env);
   for (const plugin of config.plugins) flagSecretValue(`plugins.${plugin.name}`, plugin.env);
-  flagSecretValue("sandbox", config.sandbox?.env);
   for (const [service, spec] of Object.entries(config.aws?.services ?? {})) {
     flagSecretValue(`aws.services.${service}.buildArgs`, spec.buildArgs);
   }
@@ -147,9 +128,6 @@ export function runChecks(
     for (const w of layer.warnings) warn(w);
     const mockHarness = mockHarnessWarning(config);
     if (mockHarness) warn(mockHarness);
-    if (sandboxPinPending(config)) {
-      warn("no sandbox layer image is pinned yet; run `qm sandbox publish` to record one before `qm up` renders core");
-    }
   }
 
   const errors = [
@@ -171,13 +149,16 @@ export async function runCheckCommand(
   config: QmConfig,
   configDir: string,
   sandboxDir: string,
-  envFile?: string,
+  envFile: string | undefined,
+  configIdentity: FileIdentity,
 ): Promise<void> {
   header(`qm check — ${config.orgId}`);
   assertNodeEngine(configDir);
   runChecks(config, configDir, sandboxDir, { report: true });
-  const secrets = readEnvFile(envFile ?? join(configDir, ".env"));
-  await flySandboxTokenPreflight(config, secrets);
+  const secrets = readEnvFile(envFile ?? join(configDir, ".env"), {
+    required: envFile !== undefined,
+    protectedIdentity: configIdentity,
+  });
   await emailTransportPreflight(config, secrets);
   note("");
   ok("check passed — config, sandbox layer, and plugins are valid.");

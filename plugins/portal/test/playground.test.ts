@@ -156,6 +156,8 @@ test("boot refuses playground configurations that leak or brick", () => {
     NODE_ENV: "test",
     PORTAL_PUBLIC_URL: "http://localhost:18196",
     PORTAL_PLAYGROUND: "1",
+    PORTAL_SESSION_SECRET: "s".repeat(32),
+    PORTAL_IDENTITY_SECRET: "i".repeat(32),
   };
   delete baseEnv.PORTAL_COOKIE_DOMAIN;
   delete baseEnv.PORTAL_APPS_DOMAIN;

@@ -1,6 +1,12 @@
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { join } from "node:path";
-import { JUNK_FILE, deploymentLayerBundle } from "./deployment-layer.ts";
+import {
+  JUNK_FILE,
+  deploymentLayerBundle,
+  deploymentLayerRootTextFile,
+  deploymentLayerTopLevelDirectories,
+  type DeploymentLayerBundle,
+} from "./deployment-layer.ts";
 import { errMessage } from "./log.ts";
 
 export type ApprovalDecision = "require_approval" | "deny";
@@ -681,7 +687,7 @@ export function parseSkillFrontmatter(md: string, sourcePath: string): SkillFron
   const body = source.slice(contentEnd + closing[0].length).replace(/^\s+/, "");
   if (!body.trim()) throw new Error(`${sourcePath}: skill requires a body below the frontmatter`);
 
-  const fields: Record<string, unknown> = {};
+  const fields = new Map<string, unknown>();
   const lines = source.slice(contentStart, contentEnd).split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
@@ -700,14 +706,16 @@ export function parseSkillFrontmatter(md: string, sourcePath: string): SkillFron
         collected.push(next.trim() ? next.slice(Math.min(skillIndent(next), baseIndent + 2)) : "");
         i++;
       }
-      fields[key] = (literal ? collected.join("\n") : collected.join(" ").replace(/\s+/g, " ")).trim();
+      fields.set(key, (literal ? collected.join("\n") : collected.join(" ").replace(/\s+/g, " ")).trim());
       continue;
     }
     if (rest) {
-      fields[key] =
+      fields.set(
+        key,
         rest.startsWith("[") && rest.endsWith("]")
           ? rest.slice(1, -1).split(",").map(stripSkillQuotes).filter(Boolean)
-          : stripSkillQuotes(rest);
+          : stripSkillQuotes(rest),
+      );
       continue;
     }
     const baseIndent = skillIndent(line);
@@ -720,12 +728,12 @@ export function parseSkillFrontmatter(md: string, sourcePath: string): SkillFron
       items.push(stripSkillQuotes(item[1]!));
       i++;
     }
-    fields[key] = items;
+    fields.set(key, items);
   }
 
-  const name = fields["name"];
-  const description = fields["description"];
-  const requiredCapabilities = fields["requiredCapabilities"] ?? [];
+  const name = fields.get("name");
+  const description = fields.get("description");
+  const requiredCapabilities = fields.get("requiredCapabilities") ?? [];
   if (typeof name !== "string" || !name.trim()) throw new Error(`${sourcePath}: frontmatter is missing "name"`);
   if (!/^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,126}[A-Za-z0-9_-])?$/.test(name)) {
     throw new Error(
@@ -762,6 +770,7 @@ interface SkillEntry {
 export interface SandboxValidation {
   exists: boolean;
   hasDockerfile: boolean;
+  dockerfile?: string;
   tools: ToolEntry[];
   skills: SkillEntry[];
   errors: string[];
@@ -770,44 +779,130 @@ export interface SandboxValidation {
 
 const isFile = (p: string): boolean => {
   try {
-    return statSync(p).isFile();
+    return lstatSync(p).isFile();
   } catch {
     return false;
   }
 };
 
-const subdirs = (dir: string): string[] => {
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isDirectory())
-    .map((e) => e.name)
-    .sort();
-};
-
 const isCidr = (host: string): boolean =>
   /^\d{1,3}(\.\d{1,3}){3}\/\d{1,2}$/.test(host) || /^[0-9A-Fa-f:]+\/\d{1,3}$/.test(host);
+
+function credentialServiceForPath(path: string): string | undefined {
+  const normalized = path.replace(/^\.\//, "");
+  if (normalized.startsWith(".config/")) return normalized.split("/")[1] || undefined;
+  const first = normalized.split("/")[0] ?? "";
+  return first.startsWith(".") && first.length > 1 ? first.slice(1) : undefined;
+}
+
+export function assertRestorableDeploymentLayerBundle(bundle: DeploymentLayerBundle): void {
+  const descriptors = bundle.tools.map((file) => {
+    if (!/^tools\/[^/]+\/tool\.json$/.test(file.path)) {
+      throw new Error(`deployment layer tool path must be tools/<id>/tool.json: ${file.path}`);
+    }
+    return parseToolDescriptor(file.content, file.path);
+  });
+  const ids = new Set<string>();
+  for (const descriptor of descriptors) {
+    if (ids.has(descriptor.id)) throw new Error(`duplicate deployment tool id: ${descriptor.id}`);
+    ids.add(descriptor.id);
+    for (const host of descriptor.egress ?? []) {
+      if (/^[a-z]+:\/\//i.test(host) || (host.includes("/") && !isCidr(host))) {
+        throw new Error(
+          `tool "${descriptor.id}" egress ${JSON.stringify(host)} must name a host or a CIDR range, not a URL or path`,
+        );
+      }
+    }
+  }
+  const brokered = descriptors.filter((descriptor) => descriptor.auth?.broker);
+  if (brokered.length > 1) {
+    throw new Error(
+      `deployment layer declares credential brokers on multiple tools (${brokered.map((descriptor) => descriptor.id).join(", ")}) — ambient credential vending supports one brokered tool per deployment`,
+    );
+  }
+  for (const descriptor of brokered) {
+    const services = new Set(
+      (descriptor.auth?.credentialPaths ?? []).flatMap((entry) => credentialServiceForPath(entry.path) ?? []),
+    );
+    if (!services.has(descriptor.id) && services.size > 1) {
+      throw new Error(
+        `deployment tool "${descriptor.id}" has a credential broker but its credential paths map to multiple services: ${[...services].join(", ")}`,
+      );
+    }
+  }
+  const links = descriptors.flatMap((descriptor) =>
+    (descriptor.auth?.credentialPaths ?? []).map((entry) => ({ id: descriptor.id, ...entry })),
+  );
+  for (const [index, left] of links.entries()) {
+    const right = links.find(
+      (entry, otherIndex) =>
+        otherIndex !== index &&
+        (left.path === entry.path
+          ? left.kind !== entry.kind
+          : nested(left.path, entry.path) || nested(entry.path, left.path)),
+    );
+    if (right) {
+      throw new Error(
+        `tools "${left.id}" and "${right.id}" declare incompatible credential paths ${JSON.stringify(left.path)} and ${JSON.stringify(right.path)} — declare matching kinds for shared paths or disjoint paths`,
+      );
+    }
+  }
+  const skills = new Map<string, Map<string, DeploymentLayerBundle["skills"][number]>>();
+  for (const file of bundle.skills) {
+    const match = /^skills\/([^/]+)\/(.+)$/.exec(file.path);
+    if (!match) throw new Error(`deployment layer skill path must be skills/<id>/<file>: ${file.path}`);
+    const directory = match[1]!;
+    const files = skills.get(directory) ?? new Map<string, DeploymentLayerBundle["skills"][number]>();
+    files.set(file.path, file);
+    skills.set(directory, files);
+  }
+  const names = new Set<string>();
+  for (const [directory, files] of skills) {
+    const manifestPath = `skills/${directory}/SKILL.md`;
+    const manifestFile = files.get(manifestPath);
+    if (!manifestFile) throw new Error(`deployment layer skill ${directory} has no SKILL.md`);
+    const manifest = parseSkillFrontmatter(manifestFile.content, manifestPath);
+    if (names.has(manifest.name)) throw new Error(`duplicate deployment skill name: ${manifest.name}`);
+    names.add(manifest.name);
+  }
+}
 
 export function validateSandboxLayer(sandboxDir: string): SandboxValidation {
   const out: SandboxValidation = {
     exists: existsSync(sandboxDir),
-    hasDockerfile: existsSync(join(sandboxDir, "Dockerfile")),
+    hasDockerfile: false,
     tools: [],
     skills: [],
     errors: [],
     warnings: [],
   };
 
+  let bundle: ReturnType<typeof deploymentLayerBundle> = { contract: 1, tools: [], skills: [] };
+  let skillDirectories: string[] = [];
+  if (out.exists) {
+    try {
+      bundle = deploymentLayerBundle(sandboxDir);
+      assertRestorableDeploymentLayerBundle(bundle);
+      skillDirectories = deploymentLayerTopLevelDirectories(sandboxDir, "skills");
+      const dockerfile = deploymentLayerRootTextFile(sandboxDir, "Dockerfile");
+      if (dockerfile !== undefined) {
+        out.hasDockerfile = true;
+        out.dockerfile = dockerfile;
+      }
+    } catch (error) {
+      out.errors.push(errMessage(error));
+      return out;
+    }
+  }
+
   const toolsDir = join(sandboxDir, "tools");
   const idCounts = new Map<string, number>();
-  for (const name of subdirs(toolsDir)) {
+  for (const file of bundle.tools) {
+    const name = file.path.split("/")[1]!;
     const descriptorPath = join(toolsDir, name, "tool.json");
-    if (!existsSync(descriptorPath)) {
-      out.errors.push(`tools/${name}/ has no tool.json`);
-      continue;
-    }
     let descriptor: ToolDescriptor;
     try {
-      descriptor = parseToolDescriptor(readFileSync(descriptorPath, "utf8"), `tools/${name}/tool.json`);
+      descriptor = parseToolDescriptor(file.content, `tools/${name}/tool.json`);
     } catch (e) {
       out.errors.push(errMessage(e));
       continue;
@@ -865,35 +960,29 @@ export function validateSandboxLayer(sandboxDir: string): SandboxValidation {
   }
 
   const skillsDir = join(sandboxDir, "skills");
-  if (existsSync(skillsDir)) {
-    for (const entry of readdirSync(skillsDir, { withFileTypes: true })) {
-      if (!entry.isDirectory() && !JUNK_FILE.test(entry.name)) {
-        out.errors.push(
-          `skills/${entry.name} is not a skill directory; the core only accepts skills/<id>/<file> paths`,
-        );
+  const skillFiles = new Map(bundle.skills.map((file) => [file.path, file]));
+  const skillNames = new Set(skillDirectories);
+  for (const file of bundle.skills) {
+    const parts = file.path.split("/");
+    if (parts.length < 3) {
+      const name = parts[1] ?? "";
+      if (!JUNK_FILE.test(name)) {
+        out.errors.push(`skills/${name} is not a skill directory; the core only accepts skills/<id>/<file> paths`);
       }
+    } else {
+      skillNames.add(parts[1]!);
     }
   }
-  for (const name of subdirs(skillsDir)) {
+  for (const name of [...skillNames].sort()) {
     const skillPath = join(skillsDir, name, "SKILL.md");
-    if (!existsSync(skillPath)) {
+    const file = skillFiles.get(`skills/${name}/SKILL.md`);
+    if (!file) {
       out.errors.push(`skills/${name}/ has no SKILL.md`);
       continue;
     }
     try {
-      const frontmatter = parseSkillFrontmatter(readFileSync(skillPath, "utf8"), `skills/${name}/SKILL.md`);
+      const frontmatter = parseSkillFrontmatter(file.content, `skills/${name}/SKILL.md`);
       out.skills.push({ dir: name, skillPath, frontmatter });
-    } catch (e) {
-      out.errors.push(errMessage(e));
-    }
-  }
-
-  if (out.exists && out.errors.length === 0) {
-    try {
-      const body = JSON.stringify(deploymentLayerBundle(sandboxDir));
-      if (Buffer.byteLength(body) > 1_000_000) {
-        out.errors.push("deployment layer (skills/ + tool descriptors) exceeds the core API's 1 MB request limit");
-      }
     } catch (e) {
       out.errors.push(errMessage(e));
     }

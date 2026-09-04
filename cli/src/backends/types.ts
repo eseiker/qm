@@ -19,7 +19,6 @@ export interface Backend {
   down(opts: { purge?: boolean }): Promise<void> | void;
   rollback(to?: string): Promise<void> | void;
   doctor(): Promise<void> | void;
-  secretsPush(envFile?: string): Promise<void> | void;
+  secretsPush(values: ReadonlyMap<string, string>): Promise<void> | void;
   checkLive?(opts?: { report?: boolean }): Promise<void> | void;
-  pinSandbox(image: string): Promise<void> | void;
 }

@@ -9,7 +9,7 @@ import {
   type SkillManifest,
   type SkillStore,
 } from "../skills/skill-store.ts";
-import { foreignSkillCollision, parseSeedSkill, sameManifest, upsertSeedSkill } from "../skills/seed.ts";
+import { parseSeedSkill, sameManifest, upsertSeedSkill } from "../skills/seed.ts";
 import {
   bundleFilePaths,
   detectPathCollisions,
@@ -43,6 +43,15 @@ export interface StoredDeploymentLayer {
   bundle: DeploymentLayerBundle;
   resolved: Omit<DeploymentLayerRuntime, "dir">;
   pendingAudits?: DeploymentLayerAuditRevision[];
+  absent?: true;
+  operationId?: string;
+}
+
+export interface DeploymentLayerPrecondition {
+  generation: number;
+  contentHash: string | null;
+  source: "durable" | "filesystem" | "none";
+  operationId: string | null;
 }
 
 interface DeploymentLayerAuditRevision {
@@ -55,7 +64,17 @@ interface DeploymentLayerAuditRevision {
 export interface DeploymentLayerStore {
   hydrate(): Promise<StoredDeploymentLayer | null>;
   get(): Promise<StoredDeploymentLayer | null>;
-  put(bundle: DeploymentLayerBundle, updatedBy: string): Promise<StoredDeploymentLayer>;
+  put(
+    bundle: DeploymentLayerBundle,
+    updatedBy: string,
+    options?: { precondition?: DeploymentLayerPrecondition; operationId?: string },
+  ): Promise<StoredDeploymentLayer>;
+  clear(
+    precondition: DeploymentLayerPrecondition,
+    updatedBy: string,
+    options?: { operationId?: string },
+  ): Promise<StoredDeploymentLayer>;
+  read(): Promise<{ record: StoredDeploymentLayer | null; generation: number; operationId: string | null }>;
   durable: boolean;
   isApplied(contentHash: string): Promise<boolean>;
   live(): {
@@ -66,6 +85,7 @@ export interface DeploymentLayerStore {
 }
 
 export class DeploymentLayerValidationError extends Error {}
+export class DeploymentLayerConflictError extends Error {}
 export class DeploymentLayerPersistedError extends Error {
   readonly record: StoredDeploymentLayer;
 
@@ -77,6 +97,7 @@ export class DeploymentLayerPersistedError extends Error {
 class DeploymentLayerMutationError extends Error {}
 
 const CURRENT = "current";
+const OPERATION_ID = /^[a-f0-9]{32}$/;
 export const LAYER_CREATED_BY = "system:deployment-layer";
 export const LAYER_REVIEWER = "system:deployment-layer-reviewer";
 const pathOrder = (a: DeploymentLayerFile, b: DeploymentLayerFile): number => {
@@ -197,9 +218,47 @@ function contentHash(bundle: DeploymentLayerBundle): string {
   return createHash("sha256").update(JSON.stringify(bundle)).digest("hex");
 }
 
+function validOperationId(operationId: unknown): operationId is string {
+  return typeof operationId === "string" && OPERATION_ID.test(operationId);
+}
+
+function validPrecondition(precondition: DeploymentLayerPrecondition): boolean {
+  if (
+    !Number.isSafeInteger(precondition.generation) ||
+    precondition.generation < 0 ||
+    (precondition.operationId !== null && !validOperationId(precondition.operationId))
+  ) {
+    return false;
+  }
+  if (precondition.source === "durable") {
+    return (
+      precondition.generation >= 1 &&
+      typeof precondition.contentHash === "string" &&
+      /^[a-f0-9]{64}$/.test(precondition.contentHash)
+    );
+  }
+  return (precondition.source === "none" || precondition.source === "filesystem") && precondition.contentHash === null;
+}
+
 function publicResolved(runtime: DeploymentLayerRuntime): Omit<DeploymentLayerRuntime, "dir"> {
   const { dir: _dir, ...resolved } = runtime;
   return resolved;
+}
+
+function blockingForeignSkillCollision(all: Skill[], scopeId: ScopeId, name: string): Skill | undefined {
+  const foreign = all.filter(
+    (skill) =>
+      skill.scopeId === scopeId &&
+      skill.manifest.name === name &&
+      skill.createdBy !== LAYER_CREATED_BY &&
+      skill.status !== "archived",
+  );
+  const published = foreign.find((skill) => skill.status === "published");
+  if (published) return published;
+  const owned = all.some(
+    (skill) => skill.scopeId === scopeId && skill.manifest.name === name && skill.createdBy === LAYER_CREATED_BY,
+  );
+  return owned ? undefined : foreign[0];
 }
 
 function pendingAuditRevisions(record: StoredDeploymentLayer): DeploymentLayerAuditRevision[] {
@@ -244,9 +303,12 @@ export function createDeploymentLayerStore(opts: {
 }): DeploymentLayerStore {
   const now = opts.now ?? Date.now;
   const retryDelaysMs = opts.retryDelaysMs ?? [250, 1000, 4000];
+  const fallbackRuntime = structuredClone(opts.runtime) as DeploymentLayerRuntime;
+  const fallbackSource = fallbackRuntime.dir ? "filesystem" : "none";
   let appliedHash: string | null = null;
   let failedHash: string | null = null;
   let seeded = false;
+  let fallbackManifests: SkillManifest[] | null = null;
   const queue = createKeyedQueue<string>();
   const advisoryLock = opts.advisoryLock ?? createNoopAdvisoryLock();
   const withFleetLock = <T>(fn: () => Promise<T>): Promise<T> => advisoryLock.withLock(SKILL_MATERIALIZATION_LOCK, fn);
@@ -296,10 +358,16 @@ export function createDeploymentLayerStore(opts: {
   const assertNoBundleCollisions = async (manifests: SkillManifest[], all: Skill[]): Promise<void> => {
     const claimed = await activeBundleClaims(all);
     for (const manifest of manifests) {
-      const collision = detectPathCollisions(skillRecordPaths(manifest.name, manifest.files), claimed)[0];
+      const collision = blockingForeignSkillCollision(all, opts.scopeId, manifest.name);
       if (collision) {
         throw new Error(
-          `deployment layer skill "${manifest.name}" materializes over ${collision.path}, already claimed by ${collision.owner}`,
+          `deployment layer skill "${manifest.name}" collides with an existing skill created by ${collision.createdBy}`,
+        );
+      }
+      const pathCollision = detectPathCollisions(skillRecordPaths(manifest.name, manifest.files), claimed)[0];
+      if (pathCollision) {
+        throw new Error(
+          `deployment layer skill "${manifest.name}" materializes over ${pathCollision.path}, already claimed by ${pathCollision.owner}`,
         );
       }
     }
@@ -329,13 +397,73 @@ export function createDeploymentLayerStore(opts: {
     for (const skill of snapshot) await opts.skills.restore(skill);
   };
 
+  const fallbackMatches = async (): Promise<boolean> => {
+    if (!fallbackManifests) return false;
+    if (JSON.stringify(publicResolved(opts.runtime)) !== JSON.stringify(publicResolved(fallbackRuntime))) return false;
+    const active = layerSkills(await opts.skills.list()).filter((skill) => skill.status !== "archived");
+    if (active.length !== fallbackManifests.length) return false;
+    return fallbackManifests.every((manifest) => {
+      const matches = active.filter((skill) => skill.manifest.name === manifest.name);
+      return matches.length === 1 && matches[0]!.status === "published" && sameManifest(matches[0]!.manifest, manifest);
+    });
+  };
+
+  const restoreFallback = async (): Promise<void> => {
+    if (await fallbackMatches()) return;
+    const runtimeSnapshot = structuredClone(opts.runtime) as DeploymentLayerRuntime;
+    const snapshot = layerSkills(await opts.skills.list()).map((skill) => structuredClone(skill));
+    try {
+      for (const skill of snapshot) {
+        if (skill.status !== "archived") await opts.skills.archive(skill.id);
+      }
+      const expected = new Set<string>();
+      let reported = false;
+      if (opts.seedFallback) {
+        const result = await opts.seedFallback();
+        seeded = true;
+        if (result && typeof result === "object") {
+          reported = true;
+          const seed = result as Record<string, unknown>;
+          for (const key of ["installed", "updated", "skipped"] as const) {
+            if (!Array.isArray(seed[key]) || seed[key].some((name) => typeof name !== "string")) {
+              throw new Error("deployment layer filesystem fallback returned an invalid skill result");
+            }
+          }
+          const skipped = seed.skipped as string[];
+          if (skipped.length) {
+            throw new Error(
+              `deployment layer filesystem fallback collides with existing skills: ${skipped.join(", ")}`,
+            );
+          }
+          for (const name of [...(seed.installed as string[]), ...(seed.updated as string[])]) expected.add(name);
+        }
+      }
+      const active = layerSkills(await opts.skills.list()).filter((skill) => skill.status !== "archived");
+      if (!reported) {
+        for (const skill of active) expected.add(skill.manifest.name);
+      }
+      if (
+        active.length !== expected.size ||
+        active.some((skill) => skill.status !== "published" || !expected.has(skill.manifest.name))
+      ) {
+        throw new Error("deployment layer filesystem fallback did not restore its exact skill projection");
+      }
+      fallbackManifests = active.map((skill) => structuredClone(skill.manifest));
+      replaceDeploymentLayer(opts.runtime, fallbackRuntime);
+    } catch (error) {
+      await restoreProjection(snapshot);
+      replaceDeploymentLayer(opts.runtime, runtimeSnapshot);
+      throw new DeploymentLayerMutationError(errMessage(error), { cause: error });
+    }
+  };
+
   const apply = async (record: StoredDeploymentLayer): Promise<void> => {
     const { manifests, runtime: nextRuntime } = validateBundle(record.bundle, `durable:${record.contentHash}`);
-    if (
-      appliedHash === record.contentHash &&
-      (await projectionMatches(record, { bundle: record.bundle, manifests, runtime: nextRuntime }))
-    )
+    if (await projectionMatches(record, { bundle: record.bundle, manifests, runtime: nextRuntime })) {
+      appliedHash = record.contentHash;
+      failedHash = null;
       return;
+    }
     appliedHash = null;
     const all = await opts.skills.list();
     const snapshot = layerSkills(all).map((skill) => structuredClone(skill));
@@ -428,13 +556,63 @@ export function createDeploymentLayerStore(opts: {
       await apply(record);
     } catch (error) {
       reportApplyFailure(record, error);
-      if (!(error instanceof DeploymentLayerMutationError) && opts.seedFallback && !seeded) {
-        await opts.seedFallback();
-        seeded = true;
-      }
+      await restoreFallback();
     }
     return record;
   };
+
+  const matchesPrecondition = (
+    record: StoredDeploymentLayer | null,
+    precondition: DeploymentLayerPrecondition,
+  ): boolean => {
+    if (record?.absent === true || record === null) {
+      return (
+        precondition.contentHash === null &&
+        precondition.source === fallbackSource &&
+        precondition.generation === (record?.version ?? 0) &&
+        precondition.operationId === (record?.operationId ?? null)
+      );
+    }
+    return (
+      precondition.source === "durable" &&
+      precondition.contentHash === record.contentHash &&
+      precondition.generation === record.version &&
+      precondition.operationId === (record.operationId ?? null)
+    );
+  };
+
+  const isForwardRetry = (
+    record: StoredDeploymentLayer | null,
+    precondition: DeploymentLayerPrecondition,
+    hash: string,
+    operationId: string,
+  ): boolean =>
+    record?.absent !== true &&
+    record?.contentHash === hash &&
+    record?.version === precondition.generation + 1 &&
+    record?.operationId === operationId;
+
+  const read = () =>
+    queue(CURRENT, () =>
+      withFleetLock(async () => {
+        const record = await opts.backing.get(CURRENT);
+        if (!record) return { record: null, generation: 0, operationId: null };
+        await auditPersisted(record, false);
+        if (record.absent) {
+          await restoreFallback();
+          return { record: null, generation: record.version, operationId: record.operationId ?? null };
+        }
+        if (failedHash !== record.contentHash) {
+          try {
+            await apply(record);
+          } catch (error) {
+            reportApplyFailure(record, error);
+            await restoreFallback();
+          }
+        }
+        return { record, generation: record.version, operationId: record.operationId ?? null };
+      }),
+    );
 
   return {
     durable: opts.durable ?? false,
@@ -442,7 +620,7 @@ export function createDeploymentLayerStore(opts: {
       if (appliedHash !== hash) return false;
       try {
         const record = await opts.backing.get(CURRENT);
-        return record?.contentHash === hash && projectionMatches(record);
+        return record?.absent !== true && record?.contentHash === hash && projectionMatches(record);
       } catch {
         return false;
       }
@@ -462,11 +640,14 @@ export function createDeploymentLayerStore(opts: {
           const record = await retrying(() => opts.backing.get(CURRENT));
           if (record) {
             await auditPersisted(record, false);
+            if (record.absent) {
+              await restoreFallback();
+              return null;
+            }
             return applyForHydrate(record);
           }
           if (opts.seedFallback && !seeded) {
-            await opts.seedFallback();
-            seeded = true;
+            await restoreFallback();
             let appeared: StoredDeploymentLayer | null = null;
             try {
               appeared = await retrying(() => opts.backing.get(CURRENT));
@@ -480,24 +661,19 @@ export function createDeploymentLayerStore(opts: {
           return null;
         }),
       ),
-    get: () =>
-      queue(CURRENT, () =>
-        withFleetLock(async () => {
-          const record = await opts.backing.get(CURRENT);
-          if (!record) return null;
-          await auditPersisted(record, false);
-          if (failedHash !== record.contentHash) {
-            try {
-              await apply(record);
-            } catch (error) {
-              reportApplyFailure(record, error);
-            }
-          }
-          return record;
-        }),
-      ),
-    put: (input, updatedBy) =>
+    read,
+    get: async () => (await read()).record,
+    put: (input, updatedBy, options = {}) =>
       queue(CURRENT, async () => {
+        if (
+          (options.precondition !== undefined && !validPrecondition(options.precondition)) ||
+          (options.precondition !== undefined && !validOperationId(options.operationId)) ||
+          (options.precondition === undefined && options.operationId !== undefined)
+        ) {
+          throw new DeploymentLayerValidationError(
+            "deployment layer mutation requires an exact revision and operation ID",
+          );
+        }
         let bundle: DeploymentLayerBundle;
         let manifests: SkillManifest[];
         let runtime: DeploymentLayerRuntime;
@@ -510,6 +686,7 @@ export function createDeploymentLayerStore(opts: {
           throw new DeploymentLayerValidationError(errMessage(error), { cause: error });
         }
         const hash = contentHash(bundle);
+        const validated = validateBundle(bundle, `durable:${hash}`);
         const candidate: StoredDeploymentLayer = {
           contentHash: hash,
           version: 1,
@@ -518,6 +695,7 @@ export function createDeploymentLayerStore(opts: {
           bundle,
           resolved: publicResolved(runtime),
           pendingAudits: [],
+          ...(options.operationId !== undefined ? { operationId: options.operationId } : {}),
         };
         return withFleetLock(async () => {
           const existing = await opts.skills.list();
@@ -530,7 +708,7 @@ export function createDeploymentLayerStore(opts: {
           }
           for (const [path, owner] of await activeBundleClaims(existing)) claimed.set(path, owner);
           for (const manifest of manifests) {
-            const clash = foreignSkillCollision(existing, opts.scopeId, manifest.name, LAYER_CREATED_BY);
+            const clash = blockingForeignSkillCollision(existing, opts.scopeId, manifest.name);
             if (clash) {
               throw new DeploymentLayerValidationError(
                 `deployment layer skill "${manifest.name}" collides with an existing skill created by ${clash.createdBy} — rename it or remove the colliding skill`,
@@ -543,6 +721,24 @@ export function createDeploymentLayerStore(opts: {
               );
             }
           }
+          const current = await opts.backing.get(CURRENT);
+          if (
+            options.precondition &&
+            !matchesPrecondition(current, options.precondition) &&
+            !isForwardRetry(current, options.precondition, hash, options.operationId!)
+          ) {
+            throw new DeploymentLayerConflictError("deployment layer changed after the rollback snapshot was taken");
+          }
+          if (
+            current?.absent !== true &&
+            current?.contentHash === hash &&
+            (await projectionMatches(current, validated))
+          ) {
+            await auditPersisted(current, true);
+            appliedHash = hash;
+            failedHash = null;
+            return current;
+          }
           candidate.pendingAudits = [
             {
               contentHash: candidate.contentHash,
@@ -551,11 +747,27 @@ export function createDeploymentLayerStore(opts: {
               updatedBy: candidate.updatedBy,
             },
           ];
-          let record = await opts.backing.putIfAbsent(CURRENT, candidate);
-          if (record.contentHash !== hash) {
+          let record = current ?? (await opts.backing.putIfAbsent(CURRENT, candidate));
+          if (
+            options.precondition &&
+            !matchesPrecondition(record, options.precondition) &&
+            !isForwardRetry(record, options.precondition, hash, options.operationId!)
+          ) {
+            throw new DeploymentLayerConflictError("deployment layer changed after the rollback snapshot was taken");
+          }
+          if (record.absent === true || record.contentHash !== hash) {
             if (!opts.backing.update) throw new Error("deployment layer backing store must support atomic updates");
             const updated = await opts.backing.update(CURRENT, (current) => {
-              if (current.contentHash === hash) return current;
+              if (
+                options.precondition &&
+                !matchesPrecondition(current, options.precondition) &&
+                !isForwardRetry(current, options.precondition, hash, options.operationId!)
+              ) {
+                throw new DeploymentLayerConflictError(
+                  "deployment layer changed after the rollback snapshot was taken",
+                );
+              }
+              if (current.absent !== true && current.contentHash === hash) return current;
               const version = current.version + 1;
               return {
                 ...candidate,
@@ -584,5 +796,79 @@ export function createDeploymentLayerStore(opts: {
           return record;
         });
       }),
+    clear: (precondition, updatedBy, options = {}) =>
+      queue(CURRENT, () =>
+        withFleetLock(async () => {
+          if (
+            !validPrecondition(precondition) ||
+            precondition.source !== "durable" ||
+            precondition.contentHash === null ||
+            !validOperationId(options.operationId)
+          ) {
+            throw new DeploymentLayerValidationError("deployment layer clear requires an exact durable revision");
+          }
+          const replaceContentHash = precondition.contentHash;
+          const operationId = options.operationId;
+          const current = await opts.backing.get(CURRENT);
+          if (
+            current?.absent === true &&
+            current.contentHash === replaceContentHash &&
+            current.version === precondition.generation + 1 &&
+            current.operationId === operationId
+          ) {
+            try {
+              await auditPersisted(current, true);
+              await restoreFallback();
+            } catch (error) {
+              if (error instanceof DeploymentLayerPersistedError) throw error;
+              throw new DeploymentLayerPersistedError(errMessage(error), current, { cause: error });
+            }
+            appliedHash = null;
+            failedHash = null;
+            return current;
+          }
+          if (!matchesPrecondition(current, precondition)) {
+            throw new DeploymentLayerConflictError("deployment layer changed after the rollback snapshot was taken");
+          }
+          if (!opts.backing.update) throw new Error("deployment layer backing store must support atomic updates");
+          const updatedAt = now();
+          const updated = await opts.backing.update(CURRENT, (stored) => {
+            if (
+              stored.absent === true &&
+              stored.contentHash === replaceContentHash &&
+              stored.version === precondition.generation + 1 &&
+              stored.operationId === operationId
+            )
+              return stored;
+            if (!matchesPrecondition(stored, precondition)) {
+              throw new DeploymentLayerConflictError("deployment layer changed after the rollback snapshot was taken");
+            }
+            const version = stored.version + 1;
+            return {
+              ...stored,
+              absent: true,
+              version,
+              updatedAt,
+              updatedBy,
+              operationId,
+              pendingAudits: [
+                ...pendingAuditRevisions(stored),
+                { contentHash: replaceContentHash, version, updatedAt, updatedBy },
+              ],
+            };
+          });
+          if (!updated) throw new Error("deployment layer clear conflicted with a concurrent delete; retry");
+          try {
+            await auditPersisted(updated, true);
+            await restoreFallback();
+          } catch (error) {
+            if (error instanceof DeploymentLayerPersistedError) throw error;
+            throw new DeploymentLayerPersistedError(errMessage(error), updated, { cause: error });
+          }
+          appliedHash = null;
+          failedHash = null;
+          return updated;
+        }),
+      ),
   };
 }

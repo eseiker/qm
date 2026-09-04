@@ -6,6 +6,8 @@ import { egressDecision, hostMatches, isHostDenied, type EgressVerdict } from ".
 import { createEgressAuditSink, type EgressAuditRecord, type EgressAuditSink } from "./admin/egress-audit-sink.ts";
 import { createPostgresEgressAuditSink } from "./admin/postgres-egress-audit-sink.ts";
 import { signedRequestHeaders } from "./auth/source-auth-sign.ts";
+import { sourceAuthFetch } from "./auth/source-auth-fetch.ts";
+import { isStrongSigningSecret, MIN_SIGNING_SECRET_BYTES } from "./auth/source-auth.ts";
 import { createSweeper } from "./util/sweeper.ts";
 import { errMessage } from "./util/errors.ts";
 import { numEnv } from "./config.ts";
@@ -123,6 +125,9 @@ async function decide(
 }
 
 export function buildEgressAuthzServer(deps: EgressAuthzDeps): Server {
+  if (deps.capabilitySecret !== undefined && !isStrongSigningSecret(deps.capabilitySecret)) {
+    throw new Error(`CAPABILITY_SECRET must be at least ${MIN_SIGNING_SECRET_BYTES} UTF-8 bytes`);
+  }
   const lookup = deps.lookup ?? defaultLookup;
   async function checkStatus(
     req: IncomingMessage,
@@ -192,14 +197,18 @@ export function createRelayAuditSink(
     try {
       const batch = buffer.slice(0, RELAY_MAX_BATCH);
       const body = JSON.stringify({ records: batch });
-      const res = await fetchImpl(url, {
-        method: "POST",
-        headers: signedRequestHeaders(signingSecret, "POST", pathWithQuery, body, {
-          "content-type": "application/json",
-        }),
-        body,
-        signal: AbortSignal.timeout(10_000),
-      });
+      const res = await sourceAuthFetch(
+        url,
+        {
+          method: "POST",
+          headers: signedRequestHeaders(signingSecret, "POST", pathWithQuery, body, {
+            "content-type": "application/json",
+          }),
+          body,
+          signal: AbortSignal.timeout(10_000),
+        },
+        fetchImpl,
+      );
       if (!res.ok) throw new Error(`core responded ${res.status}`);
       buffer.splice(0, batch.length);
       if (dropped > 0) {

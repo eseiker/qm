@@ -50,12 +50,36 @@ durable, mutable `admin_grants` store, and this surface derives admin status fro
 that, admins are promoted/revoked at runtime through the Users tab (a redeploy never clobbers
 runtime grants).
 
-`QM_VERSION` enables release checks. Browser deployment additionally requires
-`QM_UPDATE_GITHUB_REPOSITORY` and a fine-grained `QM_UPDATE_GITHUB_TOKEN` with Actions
-read/write access. `QM_UPDATE_GITHUB_REF` defaults to `main` and
-`QM_UPDATE_GITHUB_WORKFLOW` defaults to `qm-update.yml`. Without that integration, Admin
-keeps the exact command fallback. Update jobs are authorized and audited in core and remain
-durable in Postgres while GitHub Actions performs the deployment.
+The baked QM package manifest enables a read-only release notice. Outside production, a non-empty
+`QM_VERSION` environment value takes precedence for controlled development runs. Production
+always uses the baked package manifest. Admin checks npm's
+promoted `/latest` manifest, accepts only a non-deprecated stable `X.Y.Z` release, and shows
+the exact pinned CLI update command with its GitHub release page. Admin never starts or tracks a deployment.
+CLI-managed deployments without custom workload images can run the command; custom-image
+and other systems use the version details in their normal rollout path. Results are cached
+briefly in each Admin process, and a registry outage does not affect the rest of the surface.
+
+The operator runs that exact command as same-owner exclusive maintenance: finish every other QM
+CLI command and package-manager write for the deployment directory first, and start
+neither until the update exits.
+
+Deployments migrating from the retired Admin-dispatched GitHub updater must first
+cancel every queued or running job for every configured or detected legacy workflow,
+including renamed copies, and wait for terminal status. Only then may they remove every
+workflow copy and all `QM_UPDATE_GITHUB_*` settings, delete the GitHub repository
+secret `QM_DEPLOY_ENV`, revoke the old GitHub token and remove every resident
+`QM_UPDATE_GITHUB_TOKEN` copy, then revoke and delete the retired source credential
+`FLY_SANDBOX_API_TOKEN` from every repository, host, and CI secret store and unset
+its deployed core `FLY_API_TOKEN` alias. Removing or disabling a workflow or
+redeploying Admin does not cancel those GitHub jobs.
+That app-scoped token cleanup is separate from operator migration of legacy
+`sandbox.env` or `sandbox.secretEnv`. After the replacement delivery path is verified,
+the legacy fields are removed, and the deployment is rolled, the operator removes the
+old source for that target. That means `FLY_RESIDENT_ENV_<name>` app secrets after the
+affected Fly app rollout no longer references them, `${aws.secretsPrefix}<name>`
+Secrets Manager entries after the new AWS task definition no longer references them,
+or the original `<name>` entries in the Docker deployment's `.env` or environment
+source after the replacement container rollout.
 
 ## How it stays safe
 
@@ -73,8 +97,7 @@ durable in Postgres while GitHub Actions performs the deployment.
 
 `GET /` (UI) · `GET /healthz` · `GET /api/me` + `GET /api/whoami` (identity + derived admin
 status) · `POST /api/logout` ·
-`GET /api/update` (eligible release and durable job status for admins) ·
-`POST /api/update` (dispatch the exact reviewed release) ·
+`GET /api/update` (promoted stable release notice for admins) ·
 `GET /api/scopes/:scopeId` + `PUT /api/scopes/:scopeId/:resource`
 (`command-policy|soul|egress`) ·
 `GET /api/{metrics|errors|audit|crons|deployments|skills|sessions|runs|files}?scope=` ·

@@ -50,9 +50,9 @@ function childEnv(env: NodeJS.ProcessEnv, passEnv: readonly string[]): NodeJS.Pr
 }
 
 function stringValues(env: NodeJS.ProcessEnv): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(env)) if (typeof value === "string") out[key] = value;
-  return out;
+  return Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
 }
 
 function timeout(value: unknown, at: string, fallback: number, max: number): number {

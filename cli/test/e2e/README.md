@@ -22,7 +22,7 @@ They load the repo's `./.env` into the child environment (so `ANTHROPIC_API_KEY`
 | `init`             | `init` (+ `--org`/`--target`, clobber refusal)                                          | scaffolds, then **round-trips through `check`**            |
 | `check`            | `check` (+ `--sandbox-dir`)                                                             | pass on a valid layer; exit 1 naming each break            |
 | `plan`             | `plan` = `up --dry-run` (docker) (+ `--build-from`/`--config`/`--sandbox-dir`/basePort) | asserts the resolved plan; verifies it starts nothing      |
-| `sandbox-build`    | `sandbox build --dry-run` (+ `--from`/`--app`/`--tag`)                                  | asserts the generated Dockerfile + push command            |
+| `sandbox-build`    | `sandbox build --dry-run` (+ `--from`/`--tag`)                                          | asserts the generated Dockerfile + local build command     |
 | `docker-lifecycle` | `up`→`status`→`logs`→`down`/`--purge`                                                   | **real Docker daemon**, asserts against docker's own state |
 | `identity`         | `init`→`check`→`slack render`→`outputs` with a custom `botName`                         | brands the real manifest; outputs rejects a stale one      |
 | `fly`              | `plan`/`status`/`logs`/`down`/`--target`/`--only`/`-f` (fly)                            | a **fake flyctl** records the exact commands issued        |

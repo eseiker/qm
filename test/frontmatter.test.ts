@@ -90,6 +90,26 @@ test("accepts a BOM and CRLF without changing the body line endings", () => {
   assert.equal(parsed.body, "line one\r\nline two\r\n");
 });
 
+test("frontmatter preserves prototype-like keys as ordered own data", () => {
+  const { attrs } = parseFrontmatter(`---
+before: one
+__proto__:
+  - proto-value
+constructor: constructor-value
+prototype: prototype-value
+after: two
+---
+body`);
+  assert.deepEqual(Object.keys(attrs), ["before", "__proto__", "constructor", "prototype", "after"]);
+  assert.equal(Object.getPrototypeOf(attrs), Object.prototype);
+  assert.equal(Object.hasOwn(attrs, "__proto__"), true);
+  assert.deepEqual(attrs.__proto__, ["proto-value"]);
+  assert.equal(attrs.constructor, "constructor-value");
+  assert.equal(attrs.prototype, "prototype-value");
+  assert.deepEqual(Object.keys(JSON.parse(JSON.stringify(attrs)) as Record<string, unknown>), Object.keys(attrs));
+  assert.equal((Object.prototype as { polluted?: unknown }).polluted, undefined);
+});
+
 test("seed skill names cannot escape or alias their materialized directory", () => {
   const skill = (name: string) => `---\nname: ${name}\ndescription: test\n---\nbody`;
   for (const name of ["..", ".", "foo/bar", "foo\\bar", "foo bar", ".hidden", "foo."]) {

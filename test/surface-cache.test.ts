@@ -288,6 +288,20 @@ test("mentions round-trip through ingest → readMessages (memory)", async () =>
   assert.deepEqual(after[0]!.mentions, { U1: "jordan" }, "a mention-less edit keeps the prior mentions");
 });
 
+test("prototype-like mentions round-trip through the memory surface cache", async () => {
+  const mentions = JSON.parse(
+    '{"__proto__":"proto-name","constructor":"constructor-name","prototype":"prototype-name"}',
+  ) as Record<string, string>;
+  const cache = createMemorySurfaceCache();
+  await cache.ingest([{ container: "C1", ts: "101.0", text: "names", mentions, createdAt: 1 }]);
+  const output = (await cache.readMessages("C1"))[0]!.mentions!;
+  assert.deepEqual(Object.keys(output), ["__proto__", "constructor", "prototype"]);
+  assert.equal(Object.getPrototypeOf(output), Object.prototype);
+  assert.equal(Object.hasOwn(output, "__proto__"), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(output)), mentions);
+  assert.equal((Object.prototype as { polluted?: unknown }).polluted, undefined);
+});
+
 test("mentionsSelf round-trips through ingest → readMessages (memory)", async () => {
   const cache = createMemorySurfaceCache();
   await cache.ingest([

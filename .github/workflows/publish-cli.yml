@@ -3,108 +3,758 @@ name: Publish the QM CLI
 on:
   workflow_call:
     inputs:
-      images_ref:
-        description: Commit SHA whose published images the package should pin
-        required: false
+      image_manifest:
+        description: Digest-pinned image manifest produced by the signing workflow
+        required: true
+        type: string
+      origin_run_id:
+        description: Workflow run recorded by the package provenance
+        required: true
+        type: string
+      sha:
+        description: Commit that produced the release package
+        required: true
         type: string
       version:
-        description: Version to publish, overriding cli/package.json
-        required: false
+        description: Exact stable version to publish
+        required: true
         type: string
+    secrets:
+      NPM_TOKEN:
+        required: true
+      RELEASE_SETTINGS_TOKEN:
+        required: true
     outputs:
       manifest:
         description: The image manifest the published package pins
         value: ${{ jobs.package.outputs.manifest }}
-  workflow_dispatch:
-    inputs:
-      images_ref:
-        description: Commit SHA whose published images the package should pin
-        required: false
-      version:
-        description: Version to publish, overriding cli/package.json
-        required: false
+      origin_run_id:
+        description: Workflow run cryptographically verified by the package provenance
+        value: ${{ jobs.package.outputs.origin_run_id }}
 
 permissions:
   contents: read
   id-token: write
 
+env:
+  NPM_CONFIG_DRY_RUN: "false"
+  NPM_CONFIG_GLOBALCONFIG: /dev/null
+  NPM_CONFIG_PREFER_ONLINE: "true"
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+  NPM_CONFIG_WORKSPACES: "false"
+
 jobs:
-  package:
-    if: github.ref == 'refs/heads/main'
+  prepare:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
       manifest: ${{ steps.pin.outputs.manifest }}
+      tarball_sha256: ${{ steps.pack.outputs.tarball_sha256 }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           persist-credentials: false
+          ref: ${{ inputs.sha }}
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version-file: .node-version
           registry-url: https://registry.npmjs.org
-          cache: npm
-          cache-dependency-path: cli/package-lock.json
-      - name: Install, typecheck, packed-artifact test
-        working-directory: cli
-        run: |
-          npm ci
-          npm run typecheck
-          npm run test:pack
-      - name: Pin published image digests
-        id: pin
+          scope: "@yc-software"
+      - name: Validate release inputs
         env:
-          IMAGES_REF: ${{ inputs.images_ref || github.sha }}
+          ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+          RELEASE_SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          out=$(jq -n '{sandboxBase: "", services: {}}')
-          for service in core web-ui admin portal auth sandbox-base; do
-            repo="yc-software/qm/$service"
-            token=$(curl -fsS "https://ghcr.io/token?scope=repository:$repo:pull&service=ghcr.io" | jq -r .token)
-            digest=$(curl -fsS -o /dev/null -D - -H "Authorization: Bearer $token" \
-              -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json' \
-              "https://ghcr.io/v2/$repo/manifests/$IMAGES_REF" \
-              | tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" { print $2 }')
-            if [ -z "$digest" ]; then
-              echo "no published image for $repo at $IMAGES_REF" >&2
-              exit 1
-            fi
-            ref="ghcr.io/$repo@$digest"
-            if [ "$service" = sandbox-base ]; then
-              out=$(printf '%s' "$out" | jq --arg r "$ref" '.sandboxBase = $r')
-            else
-              out=$(printf '%s' "$out" | jq --arg k "$service" --arg r "$ref" '.services[$k] = $r')
-            fi
-          done
-          printf '%s\n' "$out" > cli/manifest.json
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "packages must be published from main; this run is on $GITHUB_REF" >&2
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "version must be stable semver, got $VERSION" >&2
+            exit 1
+          fi
+          if [[ ! "$ORIGIN_RUN_ID" =~ ^[1-9][0-9]*$ ]] || [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release origin must contain a workflow run and full commit" >&2
+            exit 1
+          fi
+          checkout_sha=$(git rev-parse HEAD)
+          if [ "$checkout_sha" != "$RELEASE_SHA" ]; then
+            echo "release checkout is $checkout_sha, not $RELEASE_SHA" >&2
+            exit 1
+          fi
+          source_version=$(jq -r .version cli/package.json)
+          if [ "$VERSION" != "$source_version" ]; then
+            echo "release version $VERSION does not match cli/package.json $source_version" >&2
+            exit 1
+          fi
+      - name: Install and typecheck
+        working-directory: cli
+        run: |
+          npm --registry="$NPM_CONFIG_REGISTRY" \
+            --@yc-software:registry="$NPM_CONFIG_REGISTRY" \
+            --workspaces=false ci
+          npm run typecheck
+      - name: Pin signed image digests
+        id: pin
+        env:
+          IMAGE_MANIFEST: ${{ inputs.image_manifest }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$IMAGE_MANIFEST" | jq -c . > cli/manifest.json
+          jq -e -s '
+            def service_name:
+              type == "string" and test("^[a-z0-9]+(-[a-z0-9]+)*$");
+            def digest:
+              type == "string"
+              and test("^sha256:[0-9a-f]{64}$")
+              and (test("^sha256:(.)\\1{63}$") | not);
+            def image_ref($service):
+              type == "string"
+              and (split("@") as $parts
+                | ($parts | length) == 2
+                and $parts[0] == ("ghcr.io/yc-software/qm/" + $service)
+                and ($parts[1] | digest));
+            length == 1
+            and (.[0]
+              | type == "object"
+              and keys == ["sandboxBase", "services"]
+              and (.sandboxBase | image_ref("sandbox-base"))
+              and (.services | type == "object" and length > 0 and (has("sandbox-base") | not))
+              and all(.services | to_entries[];
+                . as $entry
+                | ($entry.key | service_name)
+                  and ($entry.value | image_ref($entry.key))))' \
+            cli/manifest.json > /dev/null
           cat cli/manifest.json
-          jq -e '[.sandboxBase] + [.services[]]
-                 | length == 6
-                 and all(test("^ghcr\\.io/yc-software/qm/[a-z-]+@sha256:[0-9a-f]{64}$"))
-                 and all(test("@sha256:(.)\\1{63}$") | not)' cli/manifest.json > /dev/null
           printf 'manifest=%s\n' "$(jq -c . cli/manifest.json)" >> "$GITHUB_OUTPUT"
-      - name: Publish
+      - name: Build the release package
+        working-directory: cli
+        run: npm run --ignore-scripts=true prepack
+      - name: Test the built release artifact
+        working-directory: cli
+        env:
+          NPM_CONFIG_IGNORE_SCRIPTS: "true"
+        run: npm run test:pack
+      - name: Pack the prepared release artifact
+        id: pack
         working-directory: cli
         env:
           VERSION: ${{ inputs.version }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -n "$VERSION" ]; then
-            npm version "$VERSION" --no-git-tag-version --allow-same-version > /dev/null
+          validate_package_json() {
+            jq -e \
+              --arg version "$VERSION" \
+              '.name == "@yc-software/qm"
+               and .version == $version
+               and .repository == {
+                 type: "git",
+                 url: "git+https://github.com/yc-software/qm.git",
+                 directory: "cli"
+               }
+               and .publishConfig == {access: "public", provenance: true}
+               and ((.dependencies // {}) == {})
+               and ((.optionalDependencies // {}) == {})
+               and ((.peerDependencies // {}) == {})
+               and ((.bundledDependencies // []) == [])
+               and ((.bundleDependencies // []) == [])
+               and .scripts.prepack == "npm run build"
+               and all((.scripts // {}) | keys[];
+                 test("^(preinstall|install|postinstall|prepare|prepublish|prepublishOnly|postpack|publish|postpublish)$") | not)' \
+              "$1" > /dev/null
+          }
+          expected_filename="yc-software-qm-$VERSION.tgz"
+          validate_package_json package.json
+          expected_dir=$(mktemp -d)
+          expected_pack=$(npm pack --json --dry-run=false --ignore-scripts=true --pack-destination "$expected_dir")
+          expected_name=$(printf '%s' "$expected_pack" | jq -er \
+            --arg expected "$expected_filename" \
+            'if type == "array" and length == 1 and .[0].filename == $expected
+             then .[0].filename
+             else error("unexpected npm pack result")
+             end')
+          expected_tarball="$expected_dir/$expected_name"
+          packed_package=$(mktemp)
+          packed_manifest=$(mktemp)
+          tar -xOzf "$expected_tarball" package/package.json > "$packed_package"
+          tar -xOzf "$expected_tarball" package/manifest.json > "$packed_manifest"
+          validate_package_json "$packed_package"
+          if ! cmp --silent package.json "$packed_package"; then
+            echo "packed package.json differs from the prepared source" >&2
+            exit 1
           fi
-          version=$(jq -r .version package.json)
-          if npm view "@yc-software/qm@$version" version > /dev/null 2>&1; then
-            published=$(mktemp -d)
-            tarball=$(npm pack "@yc-software/qm@$version" --pack-destination "$published" --silent | tail -1)
-            tar -xzf "$published/$tarball" -C "$published" package/manifest.json
-            if [ "$(jq -Sc . "$published/package/manifest.json")" != "$(jq -Sc . manifest.json)" ]; then
-              echo "@yc-software/qm@$version is on npm pinning different image digests; bump the version" >&2
+          if ! cmp --silent manifest.json "$packed_manifest"; then
+            echo "packed image manifest differs from the prepared source" >&2
+            exit 1
+          fi
+          confirmation_dir=$(mktemp -d)
+          confirmation_pack=$(npm pack --json --dry-run=false --ignore-scripts=true --pack-destination "$confirmation_dir")
+          confirmation_name=$(printf '%s' "$confirmation_pack" | jq -er \
+            --arg expected "$expected_filename" \
+            'if type == "array" and length == 1 and .[0].filename == $expected
+             then .[0].filename
+             else error("unexpected npm pack confirmation")
+             end')
+          confirmation_tarball="$confirmation_dir/$confirmation_name"
+          if ! cmp --silent "$expected_tarball" "$confirmation_tarball"; then
+            echo "QM $VERSION does not produce a deterministic package tarball" >&2
+            exit 1
+          fi
+          mkdir "$GITHUB_WORKSPACE/prepared-cli"
+          install -m 0444 "$expected_tarball" "$GITHUB_WORKSPACE/prepared-cli/qm-cli.tgz"
+          tarball_sha256=$(sha256sum "$GITHUB_WORKSPACE/prepared-cli/qm-cli.tgz" | cut -d ' ' -f 1)
+          printf 'tarball_sha256=%s\n' "$tarball_sha256" >> "$GITHUB_OUTPUT"
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: qm-cli-prepared-${{ github.run_id }}-${{ github.run_attempt }}
+          path: prepared-cli/qm-cli.tgz
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: false
+          retention-days: 7
+
+  package:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      manifest: ${{ steps.verify.outputs.manifest }}
+      origin_run_id: ${{ steps.publish.outputs.origin_run_id }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.sha }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          path: prepared-cli-artifact
+          merge-multiple: true
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version-file: .node-version
+          registry-url: https://registry.npmjs.org
+          scope: "@yc-software"
+      - uses: sigstore/cosign-installer@faadad0cce49287aee09b3a48701e75088a2c6ad
+        with:
+          cosign-release: v3.1.3
+      - name: Verify the prepared release artifact
+        id: verify
+        env:
+          EXPECTED_ARTIFACT_ID: ${{ needs.prepare.outputs.artifact_id }}
+          EXPECTED_TARBALL_SHA256: ${{ needs.prepare.outputs.tarball_sha256 }}
+          IMAGE_MANIFEST: ${{ inputs.image_manifest }}
+          ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+          PREPARED_MANIFEST: ${{ needs.prepare.outputs.manifest }}
+          RELEASE_SHA: ${{ inputs.sha }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          validate_package_json() {
+            jq -e \
+              --arg version "$VERSION" \
+              '.name == "@yc-software/qm"
+               and .version == $version
+               and .repository == {
+                 type: "git",
+                 url: "git+https://github.com/yc-software/qm.git",
+                 directory: "cli"
+               }
+               and .publishConfig == {access: "public", provenance: true}
+               and ((.dependencies // {}) == {})
+               and ((.optionalDependencies // {}) == {})
+               and ((.peerDependencies // {}) == {})
+               and ((.bundledDependencies // []) == [])
+               and ((.bundleDependencies // []) == [])
+               and .scripts.prepack == "npm run build"
+               and all((.scripts // {}) | keys[];
+                 test("^(preinstall|install|postinstall|prepare|prepublish|prepublishOnly|postpack|publish|postpublish)$") | not)' \
+              "$1" > /dev/null
+          }
+          validate_image_manifest() {
+            jq -e -s '
+              def service_name:
+                type == "string" and test("^[a-z0-9]+(-[a-z0-9]+)*$");
+              def digest:
+                type == "string"
+                and test("^sha256:[0-9a-f]{64}$")
+                and (test("^sha256:(.)\\1{63}$") | not);
+              def image_ref($service):
+                type == "string"
+                and (split("@") as $parts
+                  | ($parts | length) == 2
+                  and $parts[0] == ("ghcr.io/yc-software/qm/" + $service)
+                  and ($parts[1] | digest));
+              length == 1
+              and (.[0]
+                | type == "object"
+                and keys == ["sandboxBase", "services"]
+                and (.sandboxBase | image_ref("sandbox-base"))
+                and (.services | type == "object" and length > 0 and (has("sandbox-base") | not))
+                and all(.services | to_entries[];
+                  . as $entry
+                  | ($entry.key | service_name)
+                    and ($entry.value | image_ref($entry.key))))' \
+              "$1" > /dev/null
+          }
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "packages must be published from main; this run is on $GITHUB_REF" >&2
+            exit 1
+          fi
+          if [[ ! "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] \
+            || [[ ! "$ORIGIN_RUN_ID" =~ ^[1-9][0-9]*$ ]] \
+            || [[ ! "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || [[ ! "$EXPECTED_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]] \
+            || [[ ! "$EXPECTED_TARBALL_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "prepared release metadata is invalid" >&2
+            exit 1
+          fi
+          checkout_sha=$(git rev-parse HEAD)
+          if [ "$checkout_sha" != "$RELEASE_SHA" ]; then
+            echo "release checkout is $checkout_sha, not $RELEASE_SHA" >&2
+            exit 1
+          fi
+          source_version=$(jq -r .version cli/package.json)
+          if [ "$source_version" != "$VERSION" ]; then
+            echo "release version $VERSION does not match cli/package.json $source_version" >&2
+            exit 1
+          fi
+          artifact_root="$GITHUB_WORKSPACE/prepared-cli-artifact"
+          artifact="$artifact_root/qm-cli.tgz"
+          mapfile -d '' artifact_entries < <(find "$artifact_root" -mindepth 1 -maxdepth 1 -print0)
+          if [ "${#artifact_entries[@]}" -ne 1 ] \
+            || [ "${artifact_entries[0]}" != "$artifact" ] \
+            || [ ! -f "$artifact" ] \
+            || [ -L "$artifact" ]; then
+            echo "prepared artifact must contain exactly one regular qm-cli.tgz file" >&2
+            exit 1
+          fi
+          actual_tarball_sha256=$(sha256sum "$artifact" | cut -d ' ' -f 1)
+          if [ "$actual_tarball_sha256" != "$EXPECTED_TARBALL_SHA256" ]; then
+            echo "prepared artifact digest does not match the prepare job" >&2
+            exit 1
+          fi
+          archive_members=$(mktemp)
+          tar -tzf "$artifact" > "$archive_members"
+          if ! awk '
+            BEGIN { valid = 1 }
+            !/^package\// { valid = 0 }
+            /(^|\/)\.\.?($|\/)/ { valid = 0 }
+            /\\/ { valid = 0 }
+            $0 == "package/package.json" { package_json += 1 }
+            $0 == "package/manifest.json" { manifest_json += 1 }
+            {
+              segment_count = split($0, segments, "/")
+              for (segment = 1; segment <= segment_count; segment += 1) {
+                if (segments[segment] == ".npmrc"
+                  || segments[segment] == ".git"
+                  || segments[segment] == "node_modules") {
+                  valid = 0
+                }
+              }
+            }
+            END { exit !(valid && NR > 0 && package_json == 1 && manifest_json == 1) }
+          ' "$archive_members"; then
+            echo "prepared artifact contains invalid, forbidden, or duplicate package paths" >&2
+            exit 1
+          fi
+          archive_types=$(mktemp)
+          tar -tvzf "$artifact" > "$archive_types"
+          if ! awk '
+            BEGIN { valid = 1 }
+            substr($0, 1, 1) != "-" && substr($0, 1, 1) != "d" { valid = 0 }
+            END { exit !(NR > 0 && valid) }
+          ' "$archive_types"; then
+            echo "prepared artifact contains a link or special entry" >&2
+            exit 1
+          fi
+          extract_root="$GITHUB_WORKSPACE/prepared-cli-package"
+          mkdir "$extract_root"
+          tar -xzf "$artifact" --directory "$extract_root" --no-same-owner --no-same-permissions
+          package_dir="$extract_root/package"
+          mapfile -d '' extracted_entries < <(find "$extract_root" -mindepth 1 -maxdepth 1 -print0)
+          if [ "${#extracted_entries[@]}" -ne 1 ] \
+            || [ "${extracted_entries[0]}" != "$package_dir" ] \
+            || [ ! -d "$package_dir" ] \
+            || [ -L "$package_dir" ]; then
+            echo "prepared artifact must extract to exactly one package directory" >&2
+            exit 1
+          fi
+          if find "$package_dir" \( -type l -o \( ! -type f -a ! -type d \) \) -print -quit | grep -q .; then
+            echo "prepared package contains a link or special file" >&2
+            exit 1
+          fi
+          expected_manifest=$(mktemp)
+          reported_manifest=$(mktemp)
+          printf '%s\n' "$IMAGE_MANIFEST" | jq -c . > "$expected_manifest"
+          printf '%s\n' "$PREPARED_MANIFEST" > "$reported_manifest"
+          validate_image_manifest "$expected_manifest"
+          if ! cmp --silent "$expected_manifest" "$reported_manifest" \
+            || ! cmp --silent "$expected_manifest" "$package_dir/manifest.json"; then
+            echo "prepared package image manifest does not match the release input" >&2
+            exit 1
+          fi
+          validate_package_json "$package_dir/package.json"
+          if ! cmp --silent cli/package.json "$package_dir/package.json"; then
+            echo "prepared package.json differs from the exact release checkout" >&2
+            exit 1
+          fi
+          repack_dir=$(mktemp -d)
+          repack=$(npm --registry="$NPM_CONFIG_REGISTRY" \
+            --@yc-software:registry="$NPM_CONFIG_REGISTRY" \
+            --workspaces=false pack "$package_dir" \
+            --json \
+            --dry-run=false \
+            --ignore-scripts=true \
+            --pack-destination "$repack_dir")
+          repack_name=$(printf '%s' "$repack" | jq -er \
+            --arg expected "yc-software-qm-$VERSION.tgz" \
+            'if type == "array" and length == 1 and .[0].filename == $expected
+             then .[0].filename
+             else error("unexpected prepared package repack")
+             end')
+          if ! cmp --silent "$artifact" "$repack_dir/$repack_name"; then
+            echo "prepared package does not reproduce its exact tarball without scripts" >&2
+            exit 1
+          fi
+          package_git_root=$(git -C "$package_dir" rev-parse --show-toplevel)
+          if [ "$package_git_root" != "$GITHUB_WORKSPACE" ]; then
+            echo "prepared package is not inside the exact release checkout" >&2
+            exit 1
+          fi
+          printf 'manifest=%s\n' "$(< "$expected_manifest")" >> "$GITHUB_OUTPUT"
+      - name: Publish or verify the release candidate
+        id: publish
+        working-directory: ${{ runner.temp }}
+        env:
+          BASH_ENV: /dev/null
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+          RELEASE_SHA: ${{ inputs.sha }}
+          RELEASE_SETTINGS_TOKEN: ${{ secrets.RELEASE_SETTINGS_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          npm_token=$NODE_AUTH_TOKEN
+          settings_token=$RELEASE_SETTINGS_TOKEN
+          unset NODE_AUTH_TOKEN RELEASE_SETTINGS_TOKEN
+          npm_registry() {
+            npm --registry="$NPM_CONFIG_REGISTRY" \
+              --@yc-software:registry="$NPM_CONFIG_REGISTRY" \
+              --workspaces=false "$@"
+          }
+          require_immutable_releases() {
+            immutable_settings=$(GH_TOKEN="$settings_token" gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/immutable-releases")
+            printf '%s' "$immutable_settings" \
+              | jq -e '.enabled == true and (.enforced_by_owner | type == "boolean")' > /dev/null
+          }
+          require_release_rulesets() {
+            rulesets=$(GH_TOKEN="$settings_token" gh api --paginate \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/rulesets?includes_parents=false&targets=tag&per_page=100" \
+              | jq -sc '[.[][]]')
+            mapfile -t ruleset_ids < <(printf '%s' "$rulesets" | jq -er '.[] | .id | numbers')
+            creation_rulesets=0
+            lock_rulesets=0
+            for ruleset_id in "${ruleset_ids[@]}"; do
+              ruleset=$(GH_TOKEN="$settings_token" gh api \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=false")
+              if printf '%s' "$ruleset" | jq -e \
+                '.source_type == "Repository"
+                 and .target == "tag"
+                 and .enforcement == "active"
+                 and .conditions.ref_name.include == ["refs/tags/v*"]
+                 and .conditions.ref_name.exclude == []
+                 and (.rules | type == "array")
+                 and ([.rules[].type] | sort == ["creation"])' > /dev/null; then
+                creation_rulesets=$((creation_rulesets + 1))
+              fi
+              if printf '%s' "$ruleset" | jq -e \
+                '.source_type == "Repository"
+                 and .target == "tag"
+                 and .enforcement == "active"
+                 and .conditions.ref_name.include == ["refs/tags/v*"]
+                 and .conditions.ref_name.exclude == []
+                 and (.rules | type == "array")
+                 and ([.rules[].type] | sort == ["deletion", "update"])' > /dev/null; then
+                lock_rulesets=$((lock_rulesets + 1))
+              fi
+            done
+            if [ "$creation_rulesets" -lt 1 ] || [ "$lock_rulesets" -lt 1 ]; then
+              echo "distinct active repository rulesets must restrict refs/tags/v* creation and lock its update and deletion" >&2
+              return 1
+            fi
+          }
+          validate_dist_tags() {
+            printf '%s' "$1" | jq -e \
+              --arg semver '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' \
+              --arg stable '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              'type == "object"
+               and (.latest | type == "string" and test($stable))
+               and all(to_entries[];
+                 (.value | type == "string") and (.value | test($semver)))
+               and ((has("release-candidate") | not)
+                 or (.["release-candidate"] | type == "string" and test($stable)))' > /dev/null
+          }
+          newest_stable_dist_tag() {
+            printf '%s' "$1" | jq -r \
+              --arg stable '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+              '.[] | select(test($stable))' \
+              | sort -V \
+              | tail -1
+          }
+          expected_tarball="$GITHUB_WORKSPACE/prepared-cli-artifact/qm-cli.tgz"
+          publish_directory="$GITHUB_WORKSPACE/prepared-cli-package/package"
+          if [ ! -f "$expected_tarball" ] || [ ! -d "$publish_directory" ]; then
+            echo "verified release package is unavailable" >&2
+            exit 1
+          fi
+          verified_origin_file=$(mktemp)
+          verify_published() {
+            published=$(npm_registry view "@yc-software/qm@$VERSION" version deprecated gitHead dist --json \
+              --min-release-age=0)
+            published_version=$(printf '%s' "$published" | jq -er '.version | strings')
+            published_git_head=$(printf '%s' "$published" | jq -er '.gitHead | strings')
+            published_integrity=$(printf '%s' "$published" | jq -er '.dist.integrity | strings')
+            provenance_url=$(printf '%s' "$published" | jq -er '.dist.attestations.url | strings')
+            if [ "$published_version" != "$VERSION" ]; then
+              echo "npm resolved @yc-software/qm@$VERSION to unexpected version $published_version" >&2
               exit 1
             fi
-            echo "@yc-software/qm@$version is already on npm pinning these digests; keeping it"
-          else
-            npm publish --provenance --access public
+            if printf '%s' "$published" | jq -e 'has("deprecated")' > /dev/null; then
+              echo "refusing deprecated QM $VERSION" >&2
+              exit 1
+            fi
+            if [ "$published_git_head" != "$RELEASE_SHA" ]; then
+              echo "@yc-software/qm@$VERSION was published from $published_git_head, not $RELEASE_SHA" >&2
+              exit 1
+            fi
+            if [ "$provenance_url" != "https://registry.npmjs.org/-/npm/v1/attestations/@yc-software%2fqm@$VERSION" ]; then
+              echo "@yc-software/qm@$VERSION has an unexpected provenance URL" >&2
+              exit 1
+            fi
+            remote_dir=$(mktemp -d)
+            remote_pack=$(npm_registry pack \
+              "@yc-software/qm@$VERSION" \
+              --json \
+              --pack-destination "$remote_dir" \
+              --min-release-age=0)
+            remote_tarball="$remote_dir/$(printf '%s' "$remote_pack" | jq -er '.[0].filename | strings')"
+            if ! cmp --silent "$expected_tarball" "$remote_tarball"; then
+              echo "@yc-software/qm@$VERSION differs from this run's packed artifact" >&2
+              exit 1
+            fi
+            tarball_integrity="sha512-$(openssl dgst -sha512 -binary "$remote_tarball" | openssl base64 -A)"
+            if [ "$published_integrity" != "$tarball_integrity" ]; then
+              echo "@yc-software/qm@$VERSION tarball does not match its registry integrity" >&2
+              exit 1
+            fi
+            provenance_dir=$(mktemp -d)
+            (cd "$provenance_dir" && npm init --yes > /dev/null)
+            npm_registry install \
+              --prefix "$provenance_dir" \
+              --ignore-scripts \
+              --audit=false \
+              --fund=false \
+              --save-exact \
+              --min-release-age=0 \
+              "@yc-software/qm@$VERSION" > /dev/null
+            audit=$(mktemp)
+            bundle=$(mktemp)
+            statement=$(mktemp)
+            predicate=https://slsa.dev/provenance/v1
+            timeout 180s npm \
+              --registry="$NPM_CONFIG_REGISTRY" \
+              --@yc-software:registry="$NPM_CONFIG_REGISTRY" \
+              --workspaces=false \
+              audit signatures --json --include-attestations=true \
+              --prefix "$provenance_dir" --min-release-age=0 > "$audit"
+            jq -e \
+              --arg predicate "$predicate" \
+              --arg provenance_url "$provenance_url" \
+              --arg version "$VERSION" \
+              '.invalid == []
+               and .missing == []
+               and (.verified | type == "array" and length == 1)
+               and (.verified[0] |
+                 .name == "@yc-software/qm"
+                 and .version == $version
+                 and .location == "node_modules/@yc-software/qm"
+                 and (.registry | rtrimstr("/")) == "https://registry.npmjs.org"
+                 and .attestations.url == $provenance_url
+                 and .attestations.provenance.predicateType == $predicate
+                 and (.attestationBundles | type == "array")
+                 and ([.attestationBundles[] | select(.predicateType == $predicate)] | length == 1))' \
+              "$audit" > /dev/null
+            jq -e \
+              --arg predicate "$predicate" \
+              '[.verified[0].attestationBundles[] | select(.predicateType == $predicate)][0].bundle' \
+              "$audit" > "$bundle"
+            cosign verify-blob-attestation "$remote_tarball" \
+              --bundle "$bundle" \
+              --certificate-identity="https://github.com/$GITHUB_REPOSITORY/.github/workflows/publish-cli.yml@refs/heads/main" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              --certificate-github-workflow-name=Release \
+              --certificate-github-workflow-repository="$GITHUB_REPOSITORY" \
+              --certificate-github-workflow-ref=refs/heads/main \
+              --certificate-github-workflow-sha="$RELEASE_SHA" \
+              --certificate-github-workflow-trigger=workflow_dispatch \
+              --type="$predicate" > /dev/null
+            jq -er '.dsseEnvelope.payload | strings' "$bundle" | base64 --decode > "$statement"
+            tarball_sha512=$(sha512sum "$remote_tarball" | cut -d ' ' -f 1)
+            jq -e \
+              --arg package "pkg:npm/%40yc-software/qm@$VERSION" \
+              --arg repository "https://github.com/$GITHUB_REPOSITORY" \
+              --arg sha "$RELEASE_SHA" \
+              --arg sha512 "$tarball_sha512" \
+              --arg invocation "^https://github\\.com/yc-software/qm/actions/runs/$ORIGIN_RUN_ID/attempts/[1-9][0-9]*$" \
+              '._type == "https://in-toto.io/Statement/v1"
+               and .predicateType == "https://slsa.dev/provenance/v1"
+               and (.subject == [{name: $package, digest: {sha512: $sha512}}])
+               and .predicate.buildDefinition.buildType == "https://slsa-framework.github.io/github-actions-buildtypes/workflow/v1"
+               and .predicate.buildDefinition.externalParameters.workflow == {
+                 ref: "refs/heads/main",
+                 repository: $repository,
+                 path: ".github/workflows/release.yml"
+               }
+               and .predicate.buildDefinition.internalParameters.github == {
+                 event_name: "workflow_dispatch",
+                 repository_id: "1316527318",
+                 repository_owner_id: "153323858"
+               }
+               and any(.predicate.buildDefinition.resolvedDependencies[];
+                 .uri == ("git+" + $repository + "@refs/heads/main")
+                 and .digest == {gitCommit: $sha})
+               and .predicate.runDetails.builder.id == "https://github.com/actions/runner/github-hosted"
+               and (.predicate.runDetails.metadata.invocationId | test($invocation))' \
+              "$statement" > /dev/null
+            invocation_id=$(jq -er '.predicate.runDetails.metadata.invocationId | strings' "$statement")
+            if [[ "$invocation_id" =~ ^https://github\.com/yc-software/qm/actions/runs/([1-9][0-9]*)/attempts/[1-9][0-9]*$ ]]; then
+              verified_origin_run_id="${BASH_REMATCH[1]}"
+            else
+              echo "@yc-software/qm@$VERSION has invalid release invocation $invocation_id" >&2
+              exit 1
+            fi
+            if [ "$verified_origin_run_id" != "$ORIGIN_RUN_ID" ]; then
+              echo "@yc-software/qm@$VERSION belongs to workflow run $verified_origin_run_id, not $ORIGIN_RUN_ID" >&2
+              exit 1
+            fi
+            printf '%s\n' "$verified_origin_run_id" > "$verified_origin_file"
+          }
+          tags=$(npm_registry view @yc-software/qm dist-tags --json)
+          validate_dist_tags "$tags"
+          latest=$(printf '%s' "$tags" | jq -er '.latest | strings')
+          candidate=$(printf '%s' "$tags" | jq -r '.["release-candidate"] // empty')
+          exact_error=$(mktemp)
+          set +e
+          published=$(npm_registry view "@yc-software/qm@$VERSION" version --json \
+            --min-release-age=0 2> "$exact_error")
+          lookup_status=$?
+          set -e
+          if [ "$lookup_status" -eq 0 ]; then
+            published_version=$(printf '%s' "$published" | jq -er 'strings')
+            if [ "$published_version" != "$VERSION" ]; then
+              echo "npm resolved @yc-software/qm@$VERSION to unexpected version $published_version" >&2
+              exit 1
+            fi
+          elif ! printf '%s' "$published" | jq -e '.error.code == "E404"' > /dev/null; then
+            cat "$exact_error" >&2
+            printf '%s\n' "$published" >&2
+            exit "$lookup_status"
           fi
-          if [ "$version" = 0.1.5 ]; then
-            npm deprecate @yc-software/qm@1.0.5 "Published with an incorrect version number; use 0.1.5."
+          publish_status=0
+          if [ "$lookup_status" -ne 0 ]; then
+            if [ "$RELEASE_SHA" != "$GITHUB_SHA" ] || [ "$ORIGIN_RUN_ID" != "$GITHUB_RUN_ID" ]; then
+              echo "new packages must be published by their source workflow run and commit" >&2
+              exit 1
+            fi
+            if [ -n "$candidate" ] && [ "$candidate" != "$latest" ]; then
+              echo "release-candidate QM $candidate is unfinished; dispatch recovery_version=$candidate before publishing QM $VERSION" >&2
+              exit 1
+            fi
+            newest=$(newest_stable_dist_tag "$tags")
+            if [ "$VERSION" = "$newest" ] || [ "$(printf '%s\n%s\n' "$newest" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+              echo "refusing to stage stale QM $VERSION after QM $newest" >&2
+              exit 1
+            fi
+            require_release_rulesets
+            require_immutable_releases
+            set +e
+            NODE_AUTH_TOKEN="$npm_token" npm_registry publish "$publish_directory" \
+              --provenance \
+              --access public \
+              --tag release-candidate \
+              --ignore-scripts=true \
+              --dry-run=false
+            publish_status=$?
+            set -e
           fi
+          verified=false
+          for _ in $(seq 1 10); do
+            set +e
+            (
+              set -euo pipefail
+              verify_published
+            )
+            verification_status=$?
+            set -e
+            if [ "$verification_status" -eq 0 ]; then
+              verified=true
+              break
+            fi
+            sleep 6
+          done
+          if [ "$verified" != true ]; then
+            if [ "$publish_status" -ne 0 ]; then exit "$publish_status"; fi
+            echo "@yc-software/qm@$VERSION did not become fully verifiable after publication" >&2
+            exit 1
+          fi
+          candidate_ready=false
+          candidate_status=0
+          for attempt in $(seq 1 5); do
+            tags=$(npm_registry view @yc-software/qm dist-tags --json)
+            validate_dist_tags "$tags"
+            candidate=$(printf '%s' "$tags" | jq -r '.["release-candidate"] // empty')
+            newest=$(newest_stable_dist_tag "$tags")
+            if [ "$(printf '%s\n%s\n' "$newest" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+              echo "verified older QM $VERSION without moving release-candidate back from QM ${candidate:-unset}"
+              candidate_ready=true
+              break
+            fi
+            if [ "$candidate" = "$VERSION" ]; then
+              candidate_ready=true
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              break
+            fi
+            set +e
+            NODE_AUTH_TOKEN="$npm_token" npm_registry dist-tag add "@yc-software/qm@$VERSION" release-candidate
+            candidate_status=$?
+            set -e
+            sleep 3
+          done
+          if [ "$candidate_ready" != true ]; then
+            echo "release-candidate did not converge to QM $VERSION" >&2
+            if [ "$candidate_status" -ne 0 ]; then exit "$candidate_status"; fi
+            exit 1
+          fi
+          verified_origin_run_id=$(< "$verified_origin_file")
+          if [[ ! "$verified_origin_run_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo "package provenance did not yield a verified workflow run" >&2
+            exit 1
+          fi
+          printf 'origin_run_id=%s\n' "$verified_origin_run_id" >> "$GITHUB_OUTPUT"

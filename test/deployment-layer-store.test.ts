@@ -226,6 +226,50 @@ test("with no durable record the filesystem seed applies once, and a later durab
   assert.equal((await skills.resolve("acme", [org])).skill?.manifest.body, "durable body\n");
 });
 
+test("an absent durable sentinel keeps an unchanged filesystem fallback stable across hydrates", async () => {
+  const backing = createMemoryMap<StoredDeploymentLayer>();
+  const skills = createSkillStore({ signingSecret: "layer-test" });
+  const org = scopeId("org", "default-org");
+  let seeded = 0;
+  const store = createDeploymentLayerStore({
+    backing,
+    runtime: emptyDeploymentLayer(),
+    skills,
+    scopeId: org,
+    seedFallback: async () => {
+      seeded++;
+      const fallback = await skills.create({
+        scopeId: org,
+        manifest: { name: "fallback", description: "Baked in.", requiredCapabilities: [], body: "fallback" },
+        createdBy: "system:deployment-layer",
+      });
+      await skills.review(fallback.id, "system:deployment-layer-reviewer", []);
+      await skills.publish(fallback.id);
+      return { installed: ["fallback"], updated: [], skipped: [] };
+    },
+  });
+  await store.hydrate();
+  const durable = await store.put({ contract: 1, tools: [tool("durable")], skills: [] }, "api");
+  await store.clear(
+    {
+      generation: durable.version,
+      contentHash: durable.contentHash,
+      source: "durable",
+      operationId: durable.operationId ?? null,
+    },
+    "api",
+    { operationId: "2".repeat(32) },
+  );
+  const active = (await skills.list()).find(
+    (candidate) => candidate.manifest.name === "fallback" && candidate.status === "published",
+  );
+  assert.ok(active);
+  await store.hydrate();
+  await store.hydrate();
+  assert.equal(seeded, 2);
+  assert.equal((await skills.resolve("fallback", [org])).skill?.id, active.id);
+});
+
 test("hydrate retries a transient backing read instead of failing boot", async () => {
   const backing = createMemoryMap<StoredDeploymentLayer>();
   let flaked = 0;
@@ -272,22 +316,40 @@ test("a stored record that no longer applies degrades to the seed instead of fai
     })(),
   });
   const skills = createSkillStore({ signingSecret: "layer-test" });
+  const org = scopeId("org", "default-org");
+  const stale = await skills.create({
+    scopeId: org,
+    manifest: { name: "stale", description: "Stale durable skill.", requiredCapabilities: [], body: "stale" },
+    createdBy: "system:deployment-layer",
+  });
+  await skills.review(stale.id, "system:deployment-layer-reviewer", []);
+  await skills.publish(stale.id);
   const runtime = resolvedDeploymentLayer("/fallback", []);
   let seeded = 0;
   const store = createDeploymentLayerStore({
     backing,
     runtime,
     skills,
-    scopeId: scopeId("org", "default-org"),
+    scopeId: org,
     retryDelaysMs: [1],
     seedFallback: async () => {
       seeded++;
+      const fallback = await skills.create({
+        scopeId: org,
+        manifest: { name: "fallback", description: "Filesystem fallback.", requiredCapabilities: [], body: "fallback" },
+        createdBy: "system:deployment-layer",
+      });
+      await skills.review(fallback.id, "system:deployment-layer-reviewer", []);
+      await skills.publish(fallback.id);
+      return { installed: ["fallback"], updated: [], skipped: [] };
     },
   });
   const record = await store.hydrate();
   const logged = errors.length;
   assert.equal(record?.contentHash, "poisoned", "hydrate resolves — boot is not bricked");
   assert.equal(seeded, 1, "the baked-in seed serves until a valid layer is PUT");
+  assert.equal((await skills.resolve("stale", [org])).skill, null);
+  assert.equal((await skills.resolve("fallback", [org])).skill?.manifest.body, "fallback");
   assert.equal((await store.get())?.contentHash, "poisoned", "status reads do not retry the failed apply as a 500");
   assert.equal(store.live().source, "filesystem", "status reads leave the fallback runtime in place");
   await store.hydrate();
@@ -460,6 +522,75 @@ test("a mid-seed layer that fails during skill mutation keeps the fallback live 
   assert.equal(store.live().source, "filesystem");
   assert.equal((await store.hydrate())?.contentHash, "appeared-partial");
   assert.equal(store.live().source, "durable", "the refresh retry applies once the transient skill-store error clears");
+});
+
+test("a durable mutation failure replaces stale layer skills with the filesystem fallback", async (t) => {
+  t.mock.method(console, "error", () => undefined);
+  const backing = createMemoryMap<StoredDeploymentLayer>();
+  const baseSkills = createSkillStore({ signingSecret: "layer-test" });
+  const org = scopeId("org", "default-org");
+  const stale = await baseSkills.create({
+    scopeId: org,
+    manifest: { name: "stale", description: "Stale durable skill.", requiredCapabilities: [], body: "stale" },
+    createdBy: "system:deployment-layer",
+  });
+  await baseSkills.review(stale.id, "system:deployment-layer-reviewer", []);
+  await baseSkills.publish(stale.id);
+  let fail = true;
+  const skills = {
+    ...baseSkills,
+    create: async (input: Parameters<typeof baseSkills.create>[0]) => {
+      if (fail && input.manifest.name === "b") {
+        fail = false;
+        throw new Error("skill write failed");
+      }
+      return baseSkills.create(input);
+    },
+  };
+  const durable = createDeploymentLayerStore({
+    backing,
+    runtime: emptyDeploymentLayer(),
+    skills: createSkillStore({ signingSecret: "durable-writer" }),
+    scopeId: org,
+  });
+  await durable.put(
+    {
+      contract: 1,
+      tools: [],
+      skills: [
+        { path: "skills/a/SKILL.md", content: "---\nname: a\ndescription: A.\n---\na\n" },
+        { path: "skills/b/SKILL.md", content: "---\nname: b\ndescription: B.\n---\nb\n" },
+      ],
+    },
+    "writer",
+  );
+  const runtime = resolvedDeploymentLayer("/fallback", []);
+  const store = createDeploymentLayerStore({
+    backing,
+    runtime,
+    skills,
+    scopeId: org,
+    retryDelaysMs: [],
+    seedFallback: async () => {
+      const fallback = await baseSkills.create({
+        scopeId: org,
+        manifest: { name: "fallback", description: "Filesystem fallback.", requiredCapabilities: [], body: "fallback" },
+        createdBy: "system:deployment-layer",
+      });
+      await baseSkills.review(fallback.id, "system:deployment-layer-reviewer", []);
+      await baseSkills.publish(fallback.id);
+      return { installed: ["fallback"], updated: [], skipped: [] };
+    },
+  });
+
+  await store.hydrate();
+  assert.equal(store.live().source, "filesystem");
+  assert.equal((await baseSkills.resolve("stale", [org])).skill, null);
+  assert.equal((await baseSkills.resolve("fallback", [org])).skill?.manifest.body, "fallback");
+  await store.hydrate();
+  assert.equal(store.live().source, "durable");
+  assert.equal((await baseSkills.resolve("fallback", [org])).skill, null);
+  assert.equal((await baseSkills.resolve("b", [org])).skill?.manifest.body, "b\n");
 });
 
 test("misplaced tool files are rejected, not silently ignored", async () => {
@@ -997,7 +1128,7 @@ test("a foreign skill racing after validation reports the revision as persisted 
   await assert.rejects(
     store.put({ contract: 1, tools: [tool("acme CLI")], skills: skill }, "test"),
     (error: unknown) =>
-      error instanceof DeploymentLayerPersistedError && /collides with an existing non-layer skill/.test(error.message),
+      error instanceof DeploymentLayerPersistedError && /collides with an existing skill/.test(error.message),
   );
   const record = await backing.get("current");
   assert.ok(record, "the accepted durable revision remains current");

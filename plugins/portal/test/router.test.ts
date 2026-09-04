@@ -550,6 +550,16 @@ test("admin-status probe is memoized within the TTL (one round-trip per sub)", a
   assert.equal(whoamiProbes - before, 1, "the sub is probed once then served from the 60s cache");
 });
 
+test("concurrent admin-status probes share one upstream request", async () => {
+  const before = whoamiProbes;
+  await Promise.all(
+    Array.from({ length: 10 }, () =>
+      fetch(`${base}/admin/api/me`, { headers: { cookie: sessionCookie("U-concurrent-admin") } }),
+    ),
+  );
+  assert.equal(whoamiProbes - before, 1);
+});
+
 test("impersonate start: non-admin is refused; cross-origin is refused; self-target is rejected", async () => {
   const nonAdmin = await fetch(`${base}/auth/impersonate?target=alice@acme`, {
     method: "POST",

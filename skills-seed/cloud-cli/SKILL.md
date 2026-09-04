@@ -12,9 +12,9 @@ copy and restores it if the machine is replaced — if the token is still gone, 
 
 ## First: is the CLI even here?
 
-**Do not assume the binary is on PATH.** The sandbox image ships a small, fixed tool set,
-and the "Your computer" block in your prompt lists what is installed and what is not — read
-it, or just check:
+**Do not assume the binary is on PATH.** Agent-computer inventory varies by backend, and
+the "Your computer" block in your prompt lists what is installed and what is not — read it,
+or just check:
 
 ```bash
 command -v aws || echo "not installed"
@@ -22,13 +22,14 @@ command -v aws || echo "not installed"
 
 If it is missing, say so and pick a path rather than failing halfway:
 
-- **Install it for this task** if the image allows it and the task is worth it — the
+- **Install it for this task** if the computer allows it and the task is worth it — the
   provider's own installer, into the workspace or `$HOME`, not a system path. Say that you
-  installed it; it lasts as long as the machine's disk.
+  installed it; it lasts as long as the resident computer's disk.
 - **Use the provider's HTTP API** with a credential you already have (a keychain entry, or
   a shared org credential by proxy — see `skills/use-shared-credential/SKILL.md`).
-- **Ask the operator** to add the CLI to the sandbox image if this will recur. That is the
-  durable fix; a per-turn install is not.
+- **Ask the operator** to provision the CLI through the selected backend's supported
+  agent-computer setup if this will recur. Sprites is managed directly and does not consume
+  a deployment OCI sandbox image; a per-task install is not fleet provisioning.
 
 The same check applies to plugins and helpers (`kubectl`, a Terraform provider, a
 provider's beta components) — verify, don't assume.
@@ -80,9 +81,9 @@ minutes, so if the user takes too long, start a fresh one.
 
 - Add the provider's sign-in and regional service endpoints to the org egress allowlist —
   both the identity endpoints the login needs and the service endpoints your workflows call.
-- Ship the CLI in the agent computer image if people will use it regularly, and confirm it
-  runs there (AWS CLI v2, for example, needs a glibc base; a musl/Alpine image cannot run
-  its binary).
+- Provision the CLI through the selected backend's supported agent-computer setup if people
+  will use it regularly, and confirm it runs there (AWS CLI v2, for example, needs glibc;
+  a musl/Alpine environment cannot run its binary).
 - Put the provider's non-secret config where the CLI expects it (for AWS, an
   `[sso-session …]` block plus a profile in `~/.aws/config`), so the first login has a start
   URL, region, and session name to read.

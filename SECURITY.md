@@ -167,13 +167,232 @@ these, not through them.
 
 ## Dependency cooldown
 
+The release workflow requires `RELEASE_SETTINGS_TOKEN`, a fine-grained token or GitHub
+App token with repository Administration read access. It uses that token only to require
+the versioned immutable-releases endpoint to report `enabled: true` and to verify the
+structures of the release tag rulesets before irreversible work and immediately before npm
+and GitHub publication. It never changes repository settings.
+
+Release tags require `RELEASE_TAG_TOKEN`, a fine-grained Contents write token belonging to
+a dedicated machine user. Two distinct active repository tag rulesets must each include
+exactly `refs/tags/v*` and exclude no refs. One contains only the creation restriction and
+grants its sole `always` bypass to that machine user. The other contains only update and
+deletion restrictions and has no bypass actors. The workflow first uses the token to
+validate that it resolves to a user account, then uses it to create the annotated tag
+object and ref, after which even that actor cannot move or delete it.
+GitHub's REST API omits bypass actors from ruleset responses for Administration read
+credentials, so the workflow verifies both enforceable structures but cannot prove either
+bypass list. Repository administrators must establish and audit the sole creation bypass
+and empty lock bypass out of band; dispatch remains contingent on that operator control.
+
+Fresh tag, release, and asset checks prevent a raced draft from reaching image aliases or
+npm `latest`, but they cannot make GitHub's draft publication atomic or undo a published
+npm version. The tag rulesets prevent ordinary Contents writers from racing or moving the
+tag. A compromised creation actor can preempt a not-yet-created tag, a writer can race a
+draft asset, and an administrator can race a settings change; each can still strand a
+version. Post-publication checks detect that state and stop promotion rather than prevent
+the denial of service. Restrict those privileges as an operational trust boundary. Enable
+release immutability and configure both release credentials and both rulesets before
+dispatching a release.
+
 To blunt npm supply-chain attacks (compromised maintainer publishes a malicious
 version that is caught and yanked within hours), newly published package versions must
 age for **7 days** before they can enter a lockfile. This is enforced by
 `min-release-age=7` in `.npmrc` (honored by npm ≥ 11.10.0, pinned via `.node-version`).
 The cooldown gates `npm install`/`npm update`; CI installs with `npm ci` from the
-committed lockfiles and is unaffected. Urgent security fixes can be pulled in ahead of
-the window by installing the exact version explicitly.
+committed lockfiles and is unaffected. Pulling an urgent security fix ahead of the
+window requires both an exact reviewed version and an explicit `min-release-age=0`
+override.
+
+`qm update --yes --version <version>` has a separate trust boundary. It accepts only
+the exact stable package currently promoted on npm's `latest` tag and requires the
+native npm bundled with Node to be `>=11.12.0 and <12`. Using a private home,
+temporary directory, and cache, it downloads that package from the official registry
+with lifecycle scripts disabled, verifies its npm signatures and SLSA attestation
+against QM's official release workflow and source commit, and checks its embedded
+image manifest. Only then does that trusted native npm install the exact dependency
+from the private cache without network access. npm owns the resulting `package.json`,
+`package-lock.json`, and `node_modules` changes; QM does not implement a parallel
+package transaction. The automatic path requires an existing exact registry pin and
+refuses a local package link; normalize a source checkout through its ordinary
+trusted package-manager workflow first.
+
+On macOS, the deployment tree and external local-input and environment paths must be
+free of extended ACLs. Their mutation-controlling ancestors may have deny-only ACLs,
+but no permission-granting ACL entries. On Linux, trusted `getfacl`, `getfattr`, and
+`lsattr` commands must be available on the launcher `PATH`; protected paths must be
+free of extended access and default ACLs, extended attributes, and immutable file flags.
+
+`qm update --yes` is supported on macOS and Linux, not Windows.
+
+### One-time bootstrap from QM 0.1.7 and earlier
+
+Published QM 0.1.7 and earlier do not contain `qm update`. For the one-time
+bootstrap to the first hardened updater, do not install or execute the new package
+through the deployment's npm project. The trusted Node code below obtains the exact
+current stable version directly from the official npm registry over HTTPS and rejects
+anything except stable semver. That mutable registry value selects a tag but does not
+authenticate source. The matching protected immutable annotated tag, not registry or
+release prose, is the source trust anchor. The commands require that tag to point
+directly to a commit whose message has the exact official repository identity, version,
+peeled commit, bootstrap link, and fixed warning. Independently inspect the recorded
+official Actions run when verifying release provenance. From a trusted, clean operator
+shell, create a fresh clone in a mode-0700 temporary directory outside the deployment,
+then invoke the verified source entry with trusted Node 24 or newer from the deployment
+directory:
+
+```bash
+set -euo pipefail
+bootstrap=$(mktemp -d)
+chmod 700 "$bootstrap"
+version=$(
+  node --input-type=module <<'NODE'
+import { get } from "node:https";
+
+const response = await new Promise((resolve, reject) => {
+  const request = get(
+    "https://registry.npmjs.org/@yc-software%2fqm/latest",
+    { headers: { accept: "application/json" } },
+    resolve,
+  );
+  request.on("error", reject);
+});
+if (response.statusCode !== 200) throw new Error(`npm registry returned HTTP ${response.statusCode}`);
+response.setEncoding("utf8");
+let body = "";
+for await (const chunk of response) {
+  body += chunk;
+  if (body.length > 1_000_000) throw new Error("npm registry response is too large");
+}
+const metadata = JSON.parse(body);
+const stable = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+if (typeof metadata.version !== "string" || !stable.test(metadata.version)) {
+  throw new Error("npm latest is not stable semver");
+}
+if (Object.hasOwn(metadata, "deprecated")) throw new Error("npm latest is deprecated");
+process.stdout.write(metadata.version);
+NODE
+)
+tag="v$version"
+repository=yc-software/qm
+repository_id=1316527318
+git clone --filter=blob:none --no-checkout --no-tags "https://github.com/$repository.git" "$bootstrap/qm"
+git -C "$bootstrap/qm" fetch --depth=1 --no-tags origin "refs/tags/$tag:refs/tags/$tag"
+tag_ref="refs/tags/$tag"
+test "$(git -C "$bootstrap/qm" cat-file -t "$tag_ref")" = tag
+tag_object=$(git -C "$bootstrap/qm" cat-file -p "$tag_ref")
+release_commit=$(git -C "$bootstrap/qm" rev-parse "$tag_ref^{commit}")
+test "$(printf '%s\n' "$tag_object" | sed -n '1p')" = "object $release_commit"
+test "$(printf '%s\n' "$tag_object" | sed -n '2p')" = "type commit"
+test "$(printf '%s\n' "$tag_object" | sed -n '3p')" = "tag $tag"
+tag_message=$(git -C "$bootstrap/qm" for-each-ref --format='%(contents)' "$tag_ref")
+test "$(printf '%s\n' "$tag_message" | sed -n '1p')" = "QM release provenance"
+test "$(printf '%s\n' "$tag_message" | sed -n '2p')" = "Repository: $repository ($repository_id)"
+printf '%s\n' "$tag_message" | sed -n '3p' | grep -Eq '^Run: https://github\.com/yc-software/qm/actions/runs/[1-9][0-9]*$'
+test "$(printf '%s\n' "$tag_message" | sed -n '4p')" = "Commit: $release_commit"
+test "$(printf '%s\n' "$tag_message" | sed -n '5p')" = "Version: $version"
+printf '%s\n' "$tag_message" | sed -n '6p' | grep -Eq '^Images: sha256:[0-9a-f]{64}$'
+test "$(printf '%s\n' "$tag_message" | sed -n '7p')" = "Bootstrap for QM 0.1.7 and earlier: https://github.com/$repository/blob/$release_commit/SECURITY.md#one-time-bootstrap-from-qm-017-and-earlier"
+test "$(printf '%s\n' "$tag_message" | sed -n '8p')" = "Bootstrap only from this immutable annotated tag after verifying its repository, commit, and version marker; release notes and mutable main are not trust sources. Never use deployment npm, npm exec, npx, or package scripts."
+test -z "$(printf '%s\n' "$tag_message" | sed -n '9p')"
+git -C "$bootstrap/qm" checkout --detach "$release_commit"
+test "$(git -C "$bootstrap/qm" rev-parse HEAD)" = "$release_commit"
+cd /absolute/path/to/deployment
+node "$bootstrap/qm/cli/bin/qm.ts" update --yes --version "$version"
+```
+
+Use only the verified immutable annotated tag, never editable release prose, mutable
+`main`, `curl | node`, `npm install`, `npm exec`, `npx`, or a package script for this
+bootstrap. The pinned source launcher performs the hardened package signature, SLSA
+provenance, source-commit, and manifest verification before npm can change the
+deployment. After the first hardened version is installed, use the direct installed
+entry below for later updates.
+
+The installed `@yc-software/qm` package and its `dist/bin/qm.js` entry point are
+part of the trusted launcher boundary and must be unchanged before the updater
+starts. Run the updater only from a trusted, clean operator shell whose `PATH`
+resolves `node` to a trusted Node executable, by invoking that entry point directly:
+
+```bash
+node node_modules/@yc-software/qm/dist/bin/qm.js update --yes --version <version>
+```
+
+Never launch an update through `npm exec`, `npx`, a package script, or another
+npm-mediated launcher. npm processes the deployment's project `.npmrc` and package
+settings before QM starts, outside the updater's isolated npm environment. Ambient
+preloads and loaders also execute before QM; `NODE_OPTIONS`, `NODE_PATH`, and platform
+dynamic-loader variables such as `LD_PRELOAD`, `LD_LIBRARY_PATH`,
+`DYLD_INSERT_LIBRARIES`, and `DYLD_LIBRARY_PATH` must be absent or independently
+trusted. They are part of the trusted launcher boundary. Routine non-update commands
+continue to use `npm exec --yes=false -- qm <command>`.
+
+Only npm verification and mutation are isolated. Provider reconciliation runs the
+verified CLI from a temporary working directory with absolute deployment inputs, but
+intentionally trusts the operator's external home, ambient provider variables, agent
+and keyring sockets, provider configuration and credentials, credential helpers, CLI
+plugins and aliases, proxy and CA settings, and external provider executables.
+Provider executables, transitive helpers, and plugins receive the operator's filtered
+ambient environment and external `PATH`; their interpreter and runtime loaders,
+caches, output paths, and delegated executables are not exhaustively isolated.
+Provider reconciliation is state-changing and may modify provider resources, just as
+ordinary `up` can. Every path those trusted inputs delegate to is trusted too; they must not reference
+deployment-controlled code. The external objects and every alias to them must not be
+writable through the deployment. Direct `PATH` entries that resolve inside the
+deployment are excluded; explicit provider-configuration paths that do so are
+rejected.
+
+The updater never converts ambient operator-shell values into deployment workload
+secrets. Local values must already be in the explicit deployment environment file;
+existing remote provider secret stores remain authoritative.
+
+An update is same-owner, exclusive maintenance for its deployment directory. Finish
+every other QM CLI command and package-manager write before starting it, and do not
+start either kind of operation until the update exits. Admin is a read-only npm
+`latest` notice; the operator runs the exact version-pinned command it reports. There
+is no updater journal, atomicity claim, or rollback. After any forced kill, confirm
+that no descendant npm, Node/QM, Docker, Fly, AWS, or other provider process remains
+before repairing the package or running a recovery command. If npm is interrupted,
+inspect the checkout and repair it with version control and the trusted npm workflow,
+normally by restoring `package.json` and `package-lock.json` and running
+`npm ci --ignore-scripts`, before retrying. If the later provider `up` fails, the new
+verified exact pin remains in place.
+On Docker or Fly, reconcile it with `npm exec --yes=false -- qm up`; on AWS, use
+`npm exec --yes=false -- qm up --yes`. Then review and commit the durable tracked
+changes.
+
+The exact direct Node command above is retryable only while that version remains npm
+`latest`.
+
+Legacy `sandbox.env` and `sandbox.secretEnv` need an operator-controlled credential
+migration before an update. Direct Sprites has no resident environment injection, so
+QM cannot infer a safe replacement destination. Move each value or credential to the
+supported tool, skill, connector, or keychain delivery path used by its consumer,
+verify that consumer can use the replacement, remove the legacy fields, and roll the
+deployment. After verifying the live consumer, finish the target-specific cleanup. On
+Fly, confirm the affected app rollout no longer references the old injection, then
+delete each `FLY_RESIDENT_ENV_<name>` app secret. On AWS, confirm the new task
+definition no longer references the old injection, then delete each original
+`${aws.secretsPrefix}<name>` entry from Secrets Manager. On Docker, complete the
+replacement container rollout, then remove each original `<name>` from the
+deployment's `.env` or other environment source. QM neither deletes those sources
+automatically nor treats a legacy field as acknowledgement that the migration
+happened. This cleanup is separate from revoking and deleting the retired source
+credential `FLY_SANDBOX_API_TOKEN` and unsetting its deployed core `FLY_API_TOKEN`
+alias below.
+
+## Legacy update workflow
+
+Deployments that used the retired Admin-dispatched GitHub workflow must first cancel
+every queued or running job for every configured or detected legacy workflow,
+including renamed copies, and wait for every job to reach a terminal status. Deleting
+or disabling a workflow, removing Admin configuration, or redeploying Admin does not
+cancel an already queued job. After all jobs are terminal, remove every workflow copy
+and all `QM_UPDATE_GITHUB_*` settings, delete the GitHub repository secret
+`QM_DEPLOY_ENV`, revoke the old GitHub token and remove its
+`QM_UPDATE_GITHUB_TOKEN` copy from the Admin app and every other resident secret
+store, then revoke and delete the retired source credential
+`FLY_SANDBOX_API_TOKEN` from every repository, host, and CI secret store and unset
+its deployed core `FLY_API_TOKEN` alias.
 
 ## Supported versions
 

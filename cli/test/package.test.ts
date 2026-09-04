@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -121,10 +121,17 @@ test(
         const installed = join(consumer.dir, "node_modules", "@yc-software", "qm");
         assert.equal(lstatSync(installed).isSymbolicLink(), false);
         assert.ok(realpathSync(installed).startsWith(`${realpathSync(consumer.dir)}/`));
+        const localVersion = await execFileAsync(
+          "npm",
+          ["exec", "--yes=false", `--package=@yc-software/qm@${version}`, "--", "qm", "version"],
+          { cwd: consumer.dir, encoding: "utf8", env: { ...env, NPM_CONFIG_REGISTRY: registryUrl } },
+        );
+        assert.match(localVersion.stdout, new RegExp(`^${version.replaceAll(".", "\\.")}`));
         const imageManifest = JSON.parse(readFileSync(join(installed, "manifest.json"), "utf8")) as {
           sandboxBase: string;
           services: Record<string, string>;
         };
+        assert.ok(imageManifest.services["egress-proxy"]);
         for (const reference of [imageManifest.sandboxBase, ...Object.values(imageManifest.services)]) {
           assert.match(reference, /@sha256:[a-f0-9]{64}$/, "every package-selected runtime image is immutable");
         }
@@ -143,25 +150,15 @@ test(
       const awsBin = join(awsDeployment, "node_modules", ".bin", "qm");
       rmSync(tarball);
 
-      const deploymentConfig = join(deployment, "qm.config.jsonc");
-      writeFileSync(
-        deploymentConfig,
-        readFileSync(deploymentConfig, "utf8").replace(
-          '"sandbox": { "app": "acme-sandboxes" }',
-          `"sandbox": { "app": "acme-sandboxes", "image": "registry.fly.io/acme-sandboxes@sha256:${"a".repeat(64)}" }`,
-        ),
-      );
-
       assert.ok(existsSync(join(deployment, "deployment.md")));
       assert.ok(existsSync(join(deployment, ".codex", "skills", "deploy-qm", "SKILL.md")));
       for (const provider of ["fly", "aws", "slack"]) {
         assert.ok(existsSync(join(deployment, ".codex", "skills", "deploy-qm", "references", `${provider}.md`)));
       }
       assert.equal(statSync(join(deployment, ".env")).mode & 0o777, 0o600);
-      assert.doesNotMatch(
-        readFileSync(join(deployment, "deployment.md"), "utf8"),
-        /QM_REPO|cli\/bin\/qm\.ts|fresh QM clone|source checkout/i,
-      );
+      const deploymentGuide = readFileSync(join(deployment, "deployment.md"), "utf8");
+      assert.doesNotMatch(deploymentGuide, /QM_REPO/);
+      assert.match(deploymentGuide, /node "\$bootstrap\/qm\/cli\/bin\/qm\.ts" update --yes --version "\$version"/);
       assert.match(
         readFileSync(join(deployment, "deployment.md"), "utf8"),
         /"OIDC_JWKS_URI": "https:\/\/www\.googleapis\.com\/oauth2\/v3\/certs"/,
@@ -174,6 +171,7 @@ test(
       }
 
       assert.match(execFileSync(bin, ["version"], { encoding: "utf8" }), /^\d+\.\d+\.\d+/);
+      assert.doesNotMatch(execFileSync(bin, ["help"], { encoding: "utf8" }), /sandbox publish/);
       assert.match(execFileSync(bin, ["check"], { cwd: deployment, encoding: "utf8", env }), /check passed/);
       const dockerPlan = execFileSync(bin, ["plan", "--target", "docker"], {
         cwd: deployment,
@@ -183,7 +181,10 @@ test(
       assert.match(dockerPlan, /Plan only/);
       assert.doesNotMatch(dockerPlan, /\bPI_(?:MODEL|DETECT_MODEL)\b/);
       const fakeFly = join(dir, "fly");
-      writeFileSync(fakeFly, '#!/bin/sh\ncase "$1 $2" in\n"secrets list") exit 0;;\n*) printf "{}";;\nesac\n');
+      writeFileSync(
+        fakeFly,
+        '#!/bin/sh\ncase "$1 $2" in\n"secrets list") exit 0;;\n"apps list") printf "[]";;\n*) printf "{}";;\nesac\n',
+      );
       chmodSync(fakeFly, 0o755);
       const flyPlan = execFileSync(bin, ["plan"], {
         cwd: deployment,
@@ -195,10 +196,6 @@ test(
       const generatedCore = join(deployment, ".generated", "fly", "acme", "core.fly.toml");
       assert.ok(existsSync(generatedCore));
       assert.doesNotMatch(readFileSync(generatedCore, "utf8"), /^\s*PI_(?:MODEL|DETECT_MODEL)\s*=/m);
-      assert.match(
-        execFileSync(bin, ["sandbox", "publish", "--dry-run"], { cwd: deployment, encoding: "utf8", env }),
-        /qm-sandbox-base@sha256:a{64}/,
-      );
       const outputs = JSON.parse(
         execFileSync(bin, ["outputs", "--json"], { cwd: deployment, encoding: "utf8", env }),
       ) as {
@@ -220,6 +217,18 @@ test(
         ),
       );
       const cluster = "acme-aws-qm";
+      const authSigningJwk = JSON.stringify(
+        generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export({ format: "jwk" }),
+      );
+      const awsSecretValues = Object.fromEntries(
+        readFileSync(join(awsDeployment, ".env"), "utf8")
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .map((line) => {
+            const separator = line.indexOf("=");
+            return [line.slice(0, separator), line.slice(separator + 1)];
+          }),
+      );
       const portalTarget = `arn:aws:elasticloadbalancing:us-west-2:000000000000:targetgroup/${cluster}-port-${createHash("sha1").update(`${cluster}:portal`).digest("hex").slice(0, 6)}/1`;
       const fakeAws = join(dir, "aws");
       writeFileSync(
@@ -229,6 +238,7 @@ const args = process.argv.slice(2);
 const command = args.slice(0, 2).join(" ");
 const option = (name) => args[args.indexOf(name) + 1];
 const json = (value) => process.stdout.write(JSON.stringify(value));
+const deploymentSecrets = ${JSON.stringify(awsSecretValues)};
 if (command === "sts get-caller-identity") process.stdout.write("000000000000\\n");
 else if (command === "elbv2 describe-load-balancers") json({ LoadBalancers: [{ LoadBalancerArn: "arn:alb", DNSName: "replace-with-alb-hostname", State: { Code: "active" } }] });
 else if (command === "elbv2 describe-listeners") json({ Listeners: [{ ListenerArn: "arn:listener", Protocol: "HTTP", Port: 80, DefaultActions: [{ Type: "forward", TargetGroupArn: ${JSON.stringify(portalTarget)} }] }] });
@@ -252,10 +262,13 @@ else if (command === "secretsmanager get-secret-value") {
   const name = option("--secret-id").split("/").at(-1);
   const value = name === "ADMIN_GRANTS" ? "admin@example.com:org_admin"
     : name === "PUBLIC_API_URL" ? "https://acme-aws.example.com"
-    : name.endsWith("SIGNING_SECRET") || name === "CONNECTOR_SECRET_KEY" ? "a".repeat(64)
-    : "fixture-" + name.toLowerCase();
+    : deploymentSecrets[name] ||
+      (name === "AUTH_ALLOWED_EMAILS" ? "admin@example.com"
+    : name === "AUTH_EMAIL_FROM" ? "Acme <no-reply@example.com>"
+    : name === "AUTH_SIGNING_JWK" ? ${JSON.stringify(authSigningJwk)}
+    : "fixture-" + name.toLowerCase() + "-" + "x".repeat(64));
   if (args.includes("--query")) process.stdout.write(value + "\\n");
-  else json({ ARN: "arn:secret/" + name, SecretString: value });
+  else json({ ARN: "arn:aws:secretsmanager:us-west-2:000000000000:secret:" + option("--secret-id") + "-ABC123", SecretString: value });
 } else json({});
 `,
       );
@@ -285,7 +298,7 @@ else if (command === "secretsmanager get-secret-value") {
       assert.ok(packed[0]!.files.some(({ path }) => path === "templates/aws/microvm-agent/agent.mjs"));
       assert.ok(packed[0]!.files.some(({ path }) => path === "templates/deployment/deployment.md"));
       assert.ok(packed[0]!.files.some(({ path }) => path === "templates/deployment/references/fly.md"));
-      assert.ok(packed[0]!.files.some(({ path }) => path === "templates/deployment/references/porter.md"));
+      assert.ok(!packed[0]!.files.some(({ path }) => path === "templates/deployment/references/porter.md"));
       assert.ok(packed[0]!.files.some(({ path }) => path === "templates/fly/core.toml"));
       assert.ok(!packed[0]!.files.some(({ path }) => path === "src/contract.ts" || path === "bin/qm.ts"));
     } finally {

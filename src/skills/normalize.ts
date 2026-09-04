@@ -81,9 +81,9 @@ export function normalizeSkill(raw: string, path: string, cfg?: PackConfig): Nor
     return { skip: true, reason: "malformed" };
   }
 
-  const attrs: Record<string, unknown> = { ...parsed.attrs };
+  const attrs = Object.assign(Object.create(null) as Record<string, unknown>, parsed.attrs);
   for (const [from, to] of Object.entries(cfg?.fieldOverrides ?? {})) {
-    if (attrs[from] !== undefined && attrs[to] === undefined) attrs[to] = attrs[from];
+    if (Object.hasOwn(attrs, from) && !Object.hasOwn(attrs, to)) attrs[to] = attrs[from];
   }
 
   const body = parsed.body;
@@ -107,8 +107,7 @@ export function normalizeSkill(raw: string, path: string, cfg?: PackConfig): Nor
   let declaredCreds = asStringArray(attrs.declaredCreds);
   if (declaredCreds.length === 0) declaredCreds = extractEnvRefs(body);
 
-  const meta: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(parsed.attrs)) if (!RECOGNIZED.has(k)) meta[k] = v;
+  const meta = Object.fromEntries(Object.entries(parsed.attrs).filter(([k]) => !RECOGNIZED.has(k)));
 
   return {
     manifest: { name, description, requiredCapabilities, body },

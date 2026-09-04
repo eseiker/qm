@@ -15,6 +15,7 @@ import { createLocalWorkspaceStore } from "../src/workspace/workspace-store.ts";
 import { supportsProcessSessions } from "../src/sandbox/sandbox.ts";
 import { sleep } from "../src/util/async.ts";
 import { scopeId } from "../src/types.ts";
+import { loadConfig } from "../src/config.ts";
 import { installFakeDocker, type FakeDocker } from "./support/fake-docker.ts";
 
 const tmp = mkdtempSync(join(tmpdir(), "local-sbx-"));
@@ -305,7 +306,8 @@ test("containerized core joins each sandbox network and reaches the daemon by co
     if (url.endsWith("/health")) return Promise.resolve(new Response("", { status: 200 }));
     return Promise.resolve(new Response(JSON.stringify({ code: 0, stdout: "", stderr: "", timedOut: false })));
   };
-  const sb = makeSandbox(fake, { coreContainer: "qm-test-core", fetchImpl });
+  const config = loadConfig({ SANDBOX_BACKEND: "local", QM_CORE_CONTAINER: "qm-test-core" });
+  const sb = makeSandbox(fake, { ...config.localSandbox, fetchImpl });
   const h = await sb.provision(rw(scopeId("personal", "U40")));
   const args = fake.containers.get(h.id)!.args;
   assert.equal(args.includes("-p"), false);

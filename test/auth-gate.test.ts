@@ -16,7 +16,7 @@ const SECRET = "test-signing-secret".repeat(3);
 
 test("the normal server refuses to start without source-auth material", () => {
   const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "auth-required-")) }));
-  assert.throws(() => createServer(built.app), /CORE_SIGNING_SECRET must be at least 32 characters/);
+  assert.throws(() => createServer(built.app), /CORE_SIGNING_SECRET must be at least 32 UTF-8 bytes/);
 });
 
 function start(signingSecret?: string): { base: string; close: () => Promise<void> } {

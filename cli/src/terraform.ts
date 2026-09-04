@@ -1,8 +1,8 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { awsWorkloadArchitecture, type QmConfig } from "./config.ts";
 import { CliError, ok } from "./log.ts";
+import { updateRenderedFile } from "./safe-write.ts";
 import { computedSecrets } from "./secrets.ts";
 import { isServiceName, serviceDef } from "./services.ts";
 import { canonicalJson } from "./util.ts";
@@ -178,16 +178,21 @@ export function terraformVarsDrift(
   return drift;
 }
 
-function declaredInDir(configDir: string): string[] | undefined {
-  const path = join(configDir, "infra", "variables.tf");
-  return existsSync(path) ? declaredVariables(readFileSync(path, "utf8")) : undefined;
-}
-
 export function renderTerraformVars(config: QmConfig, configDir: string): void {
   const path = join(configDir, "infra", "terraform.tfvars");
-  if (!existsSync(path)) throw new CliError(`${path} does not exist; scaffold it with qm init --target aws`);
-  const existing = readFileSync(path, "utf8");
-  const declared = declaredInDir(configDir);
-  writeFileSync(path, terraformVars(config, existing, ...(declared ? [declared] : [])));
+  if (
+    !updateRenderedFile(
+      configDir,
+      ["infra", "terraform.tfvars"],
+      (existing, dependencies) => {
+        const variables = dependencies.get("infra/variables.tf");
+        const declared = variables === undefined ? undefined : declaredVariables(variables);
+        return terraformVars(config, existing, ...(declared ? [declared] : []));
+      },
+      [["infra", "variables.tf"]],
+    )
+  ) {
+    throw new CliError(`${path} does not exist; scaffold it with qm init --target aws`);
+  }
   ok("rendered infra/terraform.tfvars from the QM deployment config");
 }

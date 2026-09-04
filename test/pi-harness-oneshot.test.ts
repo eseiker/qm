@@ -533,6 +533,34 @@ test("sanitizeLlmPayload redacts image bytes that appear outside the message arr
   assert.match(block.source.data, /<base64 image\/png omitted: \d+ chars>/, "image bytes never persist");
 });
 
+test("sanitizeLlmPayload preserves prototype-like payload and transport keys through serialization", () => {
+  const payload = JSON.parse(
+    '{"messages":[],"before":1,"__proto__":{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}},"constructor":"constructor-value","prototype":"prototype-value","after":2}',
+  ) as Record<string, unknown>;
+  const headers = JSON.parse(
+    '{"__proto__":"proto-header","constructor":"constructor-header","prototype":"prototype-header","drop":3}',
+  ) as Record<string, unknown>;
+  const sanitized = sanitizeLlmPayload(payload, { id: "model", headers });
+  const envelope = sanitized.envelope as Record<string, unknown>;
+  assert.deepEqual(Object.keys(envelope), ["before", "__proto__", "constructor", "prototype", "after"]);
+  assert.equal(Object.getPrototypeOf(envelope), Object.prototype);
+  assert.equal(Object.hasOwn(envelope, "__proto__"), true);
+  assert.match(
+    (envelope.__proto__ as { source: { data: string } }).source.data,
+    /<base64 image\/png omitted: 4 chars>/,
+  );
+  assert.equal(envelope.constructor, "constructor-value");
+  assert.equal(envelope.prototype, "prototype-value");
+  assert.deepEqual(Object.keys(sanitized.transport!.headers!), ["__proto__", "constructor", "prototype"]);
+  assert.equal(Object.getPrototypeOf(sanitized.transport!.headers!), Object.prototype);
+  assert.equal(Object.hasOwn(sanitized.transport!.headers!, "__proto__"), true);
+  assert.equal(sanitized.transport!.headers!.__proto__, "proto-header");
+  assert.equal(sanitized.transport!.headers!.constructor, "constructor-header");
+  assert.equal(sanitized.transport!.headers!.prototype, "prototype-header");
+  assert.deepEqual(Object.keys(JSON.parse(JSON.stringify(envelope)) as Record<string, unknown>), Object.keys(envelope));
+  assert.equal((Object.prototype as { polluted?: unknown }).polluted, undefined);
+});
+
 test("renderDetectPrompt uses prior assistant replies, not assembled prior user prompts", () => {
   const prompt = renderDetectPrompt({
     session: {} as any,

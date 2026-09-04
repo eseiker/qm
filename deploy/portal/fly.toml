@@ -18,6 +18,8 @@ primary_region = "sjc"
   OIDC_PRINCIPAL_CLAIM = "email"
   OIDC_ALLOWED_EMAIL_DOMAIN = "example.com"
   PORTAL_SESSION_TTL_S = "28800"
+  NODE_ENV = "production"
+  DATA_DIR = "/data"
 
 [http_service]
   internal_port = 8080

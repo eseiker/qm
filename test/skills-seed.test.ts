@@ -3,7 +3,7 @@ import "./support/auto-fake-sprites.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createHmac } from "node:crypto";
@@ -95,6 +95,29 @@ function writeSeedAsset(dir: string, name: string, relPath: string, content: str
   mkdirSync(dirname(abs), { recursive: true });
   writeFileSync(abs, content);
 }
+
+test("installSeedSkills ignores linked skill directories outside the seed catalog", async () => {
+  const skills = createSkillStore({ signingSecret: "seed-test-secret" });
+  const org = scopeId("org", "default-org");
+  const dir = mkdtempSync(join(tmpdir(), "seed-linked-dir-"));
+  const external = mkdtempSync(join(tmpdir(), "seed-external-dir-"));
+  writeSeedSkill(external, "escaped", "external skill", "# Escaped");
+  writeSeedAsset(external, "escaped", "private.txt", "external private value\n");
+  symlinkSync(join(external, "escaped"), join(dir, "linked"), "dir");
+  writeSeedSkill(dir, "valid", "valid skill", "# Valid");
+  writeSeedAsset(dir, "valid", "references/guide.md", "safe value\n");
+
+  const result = await installSeedSkills(skills, { dir, scopeId: org });
+  assert.deepEqual(result, { installed: ["valid"], updated: [], skipped: [] });
+  const published = await skills.list();
+  assert.equal(published.length, 1);
+  assert.equal(published[0]!.manifest.name, "valid");
+  assert.deepEqual(published[0]!.manifest.files, [
+    { path: "references/guide.md", content: "safe value\n", executable: false },
+  ]);
+  assert.ok(skills.verify(published[0]!));
+  assert.doesNotMatch(JSON.stringify(published[0]!.manifest), /external private value/);
+});
 
 test("installSeedSkills re-seeds a changed manifest over its own prior install, never over another author's", async () => {
   const skills = createSkillStore({ signingSecret: "seed-test-secret" });

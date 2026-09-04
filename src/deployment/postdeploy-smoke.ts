@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { PORTAL_IDENTITY_HEADER } from "../auth/portal-identity.ts";
 import { mintSignedPayload } from "../auth/signed-token.ts";
+import { sourceAuthFetch } from "../auth/source-auth-fetch.ts";
 import { signedRequestHeaders } from "../auth/source-auth-sign.ts";
 import { loadConfig, type Config } from "../config.ts";
 import { errMessage } from "../util/errors.ts";
@@ -136,11 +137,15 @@ export async function checkLiveSession(
       raw,
       admin ? { "x-admin-actor": `${principalId}@${orgId}` } : {},
     );
-    const response = await fetchImpl(`${root}${path}`, {
-      method,
-      headers: { ...headers, ...(raw ? { "content-type": "application/json" } : {}) },
-      ...(raw ? { body: raw } : {}),
-    });
+    const response = await sourceAuthFetch(
+      `${root}${path}`,
+      {
+        method,
+        headers: { ...headers, ...(raw ? { "content-type": "application/json" } : {}) },
+        ...(raw ? { body: raw } : {}),
+      },
+      fetchImpl,
+    );
     const text = await response.text();
     if (!response.ok)
       throw new Error(`live session ${method} ${path} returned ${response.status}: ${text.slice(0, 500)}`);
@@ -233,7 +238,7 @@ async function checkApi(
   port: string,
 ): Promise<void> {
   const path = `/v1/admin/sessions?scope=${encodeURIComponent(`org:${orgId}`)}&limit=5&_smoke=${randomUUID()}`;
-  const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+  const response = await sourceAuthFetch(`http://127.0.0.1:${port}${path}`, {
     headers: await stagingApiHeaders(principalId, sourceSecret, portalIdentitySecret, "GET", path, "", {
       "x-admin-actor": `${principalId}@${orgId}`,
     }),

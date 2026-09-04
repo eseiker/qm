@@ -34,6 +34,7 @@ const corePort = (core.address() as AddressInfo).port;
 
 process.env.CORE_API_URL = `http://localhost:${corePort}`;
 process.env.CORE_SIGNING_SECRET = "admin-whoami-test-secret";
+delete process.env.QM_VERSION;
 
 const { server } = await import("../src/index.ts");
 await new Promise<void>((r) => server.listen(0, r));
@@ -91,9 +92,12 @@ test("/api/me with cookie admin=U-rando → 200 (not 401) with isAdmin:false", a
   assert.equal(body.isAdmin, false);
 });
 
-test("/api/update is admin-only and stays empty when release identity is unavailable", async () => {
+test("/api/update requires live core authorization", async () => {
+  whoamiRequests = 0;
+  assert.equal((await api("/api/update")).status, 401);
   assert.equal((await api("/api/update", "admin=U-rando")).status, 403);
   assert.equal((await api("/api/update", "admin=U-admin")).status, 204);
+  assert.equal(whoamiRequests, 2);
 });
 
 test("POST /api/login is removed → 404", async () => {

@@ -119,12 +119,14 @@ export async function whoami(ctx: ApiCtx): Promise<void> {
   if (!actor) return sendJson(res, 200, { isAdmin: false, permissions: [] });
   const status = await deps.admin.adminStatusOf(actor);
   const permissions = status.isAdmin ? ["admin"] : [];
-  audit(deps, {
-    principalId: actor.id,
-    action: "admin.whoami",
-    resource: "whoami",
-    scopeLabel: status.scopeId ?? actor.id,
-  });
+  if (ctx.capability) {
+    audit(deps, {
+      principalId: actor.id,
+      action: "admin.whoami",
+      resource: "whoami",
+      scopeLabel: status.scopeId ?? actor.id,
+    });
+  }
   return sendJson(res, 200, { ...status, permissions });
 }
 

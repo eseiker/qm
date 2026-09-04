@@ -753,9 +753,7 @@ function redactImageBytes(v: unknown): unknown {
     if (o.type === "redacted_thinking" && typeof o.data === "string") {
       return { ...o, data: `<redacted_thinking ${o.data.length} chars omitted>` };
     }
-    const out: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(o)) out[k] = redactImageBytes(val);
-    return out;
+    return Object.fromEntries(Object.entries(o).map(([k, val]) => [k, redactImageBytes(val)]));
   }
   return v;
 }
@@ -766,10 +764,11 @@ export function transportFromModel(model: unknown): LlmTransportMeta | undefined
   const out: LlmTransportMeta = {};
   if (typeof m.id === "string") out.modelId = m.id;
   if (m.headers && typeof m.headers === "object") {
-    const headers: Record<string, string> = {};
-    for (const [k, v] of Object.entries(m.headers as Record<string, unknown>)) {
-      if (typeof v === "string") headers[k] = v;
-    }
+    const headers = Object.fromEntries(
+      Object.entries(m.headers as Record<string, unknown>).filter(
+        (entry): entry is [string, string] => typeof entry[1] === "string",
+      ),
+    );
     if (Object.keys(headers).length) out.headers = headers;
   }
   return out.modelId || out.headers ? out : undefined;

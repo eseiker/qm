@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
-import type { QmConfig } from "./config.ts";
+import { SLACK_OIDC_TOPOLOGY_ENV_KEYS, type QmConfig } from "./config.ts";
 
 function template(name: string): string {
   const source = new URL(`../templates/${name}`, import.meta.url);
@@ -44,9 +44,7 @@ function isSlackHost(value: string | undefined): boolean {
 
 export function usesSlackOidc(config: QmConfig): boolean {
   const portal = config.env.portal ?? {};
-  return ["OIDC_AUTH_ENDPOINT", "OIDC_TOKEN_ENDPOINT", "OIDC_USERINFO_ENDPOINT", "OIDC_ISSUER"].some((name) =>
-    isSlackHost(portal[name]),
-  );
+  return SLACK_OIDC_TOPOLOGY_ENV_KEYS.some((name) => isSlackHost(portal[name]));
 }
 
 export function renderSlackManifests(config: QmConfig): SlackManifests {

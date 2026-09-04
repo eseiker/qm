@@ -10,7 +10,7 @@ function scaffold(label: string): string {
   return dir;
 }
 
-test("sandbox build --dry-run generates the COPY-tools Dockerfile + the fly push command", () => {
+test("sandbox build --dry-run generates the COPY-tools Dockerfile and local build command", () => {
   const dir = scaffold("sb-default");
   try {
     const r = runCli(["sandbox", "build", "--dry-run"], { cwd: dir });
@@ -19,7 +19,7 @@ test("sandbox build --dry-run generates the COPY-tools Dockerfile + the fly push
     assert.match(r.out, /FROM registry\.invalid\/qm\/qm-sandbox-base@sha256:a{64}/);
     assert.match(r.out, /COPY tools\/example-tool\/example-tool \/usr\/local\/bin\/example-tool/);
     assert.match(r.out, /command -v "\$b"/);
-    assert.match(r.out, /docker buildx build --platform linux\/amd64 --load -t acme-sandbox:local/);
+    assert.match(r.out, /docker buildx build --platform linux\/amd64 --load --provenance=false -t acme-sandbox:local/);
   } finally {
     rmDir(dir);
   }
@@ -30,7 +30,7 @@ test("sandbox build --tag overrides the local image tag", () => {
   try {
     const r = runCli(["sandbox", "build", "--tag", "v2", "--dry-run"], { cwd: dir });
     assert.equal(r.code, 0, r.out);
-    assert.match(r.out, /docker buildx build --platform linux\/amd64 --load -t v2/);
+    assert.match(r.out, /docker buildx build --platform linux\/amd64 --load --provenance=false -t v2/);
   } finally {
     rmDir(dir);
   }
@@ -62,13 +62,14 @@ test("a custom sandbox/Dockerfile owns the recipe; --from is then ignored", () =
   }
 });
 
-test("sandbox build with an empty layer is a clear error", () => {
+test("sandbox build accepts a deployment with no sandbox directory", () => {
   const dir = tmp("sb-empty");
   try {
     writeConfig(dir, { orgId: "acme", target: "docker" });
-    const r = runCli(["sandbox", "build", "--dry-run"], { cwd: dir, env: { FLY_SANDBOX_APP_NAME: "" } });
-    assert.equal(r.code, 1);
-    assert.match(r.out, /nothing to build/);
+    const r = runCli(["sandbox", "build", "--dry-run"], { cwd: dir });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /tools:\s+\(none\)/);
+    assert.match(r.out, /DRY RUN — nothing built/);
   } finally {
     rmDir(dir);
   }
@@ -92,6 +93,17 @@ test("`sandbox` without the build subcommand prints usage and exits 1", () => {
     const r = runCli(["sandbox"], { cwd: dir });
     assert.equal(r.code, 1);
     assert.match(r.out, /usage:.*sandbox build/);
+  } finally {
+    rmDir(dir);
+  }
+});
+
+test("sandbox publish is rejected before registry or provider work", () => {
+  const dir = scaffold("sb-publish-removed");
+  try {
+    const r = runCli(["sandbox", "publish"], { cwd: dir });
+    assert.equal(r.code, 1);
+    assert.match(r.out, /supported sandbox backends do not consume OCI layer images/);
   } finally {
     rmDir(dir);
   }

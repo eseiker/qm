@@ -15,7 +15,7 @@ Slack sign-in with no bot.
 
 QM uses one private Socket Mode app per deployment and workspace.
 
-Run `npm exec qm -- outputs` and open the exact bot manifest creation URL.
+Run `npm exec --yes=false -- qm outputs` and open the exact bot manifest creation URL.
 Install the app, create an app-level token with `connections:write`, and enter
 the bot and app tokens in the Admin Slack card. The Admin surface validates and
 stores them without provider credentials.
@@ -65,8 +65,8 @@ not want the agent in their workspace.
 Then render and read the links:
 
 ```bash
-npm exec qm -- slack render
-npm exec qm -- outputs
+npm exec --yes=false -- qm slack render
+npm exec --yes=false -- qm outputs
 ```
 
 `outputs` prints `qm SSO app` (the manifest creation URL), `Slack sign-in`
@@ -75,7 +75,7 @@ npm exec qm -- outputs
 manifest already carries the callback, so there is no redirect URL to register by
 hand. From Basic Information, put the client secret in `.env` as
 `OIDC_CLIENT_SECRET` and the client id in either `env.portal.OIDC_CLIENT_ID` or
-`.env`, then run `npm exec qm -- secrets push`.
+`.env`, then run `npm exec --yes=false -- qm secrets push`.
 
 Prove it before calling sign-in done: open the `Slack sign-in` URL, complete
 Slack's consent screen, and land in the Web UI as the administrator. A portal

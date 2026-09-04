@@ -6,6 +6,7 @@ COPY plugins/admin/src ./src
 COPY plugins/chassis/src /chassis/src
 COPY plugins/admin/public ./public
 COPY plugins/admin/tsconfig.json ./
+COPY cli/package.json ./qm-package.json
 
 ENV NODE_ENV=production
 ENV PORT=8080

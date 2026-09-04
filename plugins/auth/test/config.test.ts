@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { bootProblems, readConfig, senderAddress } from "../src/config.ts";
+import { bootProblems, readConfig, senderAddress, validEmail } from "../src/config.ts";
 import { testEnv } from "./helpers.ts";
 
 const problemsFor = (over: Record<string, string | undefined>, isProd = true): string =>
@@ -64,13 +64,24 @@ test("production requires the core signing secret that makes links single-use", 
 });
 
 test("a weak or reused token secret is refused", () => {
-  assert.match(problemsFor({ AUTH_TOKEN_SECRET: "short" }), /AUTH_TOKEN_SECRET must be at least 32 characters/);
-  assert.match(problemsFor({ AUTH_CLIENT_SECRET: "short" }), /AUTH_CLIENT_SECRET must be at least 32 characters/);
+  assert.match(problemsFor({ AUTH_TOKEN_SECRET: "short" }), /AUTH_TOKEN_SECRET must be at least 32 bytes/);
+  assert.match(problemsFor({ AUTH_CLIENT_SECRET: "short" }), /AUTH_CLIENT_SECRET must be at least 32 bytes/);
   const shared = "0123456789abcdef0123456789abcdef";
   assert.match(
     problemsFor({ AUTH_TOKEN_SECRET: shared, AUTH_CLIENT_SECRET: shared }),
     /must differ from AUTH_TOKEN_SECRET/,
   );
+});
+
+test("secret minimums use trimmed UTF-8 bytes", () => {
+  const complete = { CORE_SIGNING_SECRET: "a".repeat(48) };
+  for (const name of ["AUTH_CLIENT_SECRET", "AUTH_TOKEN_SECRET"] as const) {
+    const problem = new RegExp(`${name} must be at least 32 bytes`);
+    assert.match(problemsFor({ ...complete, [name]: "a".repeat(31) }), problem);
+    assert.doesNotMatch(problemsFor({ ...complete, [name]: "a".repeat(32) }), problem);
+    assert.match(problemsFor({ ...complete, [name]: ` ${"é".repeat(15)} ` }), problem);
+    assert.doesNotMatch(problemsFor({ ...complete, [name]: ` ${"é".repeat(16)} ` }), problem);
+  }
 });
 
 test("the smtp transport demands its own credentials", () => {
@@ -88,6 +99,59 @@ test("the smtp transport demands its own credentials", () => {
   );
 });
 
+test("email transport modes accept only exact raw spellings", () => {
+  for (const value of ["", " ", "SMTP", " smtp", "smtp ", "RESEND", "resend\n"]) {
+    assert.match(
+      problemsFor({ AUTH_EMAIL_TRANSPORT: value }),
+      /AUTH_EMAIL_TRANSPORT must be exactly resend or smtp/,
+      JSON.stringify(value),
+    );
+  }
+  for (const value of ["smtp", "resend"]) {
+    assert.doesNotMatch(
+      problemsFor({ AUTH_EMAIL_TRANSPORT: value }),
+      /AUTH_EMAIL_TRANSPORT must be exactly resend or smtp/,
+      value,
+    );
+  }
+
+  for (const value of ["", " ", "STARTTLS", " starttls", "starttls ", "IMPLICIT", "none\n"]) {
+    assert.match(
+      problemsFor({ SMTP_TLS: value }),
+      /SMTP_TLS must be exactly starttls, implicit, or none/,
+      JSON.stringify(value),
+    );
+  }
+  for (const value of ["starttls", "implicit", "none"]) {
+    assert.doesNotMatch(
+      problemsFor({ SMTP_TLS: value }, false),
+      /SMTP_TLS must be exactly starttls, implicit, or none/,
+      value,
+    );
+  }
+});
+
+test("numeric settings reject malformed raw values instead of applying defaults", () => {
+  const settings = [
+    ["SMTP_PORT", /SMTP_PORT must be a TCP port number/],
+    ["AUTH_LINK_TTL_S", /AUTH_LINK_TTL_S must be a positive whole number/],
+    ["AUTH_CODE_TTL_S", /AUTH_CODE_TTL_S must be a positive whole number/],
+    ["AUTH_ACCESS_TTL_S", /AUTH_ACCESS_TTL_S must be a positive whole number/],
+    ["AUTH_REQUEST_TTL_S", /AUTH_REQUEST_TTL_S must be a positive whole number/],
+    ["AUTH_SEND_WINDOW_S", /AUTH_SEND_WINDOW_S must be a positive whole number/],
+    ["AUTH_SEND_LIMIT_PER_EMAIL", /AUTH_SEND_LIMIT_PER_EMAIL must be a whole number between 1 and 64/],
+    ["AUTH_SEND_LIMIT_PER_IP", /AUTH_SEND_LIMIT_PER_IP must be a whole number between 1 and 64/],
+  ] as const;
+  const malformed = ["", " ", "0", "-1", "+1", "01", "1.0", "1e2", "NaN", "Infinity", " 1", "1 "];
+
+  for (const [name, problem] of settings) {
+    for (const value of malformed) {
+      assert.match(problemsFor({ [name]: value }), problem, `${name}=${JSON.stringify(value)}`);
+    }
+    assert.doesNotMatch(problemsFor({ [name]: "1" }), problem, name);
+  }
+});
+
 test("malformed allowlists and senders are refused", () => {
   assert.match(problemsFor({ AUTH_ALLOWED_EMAILS: "not-an-email" }), /valid, non-placeholder email addresses/);
   assert.match(
@@ -95,6 +159,39 @@ test("malformed allowlists and senders are refused", () => {
     /valid, non-placeholder email domain/,
   );
   assert.match(problemsFor({ AUTH_EMAIL_FROM: "qm <not-an-address>" }), /verified sender address/);
+  assert.doesNotMatch(problemsFor({ AUTH_EMAIL_FROM: "Opérateur <sender@example.com>" }), /verified sender address/);
+  for (const sender of [
+    "Bad\r\nBcc: victim@example.net <sender@example.com>",
+    "Bad\u0007 <sender@example.com>",
+    "Bad\u200e <sender@example.com>",
+  ]) {
+    assert.match(problemsFor({ AUTH_EMAIL_FROM: sender }), /verified sender address/);
+  }
+});
+
+test("email addresses use bounded ASCII dot-atoms and DNS domains", () => {
+  for (const value of ["operator@example.com", "operator+tag@sub-domain.example.com", "agent/path@example.com"]) {
+    assert.equal(validEmail(value), true, value);
+  }
+  for (const value of [
+    ".operator@example.com",
+    "operator.@example.com",
+    "oper..ator@example.com",
+    "oper:ator@example.com",
+    "oper[ator]@example.com",
+    "opérator@example.com",
+    "operator@sub_domain.example.com",
+    "operator@-bad.example.com",
+    "operator@bad..example.com",
+    "operator@example.com:443",
+    "operator@example.com/path",
+    "operator@127.0.0.1",
+    "operator@[127.0.0.1]",
+    `bad\0name@example.com`,
+    `${"a".repeat(65)}@example.com`,
+  ]) {
+    assert.equal(validEmail(value), false, value);
+  }
 });
 
 test("oversized token lifetimes are refused", () => {

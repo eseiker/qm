@@ -23,6 +23,8 @@ import {
   exchangeCode,
   fetchUserinfo,
   resolvePrincipal,
+  validEmail,
+  validEmailDomain,
   verifyIdToken,
   type OidcConfig,
   type PrincipalRule,
@@ -37,7 +39,7 @@ import {
   FORWARD_BROKER_HEADERS,
   FORWARD_WEBHOOK_HEADERS,
 } from "./proxy.ts";
-import { signedHeaders, withSourceAuthNonce } from "../../chassis/src/core-client.ts";
+import { signedCoreFetch, withSourceAuthNonce } from "../../chassis/src/core-client.ts";
 import { coreClaimStore, withinRateLimit, ClaimStoreUnavailableError } from "../../chassis/src/claims.ts";
 import { mintPortalIdentity, PORTAL_IDENTITY_HEADER } from "../../chassis/src/portal-identity.ts";
 import { errMessage } from "../../chassis/src/errors.ts";
@@ -53,14 +55,19 @@ import {
 const PORT = portFromEnv(8097);
 const PUBLIC_URL = (process.env.PORTAL_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 const SESSION_SECRET = process.env.PORTAL_SESSION_SECRET;
+const IDENTITY_SECRET = process.env.PORTAL_IDENTITY_SECRET;
 const SESSION_TTL_S = Number(process.env.PORTAL_SESSION_TTL_S ?? 28800);
 const SESSION_MAX_TTL_S = Number(process.env.PORTAL_SESSION_MAX_TTL_S ?? Math.max(86400, SESSION_TTL_S));
+const IMPERSONATE_TTL_RAW = process.env.PORTAL_IMPERSONATE_TTL_S;
+const IMPERSONATE_TTL_MAX_S = Math.min(SESSION_MAX_TTL_S, 86400);
 const SESSION_RENEW_AFTER_S = Math.floor(SESSION_TTL_S / 2);
 const APPS_DOMAIN = process.env.PORTAL_APPS_DOMAIN || process.env.DEPLOY_APPS_DOMAIN || undefined;
+const DIRECT_APPS_DOMAIN = process.env.PORTAL_DIRECT_APPS_DOMAIN;
 const COOKIE_DOMAIN =
   process.env.PORTAL_COOKIE_DOMAIN ||
   (APPS_DOMAIN ? derivedCookieDomain(hostOf(process.env.PORTAL_PUBLIC_URL ?? ""), APPS_DOMAIN) : undefined);
 const IS_PROD = process.env.NODE_ENV === "production";
+const MIN_SECRET_BYTES = 32;
 const SECURE_COOKIES = PUBLIC_URL.startsWith("https://");
 const ORIGIN = (() => {
   try {
@@ -101,8 +108,7 @@ function refreshSurfaceConfig(): Promise<void> {
 async function fetchSurfaceConfig(): Promise<void> {
   try {
     const path = withSourceAuthNonce("/v1/surface-config", CORE_SIGNING_SECRET);
-    const r = await fetch(`${CORE}${path}`, {
-      headers: signedHeaders(CORE_SIGNING_SECRET, "GET", path),
+    const r = await signedCoreFetch(CORE, CORE_SIGNING_SECRET, "GET", path, {
       signal: AbortSignal.timeout(2_000),
     });
     if (r.ok) {
@@ -191,7 +197,8 @@ const DEV_SECRET = "dev-only-insecure-portal-session-secret";
 const sessionKey = deriveKey(SESSION_SECRET ?? DEV_SECRET, "portal.session.v1");
 const tmpKey = deriveKey(SESSION_SECRET ?? DEV_SECRET, "portal.tmp.v1");
 const impersonateKey = deriveKey(SESSION_SECRET ?? DEV_SECRET, "portal.impersonate.v1");
-const IMPERSONATE_TTL_S = Number(process.env.PORTAL_IMPERSONATE_TTL_S ?? 3600);
+const IMPERSONATE_TTL_S =
+  IMPERSONATE_TTL_RAW === undefined ? Math.min(3600, Math.floor(IMPERSONATE_TTL_MAX_S)) : Number(IMPERSONATE_TTL_RAW);
 
 const TMP_TTL_S = 600;
 const LOCAL_LOGOUT_COOKIE = "portal_local_logout";
@@ -210,6 +217,7 @@ const ADMIN_PROBE_TIMEOUT_MS = 6_500;
 const ADMIN_PROBE_ATTEMPTS = 2;
 const ADMIN_PROBE_RETRY_DELAY_MS = 250;
 const adminCache = new LRUCache<string, boolean>({ max: 10_000, ttl: ADMIN_TTL_MS });
+const adminPending = new Map<string, Promise<{ isAdmin: boolean; failed: boolean }>>();
 
 async function adminProbeAttempt(sub: string): Promise<boolean | null> {
   const ctrl = new AbortController();
@@ -241,9 +249,7 @@ async function adminProbeAttempt(sub: string): Promise<boolean | null> {
   }
 }
 
-async function adminProbe(sub: string): Promise<{ isAdmin: boolean; failed: boolean }> {
-  const hit = adminCache.get(sub);
-  if (hit !== undefined) return { isAdmin: hit, failed: false };
+async function resolveAdminProbe(sub: string): Promise<{ isAdmin: boolean; failed: boolean }> {
   for (let attempt = 0; attempt < ADMIN_PROBE_ATTEMPTS; attempt++) {
     const isAdmin = await adminProbeAttempt(sub);
     if (isAdmin === null) {
@@ -255,6 +261,16 @@ async function adminProbe(sub: string): Promise<{ isAdmin: boolean; failed: bool
     return { isAdmin, failed: false };
   }
   return { isAdmin: false, failed: true };
+}
+
+async function adminProbe(sub: string): Promise<{ isAdmin: boolean; failed: boolean }> {
+  const hit = adminCache.get(sub);
+  if (hit !== undefined) return { isAdmin: hit, failed: false };
+  const active = adminPending.get(sub);
+  if (active) return active;
+  const pending = resolveAdminProbe(sub).finally(() => adminPending.delete(sub));
+  adminPending.set(sub, pending);
+  return pending;
 }
 
 async function isAdmin(sub: string): Promise<boolean> {
@@ -312,6 +328,15 @@ export function hostIsWithinDomain(host: string, domain: string): boolean {
   const h = host.toLowerCase();
   const d = domain.toLowerCase().replace(/^\./, "");
   return !!h && !!d && (h === d || h.endsWith(`.${d}`));
+}
+
+function validDirectAppsDomain(value: string): boolean {
+  return (
+    value.length <= 189 &&
+    value === value.toLowerCase() &&
+    validEmailDomain(value) &&
+    !/^\d+$/u.test(value.split(".").at(-1) ?? "")
+  );
 }
 
 function isLocalPortalUrl(raw: string): boolean {
@@ -584,13 +609,12 @@ async function handleConsentRedeem(
 ): Promise<void> {
   const path = withSourceAuthNonce(o.corePath, CORE_SIGNING_SECRET);
   const headers = {
-    ...signedHeaders(CORE_SIGNING_SECRET, "GET", path),
     "x-consent-clicker": o.session.sub,
     "x-consent-clicker-org": o.session.org,
   };
   let data: { status?: string; authorizeUrl?: string; provider?: string; clickerConnected?: boolean };
   try {
-    const r = await fetch(`${CORE}${path}`, { headers });
+    const r = await signedCoreFetch(CORE, CORE_SIGNING_SECRET, "GET", path, { headers });
     data = (await r.json().catch(() => ({}))) as typeof data;
   } catch {
     return sendHtml(
@@ -655,14 +679,12 @@ async function handleSecretDrop(
   }
   const path = withSourceAuthNonce(o.corePath, CORE_SIGNING_SECRET);
   const headers = {
-    ...signedHeaders(CORE_SIGNING_SECRET, isPost ? "POST" : "GET", path, rawBody),
     "x-drop-owner": o.session.sub,
     "x-drop-owner-org": o.session.org,
   };
   let r: Response;
   try {
-    r = await fetch(`${CORE}${path}`, {
-      method: isPost ? "POST" : "GET",
+    r = await signedCoreFetch(CORE, CORE_SIGNING_SECRET, isPost ? "POST" : "GET", path, {
       headers,
       ...(isPost ? { body: rawBody } : {}),
     });
@@ -692,7 +714,7 @@ async function handleSelfConnect(res: ServerResponse, o: { provider: string; ses
     CORE_SIGNING_SECRET,
   );
   try {
-    const r = await fetch(`${CORE}${path}`, { headers: signedHeaders(CORE_SIGNING_SECRET, "GET", path) });
+    const r = await signedCoreFetch(CORE, CORE_SIGNING_SECRET, "GET", path);
     const data = (await r.json().catch(() => ({}))) as { authorizeUrl?: string; message?: string };
     if (data.authorizeUrl) {
       res.writeHead(302, { location: data.authorizeUrl, "cache-control": "no-store" });
@@ -720,14 +742,13 @@ async function coreImpersonate(
   const path = withSourceAuthNonce(`/v1/admin/impersonate${action === "stop" ? "/stop" : ""}`, CORE_SIGNING_SECRET);
   const body = JSON.stringify({ target });
   const headers = {
-    ...signedHeaders(CORE_SIGNING_SECRET, "POST", path, body),
     "x-admin-actor": `${admin}@${ORG}`,
     ...(PORTAL_IDENTITY_SECRET
       ? { [PORTAL_IDENTITY_HEADER]: mintPortalIdentity({ p: admin, exp: Date.now() + 60_000 }, PORTAL_IDENTITY_SECRET) }
       : {}),
   };
   try {
-    const r = await fetch(`${CORE}${path}`, { method: "POST", headers, body });
+    const r = await signedCoreFetch(CORE, CORE_SIGNING_SECRET, "POST", path, { headers, body });
     const j = (await r.json().catch(() => ({}))) as { displayName?: string; message?: string };
     return { ok: r.ok, status: r.status, displayName: j.displayName, message: j.message };
   } catch (e) {
@@ -1186,8 +1207,7 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
     const info = await fetchUserinfo(OIDC, accessToken);
     const infoSub = typeof info.sub === "string" ? info.sub : "";
     if (!infoSub) throw new Error("userinfo missing sub");
-    if (typeof claims.sub === "string" && claims.sub !== infoSub) throw new Error("subject mismatch");
-    sub = resolvePrincipal(PRINCIPAL_RULE, { sub: infoSub, claims, userinfo: info });
+    sub = resolvePrincipal(PRINCIPAL_RULE, { issuer: OIDC.issuer, sub: infoSub, claims, userinfo: info });
     const rawName = info.name ?? claims.name;
     if (typeof rawName === "string") name = rawName.trim().slice(0, 200);
   } catch (e) {
@@ -1217,6 +1237,14 @@ async function authCallback(req: IncomingMessage, res: ServerResponse, url: URL)
 
 export function bootChecks(): void {
   const problems: string[] = [];
+  for (const [name, value] of [
+    ["PORTAL_SESSION_SECRET", SESSION_SECRET],
+    ["PORTAL_IDENTITY_SECRET", IDENTITY_SECRET],
+  ] as const) {
+    if (value !== undefined && Buffer.byteLength(value.trim(), "utf8") < MIN_SECRET_BYTES) {
+      problems.push(`${name} must be at least ${MIN_SECRET_BYTES} UTF-8 bytes`);
+    }
+  }
   if (!AUTH_BROKER_UPSTREAM && originOf(OIDC.authEndpoint) && originOf(OIDC.authEndpoint) === originOf(PUBLIC_URL)) {
     problems.push(
       "OIDC_AUTH_ENDPOINT is on the portal's own origin but AUTH_BROKER_UPSTREAM is unset — every sign-in would redirect from /auth/login back into the portal forever; wire AUTH_BROKER_UPSTREAM to the auth service or point OIDC_AUTH_ENDPOINT at a real identity provider",
@@ -1265,6 +1293,25 @@ export function bootChecks(): void {
   if (APPS_DOMAIN && COOKIE_DOMAIN && !hostIsWithinDomain(APPS_DOMAIN, COOKIE_DOMAIN)) {
     problems.push(`PORTAL_COOKIE_DOMAIN (${COOKIE_DOMAIN}) must cover PORTAL_APPS_DOMAIN (${APPS_DOMAIN})`);
   }
+  if (DIRECT_APPS_DOMAIN !== undefined && !validDirectAppsDomain(DIRECT_APPS_DOMAIN)) {
+    problems.push("PORTAL_DIRECT_APPS_DOMAIN must be a canonical bare DNS name no longer than 189 ASCII characters");
+  } else if (
+    DIRECT_APPS_DOMAIN &&
+    COOKIE_DOMAIN &&
+    (hostIsWithinDomain(DIRECT_APPS_DOMAIN, COOKIE_DOMAIN) || hostIsWithinDomain(COOKIE_DOMAIN, DIRECT_APPS_DOMAIN))
+  ) {
+    problems.push(
+      `PORTAL_DIRECT_APPS_DOMAIN (${DIRECT_APPS_DOMAIN}) must be outside the portal session cookie domain (${COOKIE_DOMAIN})`,
+    );
+  } else if (
+    DIRECT_APPS_DOMAIN &&
+    !COOKIE_DOMAIN &&
+    hostOf(PUBLIC_URL).split(".").slice(1).join(".") === DIRECT_APPS_DOMAIN
+  ) {
+    problems.push(
+      `PORTAL_DIRECT_APPS_DOMAIN (${DIRECT_APPS_DOMAIN}) must not be the parent of the portal host (${hostOf(PUBLIC_URL)})`,
+    );
+  }
   if (PRINCIPAL_RULE.claim !== "sub" && PRINCIPAL_RULE.claim !== "email") {
     problems.push(`OIDC_PRINCIPAL_CLAIM must be "sub" or "email" (got "${PRINCIPAL_RULE.claim}")`);
   }
@@ -1276,12 +1323,25 @@ export function bootChecks(): void {
   ) {
     problems.push("PORTAL_SESSION_MAX_TTL_S must be a finite number at least as large as PORTAL_SESSION_TTL_S");
   }
+  if (
+    (IMPERSONATE_TTL_RAW !== undefined && !/^[1-9][0-9]*$/u.test(IMPERSONATE_TTL_RAW)) ||
+    !Number.isFinite(IMPERSONATE_TTL_S) ||
+    !Number.isInteger(IMPERSONATE_TTL_S) ||
+    IMPERSONATE_TTL_S <= 0 ||
+    IMPERSONATE_TTL_S > IMPERSONATE_TTL_MAX_S
+  ) {
+    problems.push(
+      "PORTAL_IMPERSONATE_TTL_S must be a finite positive integer no greater than PORTAL_SESSION_MAX_TTL_S or 86400, whichever is lower",
+    );
+  }
   if ((PRINCIPAL_RULE.allowedEmailDomain || PRINCIPAL_RULE.allowedEmails?.length) && PRINCIPAL_RULE.claim !== "email") {
     problems.push("OIDC_ALLOWED_EMAIL_DOMAIN and OIDC_ALLOWED_EMAILS require OIDC_PRINCIPAL_CLAIM=email");
   }
   if (IS_PROD) {
     if (isMissingOrPlaceholder(SESSION_SECRET))
       problems.push("PORTAL_SESSION_SECRET is required and may not be a placeholder in production");
+    if (isMissingOrPlaceholder(IDENTITY_SECRET))
+      problems.push("PORTAL_IDENTITY_SECRET is required and may not be a placeholder in production");
     if (isMissingOrPlaceholder(CORE_SIGNING_SECRET))
       problems.push("CORE_SIGNING_SECRET is required and may not be a placeholder in production");
     if (isMissingOrPlaceholder(OIDC.clientId))
@@ -1295,11 +1355,7 @@ export function bootChecks(): void {
     ) {
       problems.push("OIDC_ALLOWED_EMAIL_DOMAIN must be a valid, non-placeholder email domain when set");
     }
-    if (
-      PRINCIPAL_RULE.allowedEmails?.some(
-        (email) => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || isMissingOrPlaceholder(email),
-      )
-    ) {
+    if (PRINCIPAL_RULE.allowedEmails?.some((email) => !validEmail(email) || isMissingOrPlaceholder(email))) {
       problems.push("OIDC_ALLOWED_EMAILS must be a comma-separated list of valid, non-placeholder email addresses");
     }
     if (
@@ -1356,15 +1412,6 @@ export function bootChecks(): void {
 function isMissingOrPlaceholder(value: string | undefined): boolean {
   const candidate = value?.trim();
   return !candidate || /^(replace-me|placeholder|changeme|todo)$/i.test(candidate);
-}
-
-function validEmailDomain(value: string): boolean {
-  if (value.length > 253 || !value.includes(".")) return false;
-  return value
-    .split(".")
-    .every(
-      (label) => label.length > 0 && label.length <= 63 && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label),
-    );
 }
 
 export function startServer(): void {

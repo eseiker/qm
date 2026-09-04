@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload } from "jose";
 
 type FetchLike = typeof fetch;
@@ -116,6 +117,7 @@ export async function verifyIdToken(
   ) {
     throw new Error("authorized party mismatch");
   }
+  if (typeof payload.sub !== "string" || !payload.sub) throw new Error("ID token subject must be a nonempty string");
   return payload as JWTPayload & Record<string, unknown>;
 }
 
@@ -125,28 +127,58 @@ export interface PrincipalRule {
   allowedEmails?: readonly string[];
 }
 
+export function validEmailDomain(value: string): boolean {
+  if (value.length > 252 || !value.includes(".") || isIP(value) !== 0) return false;
+  return value
+    .split(".")
+    .every(
+      (label) => label.length > 0 && label.length <= 63 && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(label),
+    );
+}
+
+export function validEmail(value: string): boolean {
+  const separator = value.indexOf("@");
+  if (value.length > 254 || separator < 1 || separator !== value.lastIndexOf("@")) return false;
+  const local = value.slice(0, separator);
+  const domain = value.slice(separator + 1);
+  return (
+    local.length <= 64 &&
+    /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*$/.test(local) &&
+    validEmailDomain(domain)
+  );
+}
+
 export function resolvePrincipal(
   rule: PrincipalRule,
-  args: { sub: string; claims: Record<string, unknown>; userinfo: Record<string, unknown> },
+  args: { issuer?: string; sub: string; claims: Record<string, unknown>; userinfo: Record<string, unknown> },
 ): string {
+  if (typeof args.claims.sub !== "string" || !args.claims.sub || args.claims.sub !== args.sub) {
+    throw new Error("identity provider subject mismatch");
+  }
   if (rule.claim === "sub") return args.sub;
   const rawEmail = args.userinfo.email;
-  if (typeof rawEmail !== "string" || !rawEmail.includes("@")) throw new Error("identity provider returned no email");
+  if (typeof rawEmail !== "string") throw new Error("identity provider returned no email");
+  const trimmedEmail = rawEmail.trim();
+  if (!validEmail(trimmedEmail)) throw new Error("identity provider returned an invalid email");
+  const email = trimmedEmail.toLowerCase();
   const verified = args.userinfo.email_verified;
-  if (verified !== true && verified !== "true") throw new Error("email is not verified by the identity provider");
-  const email = rawEmail.trim().toLowerCase();
-  if (
-    rule.allowedEmails?.length &&
-    !rule.allowedEmails.map((allowed) => allowed.trim().toLowerCase()).includes(email)
-  ) {
+  if (verified !== true) throw new Error("email is not verified by the identity provider");
+  const exactEmailAllowed = rule.allowedEmails?.map((allowed) => allowed.trim().toLowerCase()).includes(email) ?? false;
+  if (rule.allowedEmails?.length && !exactEmailAllowed) {
     throw new Error("account is not on the permitted email list");
   }
   if (rule.allowedEmailDomain) {
     const domain = rule.allowedEmailDomain.toLowerCase();
     if (!email.endsWith(`@${domain}`)) throw new Error("account is outside the permitted domain");
-    const hd = args.userinfo.hd ?? args.claims.hd;
-    if (typeof hd === "string" && hd.toLowerCase() !== domain)
+  }
+  if (args.issuer === "https://accounts.google.com" || args.issuer === "accounts.google.com") {
+    const domain = email.slice(email.lastIndexOf("@") + 1);
+    const hd = args.claims.hd;
+    const exactConsumerEmail =
+      !rule.allowedEmailDomain && exactEmailAllowed && (domain === "gmail.com" || domain === "googlemail.com");
+    if (!exactConsumerEmail && (typeof hd !== "string" || !validEmailDomain(hd) || hd.toLowerCase() !== domain)) {
       throw new Error("account is outside the permitted domain");
+    }
   }
   return email;
 }
